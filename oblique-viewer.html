@@ -313,6 +313,20 @@ function parseImageTile(data) {
       ? ((90 - vda * 180 / Math.PI) % 360 + 360) % 360
       : ({ 1:0, 2:90, 3:180, 4:270 }[r[iVD]] ?? 0);
 
+    // Ground point (Z=0) that the image centre pixel looks at.
+    // Solve P·[X,Y,0,1]ᵀ = w·[px_c, py_c, 1]ᵀ for X,Y.
+    // This is a better selection metric than the footprint geographic centroid
+    // because it places the query point near the middle of the chosen image.
+    const px_c = (r[iW] || 14144) / 2, py_c = (r[iH] || 10560) / 2;
+    let lookAtMgi = center.slice(0, 2); // fallback to footprint centroid
+    const Pm = r[iPTI];
+    if (Pm) {
+      const a1=Pm[0][0]-px_c*Pm[2][0], b1=Pm[0][1]-px_c*Pm[2][1], c1=px_c*Pm[2][3]-Pm[0][3];
+      const a2=Pm[1][0]-py_c*Pm[2][0], b2=Pm[1][1]-py_c*Pm[2][1], c2=py_c*Pm[2][3]-Pm[1][3];
+      const det = a1*b2 - b1*a2;
+      if (Math.abs(det) > 1e-10) lookAtMgi = [(c1*b2-b1*c2)/det, (a1*c2-c1*a2)/det];
+    }
+
     allImages.push({
       name:          r[iN],
       width:         r[iW]  || 14144,
@@ -320,10 +334,11 @@ function parseImageTile(data) {
       tileResolution:r[iTR] || [16, 8, 4, 2, 1],
       viewDirection: r[iVD],
       heading,
-      footprintMgi,                  // quad in MGI — distance metric
-      mgiCenter: center.slice(0, 2), // kept for legacy / debug
-      groundZ:   avgHeight(gc),      // average Z from corners
-      pToImage:  r[iPTI] || null,    // 3×4 projection matrix
+      footprintMgi,
+      mgiCenter: center.slice(0, 2), // geographic footprint centroid (kept for debug)
+      lookAtMgi,                     // ground point at image centre — used for selection
+      groundZ:   avgHeight(gc),
+      pToImage:  r[iPTI] || null,
     });
   }
 }
@@ -422,7 +437,7 @@ function doSearch() {
   for (const img of allImages) {
     // Primary metric: distance from query to centerPointOnGround (metres, MGI plane).
     // This ranks images by how central the query point is in the image.
-    const [cx, cy] = img.mgiCenter;
+    const [cx, cy] = img.lookAtMgi;
     const distCenter = Math.hypot(qx - cx, qy - cy);
     if (distCenter > radiusM) continue;
 
@@ -800,7 +815,7 @@ function scheduleAutoSwitch() {
     let best = null, bestDist = Infinity;
     for (const img of allImages) {
       if (img.viewDirection !== dir) continue;
-      const [cx, cy] = img.mgiCenter;
+      const [cx, cy] = img.lookAtMgi;
       const dist = Math.hypot(qx - cx, qy - cy);
       if (dist < bestDist) { bestDist = dist; best = img; }
     }
@@ -814,8 +829,8 @@ function scheduleAutoSwitch() {
 function switchToImageBg(img, qx, qy) {
   img = {
     ...img,
-    distM:       Math.round(Math.hypot(qx - img.mgiCenter[0], qy - img.mgiCenter[1])),
-    distCenter:  Math.hypot(qx - img.mgiCenter[0], qy - img.mgiCenter[1]),
+    distM:       Math.round(Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1])),
+    distCenter:  Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1]),
     coversPoint: img.footprintMgi ? pointInPolygon2D(qx, qy, img.footprintMgi) : true,
   };
   let done = false;
