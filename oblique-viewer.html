@@ -146,30 +146,32 @@
         <button id="searchBtn" onclick="doSearch()" disabled>Search</button>
         <label style="display:flex;align-items:center;gap:5px;font-size:.75rem;cursor:pointer;color:var(--text-dim)"
                title="Run Search again when coordinates change (typing, arrow keys, drag)">
-          <input type="checkbox" id="autoSearchOnMoveCb">
+          <input type="checkbox" id="autoSearchOnMoveCb" checked>
           Auto-search on move
         </label>
         <span style="font-size:.72rem;color:var(--text-dim)" id="indexStatus">—</span>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
       <div class="cache-row">
-        <label style="display:flex;align-items:center;gap:5px;font-size:.75rem;cursor:pointer;color:var(--text-dim)"
-               title="Hold decoded tile bitmaps in memory so previously viewed images re-display instantly. Each image at z4 ≈ 42 MB.">
+        <label id="cacheEnabledLabel" style="display:flex;align-items:center;gap:5px;font-size:.75rem;cursor:pointer;color:var(--text-dim)"
+               title="">
           <input type="checkbox" id="cacheEnabledCb" onchange="onCacheToggle()">
           Keep images in memory
         </label>
         <select id="cacheSizeSel" class="cache-select" disabled onchange="onCacheSizeChange()"
-                title="Max number of (image × zoom) pairs kept in memory. Memory shown is worst-case (z4).">
-          <option value="3">3 images (~126 MB)</option>
-          <option value="5" selected>5 images (~210 MB)</option>
-          <option value="10">10 images (~420 MB)</option>
-          <option value="20">20 images (~840 MB)</option>
-          <option value="50">50 images (~2.1 GB)</option>
-          <option value="70">70 images (~2.9 GB)</option>
-          <option value="100">100 images (~4.2 GB)</option>
+                title="">
+          <option value="3">3 images</option>
+          <option value="5" selected>5 images</option>
+          <option value="10">10 images</option>
+          <option value="20">20 images</option>
+          <option value="50">50 images</option>
+          <option value="70">70 images</option>
+          <option value="100">100 images</option>
+          <option value="200">200 images</option>
+          <option value="300">300 images</option>
         </select>
         <button type="button" class="btn-sm" id="preloadListBtn" onclick="preloadResultList()" disabled
-                title="Decode tiles for every image in the current list into memory, up to the max above. Order keeps best-ranked matches (LRU). Uses the current tile-quality zoom (z), or z1 if none open.">
+                title="">
           Preload list
         </button>
         <label class="filter-label" style="margin-left:2px"
@@ -262,15 +264,36 @@
         <option value="20">×20</option>
         <option value="30">×30</option>
       </select>
-      <input type="number" id="overlayBlurInput" value="2" min="0" max="40" step="0.5" disabled
-             title="Blur (px) added per layer further back from the current image (0 = no blur)"
+      <span id="overlayBlurBaseWrap" style="font-size:.68rem;color:var(--text-dim);display:inline-flex;align-items:center;gap:3px;opacity:.4"
+            title="Blur applied to every layer behind the current image (in addition to the per-layer amount)">
+        <span>base</span>
+        <input type="number" id="overlayBlurFixedInput" value="0" min="0" max="40" step="0.5" disabled
+               style="width:40px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.73rem;padding:2px 5px;"
+               oninput="onOverlayBlurChange()">
+        <span>px</span>
+      </span>
+      <span style="font-size:.68rem;color:var(--text-dim);margin:0 2px">+</span>
+      <input type="number" id="overlayBlurInput" value="0" min="0" max="40" step="0.5" disabled
+             title="Extra blur (px) multiplied by how many layers back from the current image"
              style="width:46px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.73rem;padding:2px 5px;"
              oninput="onOverlayBlurChange()">
       <span id="overlayBlurUnit" style="font-size:.73rem;color:var(--text-dim);opacity:.4">px/layer</span>
       <label class="filter-label" title="Off: per-camera pan offset only. On: back layers are warped with a perspective homography from the ground plane (fixed Z) into the active image’s view — correct for pinhole cameras on a flat slice; not a full spherical/terrain reprojection.">
-        <input type="checkbox" id="overlayStretchToMainCb" disabled onchange="if(overlayEnabled)syncOverlayLayersToMarker()">
+        <input type="checkbox" id="overlayStretchToMainCb" disabled onchange="onOverlayReprojectChange()">
         Reproject to main
       </label>
+      <select id="overlayNeighborPreloadSel" class="sort-select" disabled onchange="onOverlayNeighborPreloadChange()"
+              title="When Reproject is on: pre-decode tiles and show the N nearest candidate images (same view direction first, then distance to marker) behind your stack, warped into the main view"
+              style="padding:2px 4px">
+        <option value="0" selected>near 0</option>
+        <option value="4">near 4</option>
+        <option value="8">near 8</option>
+        <option value="16">near 16</option>
+        <option value="32">near 32</option>
+        <option value="64">near 64</option>
+        <option value="128">near 128</option>
+        <option value="265">near 265</option>
+      </select>
       <button class="btn-sm" id="lockImagesBtn"    onclick="toggleLockImages()">🔓 Lock image</button>
       <label class="filter-label" style="margin-left:4px"
              title="Decode every tile for the next view before swapping. Current image stays until the new one is ready.">
@@ -801,6 +824,7 @@ async function loadIndex() {
     document.getElementById('indexStatus').textContent = '';
     document.getElementById('progressFill').style.display = 'none';
     document.getElementById('searchBtn').disabled = false;
+    updateCacheSizeDropdownLabels();
   } finally {
     if (setSel) setSel.disabled = false;
   }
@@ -863,6 +887,9 @@ function doSearch(opts) {
 
   document.getElementById('resultsHeader').style.display = 'flex';
   applySort();   // applySort sets resultCount (supports "X / Y" when filtered)
+  if (overlayEnabled && document.getElementById('overlayStretchToMainCb')?.checked && overlayNeighborCount > 0 && currentImage) {
+    scheduleRebuildOverlayNeighborLayers();
+  }
 }
 
 document.getElementById('coordsInput').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
@@ -1166,7 +1193,10 @@ let autoRotate       = false; // when true, rotate so the marker is horizontally
 let pinMarkerCenter  = false; // when true, translate the image so the marker is at the exact viewport centre
 let overlayEnabled   = false; // when true, stack images as layers aligned at the marker
 let overlayMaxLayers = 3;    // max layers kept in the overlay stack
-let overlayBlurStep  = 2;    // px of blur added per layer further back (0 = no blur)
+let overlayBlurFixed = 0;   // px applied to every layer behind the main (top) layer
+let overlayBlurStep  = 0;    // px of blur added per layer further back (0 = no blur)
+let overlayNeighborCount = 0; // 0,4,8,… preloaded nearest images shown when reproject is on
+let overlayNeighborGen   = 0; // invalidates async neighbor rebuild
 let listPlayTimer    = null;
 let listPlayActive   = false;
 
@@ -1255,6 +1285,169 @@ function waitForAllTilesDecoded(img, zoom) {
     }
   }
   return Promise.all(promises);
+}
+
+function computeAutoRotDegForImage(img) {
+  let rotDeg = 0;
+  if (autoRotate && img.pToImage) {
+    const hVal = document.getElementById('heightNum').value;
+    const Z = hVal === '' ? 0 : Number(hVal);
+    const proj = projectToPixel(img, searchLat, searchLon, Z);
+    if (proj) {
+      const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
+      if (fx >= 1) rotDeg = -Math.atan((proj[0] - img.width / 2) / fx) * (180 / Math.PI);
+    }
+  }
+  return rotDeg;
+}
+
+/** Neighbor preview layer (no dot overlay, no rotPadDiv id) — same tile layout as the main stack. */
+function buildNeighborLayerDOM(img, zoom) {
+  const area = document.getElementById('viewerArea');
+  const viewW = area.clientWidth || 800;
+  const viewH = area.clientHeight || 600;
+  const baseScale = Math.min(viewW / img.width, viewH / img.height);
+  const scale = baseScale * viewerZoom;
+  const { cols, rows } = tileDims(img.width, img.height, zoom, img.tileResolution);
+  const res = img.tileResolution[zoom];
+  const dispTileW = Math.max(1, Math.round(tileSize * res * scale));
+  const topBlack = Math.round((rows * tileSize * res - img.height) * scale);
+  const contentW = Math.round(img.width * scale);
+  const contentH = Math.round(img.height * scale);
+  const rotDeg = computeAutoRotDegForImage(img);
+  let tilesHtml = '';
+  for (let y = rows - 1; y >= 0; y--) {
+    tilesHtml += '<div class="tile-row">';
+    for (let x = 0; x < cols; x++) {
+      tilesHtml += `<img src="${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg"
+                        width="${dispTileW}" height="${dispTileW}"
+                        loading="lazy" onerror="this.style.opacity='.1'"
+                        title="z${zoom}/${x}/${y}">`;
+    }
+    tilesHtml += '</div>';
+  }
+  const rotStyle = rotDeg !== 0
+    ? `transform:rotate(${rotDeg}deg);transform-origin:50% 50%;`
+    : '';
+  const innerHtml = `
+    <div style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;${rotStyle}">
+      <div style="position:absolute;top:-${topBlack}px;left:0;">
+        <div class="tile-canvas-wrap">${tilesHtml}</div>
+      </div>
+    </div>`;
+  const layer = document.createElement('div');
+  layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform;';
+  layer.innerHTML = innerHtml;
+  layer._overlayImage = img;
+  layer._overlayRotDeg = rotDeg;
+  layer._overlayNeighborPreview = true;
+  layer._overlayHistory = false;
+  return layer;
+}
+
+function removeNeighborPreviewLayers(area) {
+  Array.from(area.children).forEach(el => {
+    if (el._overlayNeighborPreview) el.remove();
+  });
+}
+
+/** Max user-navigated layers; neighbor previews do not count toward this cap. */
+function trimOverlayHistory() {
+  const area = document.getElementById('viewerArea');
+  if (!area || !overlayEnabled) return;
+  while (true) {
+    const userLayers = Array.from(area.children).filter(el => el._overlayHistory);
+    if (userLayers.length <= overlayMaxLayers) break;
+    userLayers[0].remove();
+  }
+}
+
+/**
+ * Candidates for “next” views: same view direction as main first, then nearest ground-centre (MGI) to marker.
+ */
+function pickNearestNeighborImages(mainImg, count) {
+  if (!count || !mainImg || !allImages.length) return [];
+  const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const dir = mainImg.viewDirection;
+  return allImages
+    .filter(img => img.name !== mainImg.name)
+    .map(img => {
+      const [cx, cy] = img.lookAtMgi;
+      const dist = Math.hypot(qx - cx, qy - cy);
+      const sameDir = img.viewDirection === dir ? 0 : 1;
+      return { img, dist, sameDir };
+    })
+    .sort((a, b) => a.sameDir - b.sameDir || a.dist - b.dist)
+    .slice(0, count)
+    .map(x => x.img);
+}
+
+function scheduleRebuildOverlayNeighborLayers() {
+  overlayNeighborGen++;
+  const gen = overlayNeighborGen;
+  const area = document.getElementById('viewerArea');
+  if (!area || !overlayEnabled) return;
+
+  const n = overlayNeighborCount;
+  const reproject = document.getElementById('overlayStretchToMainCb')?.checked;
+  if (!n || !reproject || !currentImage) {
+    removeNeighborPreviewLayers(area);
+    syncOverlayLayersToMarker();
+    updateOverlayBlur();
+    return;
+  }
+
+  const neighbors = pickNearestNeighborImages(currentImage, n);
+  if (!neighbors.length) {
+    removeNeighborPreviewLayers(area);
+    syncOverlayLayersToMarker();
+    updateOverlayBlur();
+    return;
+  }
+
+  const z = currentZoom;
+  const mainName = currentImage.name;
+
+  // Keep previous neighbor layers visible until the new set has finished decoding.
+
+  Promise.all(neighbors.map(img => waitForAllTilesDecoded(img, z))).then(() => {
+    if (gen !== overlayNeighborGen) return;
+    if (!overlayEnabled || !currentImage || currentImage.name !== mainName) return;
+    const area2 = document.getElementById('viewerArea');
+    if (!area2) return;
+
+    removeNeighborPreviewLayers(area2);
+
+    const mainEl = area2.lastElementChild;
+    if (!mainEl || !mainEl._overlayHistory) return;
+
+    const sorted = [...neighbors].sort((a, b) => {
+      const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+      const da = Math.hypot(qx - a.lookAtMgi[0], qy - a.lookAtMgi[1]);
+      const db = Math.hypot(qx - b.lookAtMgi[0], qy - b.lookAtMgi[1]);
+      return db - da;
+    });
+
+    for (const img of sorted) {
+      const layer = buildNeighborLayerDOM(img, z);
+      area2.insertBefore(layer, mainEl);
+    }
+    neighbors.forEach(img => preloadToCache(img, z));
+    syncOverlayLayersToMarker();
+    updateOverlayBlur();
+  });
+}
+
+function onOverlayNeighborPreloadChange() {
+  const sel = document.getElementById('overlayNeighborPreloadSel');
+  overlayNeighborCount = sel ? Math.max(0, Number(sel.value) || 0) : 0;
+  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
+}
+
+function onOverlayReprojectChange() {
+  if (!overlayEnabled) return;
+  syncOverlayLayersToMarker();
+  scheduleRebuildOverlayNeighborLayers();
 }
 
 function renderTiles(img, zoom) {
@@ -1347,11 +1540,12 @@ function renderTiles(img, zoom) {
     layer.innerHTML = innerHtml;
     layer._overlayImage = img;
     layer._overlayRotDeg = rotDeg;
+    layer._overlayHistory = true;
+    layer._overlayNeighborPreview = false;
     area.appendChild(layer);
 
-    // Trim oldest layers once we exceed the limit, then re-apply blur.
-    while (area.children.length > overlayMaxLayers) area.removeChild(area.firstChild);
-    updateOverlayBlur();
+    trimOverlayHistory();
+    scheduleRebuildOverlayNeighborLayers();
   } else {
     // ── SINGLE MODE ──────────────────────────────────────────────
     area.innerHTML = `
@@ -1361,6 +1555,7 @@ function renderTiles(img, zoom) {
   }
 
   refreshDot();
+  updateCacheSizeDropdownLabels();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1604,6 +1799,65 @@ async function preloadToCacheWithTileProgress(img, zoom, onTile) {
   await Promise.all(promises);
 }
 
+/** Approx. decoded memory per image at tile zoom z (viewer z pills). Values beyond z4 use z4. */
+const CACHE_MB_PER_IMAGE_AT_Z = [0.3, 1, 3, 11, 42];
+
+function mbPerCachedImageAtZoom(z) {
+  const zi = Math.min(Math.max(0, z), CACHE_MB_PER_IMAGE_AT_Z.length - 1);
+  return CACHE_MB_PER_IMAGE_AT_Z[zi];
+}
+
+function effectiveCacheEstimateZoom() {
+  if (!currentImage) return 4;
+  const maxZ = currentImage.tileResolution.length - 1;
+  return Math.max(0, Math.min(maxZ, currentZoom));
+}
+
+function formatApproximateMemory(totalMb) {
+  if (totalMb >= 1024) {
+    const gb = totalMb / 1024;
+    return `~${gb >= 10 ? gb.toFixed(1) : gb.toFixed(2)} GB`;
+  }
+  if (totalMb >= 100) return `~${Math.round(totalMb)} MB`;
+  if (totalMb >= 10) return `~${totalMb.toFixed(1)} MB`;
+  return `~${totalMb.toFixed(2)} MB`;
+}
+
+/** Refresh cache limit dropdown labels from current tile zoom (z pill). */
+function updateCacheSizeDropdownLabels() {
+  const sel = document.getElementById('cacheSizeSel');
+  if (!sel) return;
+  const z = effectiveCacheEstimateZoom();
+  const mbEach = mbPerCachedImageAtZoom(z);
+  for (let i = 0; i < sel.options.length; i++) {
+    const opt = sel.options[i];
+    const n = Number(opt.value);
+    if (!isFinite(n)) continue;
+    opt.textContent = `${n} images (${formatApproximateMemory(mbEach * n)})`;
+  }
+  const zNote = currentImage
+    ? `current tile zoom z${z} (≈ ${mbEach} MB per image)`
+    : 'z4 (≈ 42 MB per image) until an image is open';
+  sel.title = `Max number of (image × zoom) pairs kept in memory. Totals use ${zNote}; change the z pill to update.`;
+
+  const lab = document.getElementById('cacheEnabledLabel');
+  if (lab) {
+    lab.title = 'Hold decoded tile bitmaps in memory so previously viewed images re-display instantly. '
+      + 'Approx. size per image: z0≈0.3 MB, z1≈1 MB, z2≈3 MB, z3≈11 MB, z4≈42 MB. '
+      + 'The limit dropdown updates when you change tile zoom.';
+  }
+
+  const pb = document.getElementById('preloadListBtn');
+  if (pb) {
+    if (currentImage) {
+      const zz = Math.min(currentZoom, currentImage.tileResolution.length - 1);
+      pb.title = `Decode tiles for every image in the current list into memory, up to the max above. Order keeps best-ranked matches (LRU). Uses current tile zoom (z${zz}).`;
+    } else {
+      pb.title = 'Decode tiles for every image in the current list into memory, up to the max above. Order keeps best-ranked matches (LRU). When no image is open, zoom follows the first list row per image.';
+    }
+  }
+}
+
 function updateCacheInfo() {
   const el = document.getElementById('cacheInfo');
   if (!el) return;
@@ -1615,6 +1869,7 @@ function updateCacheInfo() {
 function onCacheToggle() {
   tileCacheEnabled = document.getElementById('cacheEnabledCb').checked;
   document.getElementById('cacheSizeSel').disabled = !tileCacheEnabled;
+  updateCacheSizeDropdownLabels();
   if (!tileCacheEnabled) {
     // Release all cached elements.
     tileCacheMap.forEach(v => v.els.forEach(el => el.remove()));
@@ -1858,9 +2113,18 @@ function toggleOverlay() {
   btn.style.opacity = overlayEnabled ? '' : '.5';
   document.getElementById('overlayLayersSel').disabled  = !overlayEnabled;
   document.getElementById('overlayBlurInput').disabled  = !overlayEnabled;
+  document.getElementById('overlayBlurFixedInput').disabled = !overlayEnabled;
   document.getElementById('overlayBlurUnit').style.opacity = overlayEnabled ? '' : '.4';
+  const obw = document.getElementById('overlayBlurBaseWrap');
+  if (obw) obw.style.opacity = overlayEnabled ? '' : '.4';
   const st = document.getElementById('overlayStretchToMainCb');
   if (st) st.disabled = !overlayEnabled;
+  const nsel = document.getElementById('overlayNeighborPreloadSel');
+  if (nsel) {
+    nsel.disabled = !overlayEnabled;
+    nsel.style.opacity = overlayEnabled ? '' : '.4';
+    if (overlayEnabled) overlayNeighborCount = Number(nsel.value) || 0;
+  }
   const area = document.getElementById('viewerArea');
   if (area) area.style.overflow = (pinMarkerCenter || overlayEnabled) ? 'hidden' : '';
   if (overlayEnabled) {
@@ -1877,18 +2141,19 @@ function onOverlayLayersChange() {
   overlayMaxLayers = Number(document.getElementById('overlayLayersSel').value);
   const area = document.getElementById('viewerArea');
   if (area && overlayEnabled) {
-    while (area.children.length > overlayMaxLayers) area.removeChild(area.firstChild);
-    updateOverlayBlur();
+    trimOverlayHistory();
+    scheduleRebuildOverlayNeighborLayers();
   }
 }
 
 function onOverlayBlurChange() {
+  overlayBlurFixed = Math.max(0, Number(document.getElementById('overlayBlurFixedInput')?.value) || 0);
   overlayBlurStep = Math.max(0, Number(document.getElementById('overlayBlurInput').value) || 0);
   updateOverlayBlur();
 }
 
-/** Apply a progressive blur to all overlay layers.
- *  The current (topmost) layer gets 0 blur; each step back adds overlayBlurStep px.
+/** Apply blur to all overlay layers: top layer is sharp; each layer behind gets
+ *  overlayBlurFixed + stepsBack * overlayBlurStep (px).
  *  Explicit z-index keeps paint order correct when transform + filter both create stacking contexts
  *  (otherwise blurred layers can paint above the sharp top layer, especially with stacked transforms). */
 function updateOverlayBlur() {
@@ -1900,7 +2165,7 @@ function updateOverlayBlur() {
   layers.forEach((layer, i) => {
     if (layer._overlayImage) layer.style.zIndex = String(i + 1);
     const stepsBack = n - 1 - i;   // 0 for current top layer
-    const blurPx    = stepsBack * overlayBlurStep;
+    const blurPx = (stepsBack > 0 ? overlayBlurFixed : 0) + stepsBack * overlayBlurStep;
     layer.style.filter = blurPx > 0 ? `blur(${blurPx}px)` : '';
   });
 }
