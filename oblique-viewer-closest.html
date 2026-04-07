@@ -94,7 +94,7 @@
 
     /* ── tile viewer inside card ── */
     .card-viewer { flex: 1; overflow: auto; background: #080a0e; min-height: 0;
-                   scrollbar-width: none; }
+                   scrollbar-width: none; cursor: grab; }
     .card-viewer::-webkit-scrollbar { display: none; }
     .tile-row { display: flex; }
     .tile-row img { display: block; flex-shrink: 0; background: #111; }
@@ -141,6 +141,11 @@
     <button class="btn-sm" onclick="changeVZoom(-1)">−</button>
     <span class="vzoom-label" id="vzoomLabel">1×</span>
     <button class="btn-sm" onclick="changeVZoom(+1)">+</button>
+
+    <div class="sep"></div>
+
+    <span class="lbl" style="white-space:nowrap"
+          title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads per direction.">⌨ ↑↓←→ 5 m</span>
 
     <div class="sep"></div>
 
@@ -273,6 +278,25 @@ function projectToPixel(img, lat, lon, Z) {
   const w = P[2][0]*X + P[2][1]*Y + P[2][2]*Z + P[2][3];
   if (Math.abs(w) < 1e-10) return null;
   return [u/w, v/w];
+}
+
+/** Inverse Jacobian of the camera projection at (lat,lon,Z): pixel → MGI metres. */
+function computeInvJacobian(img, lat, lon, Z) {
+  if (!img || !img.pToImage) return null;
+  const P = img.pToImage;
+  const [X, Y] = wgs84ToMgi.forward([lon, lat]);
+  const u = P[0][0]*X + P[0][1]*Y + P[0][2]*Z + P[0][3];
+  const v = P[1][0]*X + P[1][1]*Y + P[1][2]*Z + P[1][3];
+  const w = P[2][0]*X + P[2][1]*Y + P[2][2]*Z + P[2][3];
+  if (Math.abs(w) < 1e-10) return null;
+  const w2 = w * w;
+  const a =  (P[0][0]*w - u*P[2][0]) / w2;
+  const b =  (P[0][1]*w - u*P[2][1]) / w2;
+  const c =  (P[1][0]*w - v*P[2][0]) / w2;
+  const dd = (P[1][1]*w - v*P[2][1]) / w2;
+  const det = a*dd - b*c;
+  if (Math.abs(det) < 1e-20) return null;
+  return { dXdPx: dd/det, dXdPy: -b/det, dYdPx: -c/det, dYdPy: a/det };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -578,6 +602,233 @@ function scrollToMarker(d) {
   area.scrollLeft = st.padX + st.dx - area.clientWidth  / 2;
   area.scrollTop  = st.padY + st.dy - area.clientHeight / 2;
 }
+
+// ═══════════════════════════════════════════════════════
+//  ARROW KEY NAVIGATION
+// ═══════════════════════════════════════════════════════
+let autoSwitchTimer = null;
+
+/** Move search point by (dxM, dyM) metres (East=+x, North=+y) in MGI. */
+function moveMarker(dxM, dyM) {
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const [newLon, newLat] = wgs84ToMgi.inverse([mx + dxM, my + dyM]);
+  searchLat = newLat;
+  searchLon = newLon;
+  document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  refreshAllDots();
+  scheduleAutoSwitch();
+}
+
+/** Debounce: after 120 ms find the best image per direction and switch if needed. */
+function scheduleAutoSwitch() {
+  if (autoSwitchTimer) clearTimeout(autoSwitchTimer);
+  autoSwitchTimer = setTimeout(() => {
+    autoSwitchTimer = null;
+    const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+    for (let d = 1; d <= 4; d++) {
+      let best = null, bestDist = Infinity;
+      for (const img of allImages) {
+        if (img.viewDirection !== d) continue;
+        const [cx, cy] = img.mgiCenter;
+        const dist = Math.hypot(qx - cx, qy - cy);
+        if (dist < bestDist) { bestDist = dist; best = img; }
+      }
+      const cur = cardState[d].img;
+      if (best && (!cur || best.name !== cur.name)) {
+        switchCardBg(d, best, qx, qy);
+      }
+    }
+  }, 120);
+}
+
+/** Preload the lowest-res tile of the candidate; switch once it arrives (max 800 ms). */
+function switchCardBg(d, img, qx, qy) {
+  img = {
+    ...img,
+    distM: Math.round(Math.hypot(qx - img.mgiCenter[0], qy - img.mgiCenter[1])),
+  };
+  let done = false;
+  const commit = () => {
+    if (done) return; done = true;
+    cardState[d].img = img;
+    cardState[d].dx  = cardState[d].dy = -1;
+    renderCard(d);
+  };
+  const probe = new Image();
+  probe.onload  = commit;
+  probe.onerror = commit;
+  setTimeout(commit, 800);
+  probe.src = `${BASE_URL}/${img.name}/0/0/0.jpg`;
+}
+
+// ── Continuous keyboard movement: fires every animation frame while keys held ──
+const ARROW_KEYS = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'];
+const keysHeld   = new Set();
+let   shiftHeld  = false;
+let   keyRafId   = null, lastKeyTs = null;
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'Shift') { shiftHeld = true; return; }
+  if (!ARROW_KEYS.includes(e.key)) return;
+  e.preventDefault();
+  keysHeld.add(e.key);
+  if (!keyRafId) keyRafId = requestAnimationFrame(keyMoveLoop);
+});
+document.addEventListener('keyup', e => {
+  if (e.key === 'Shift') { shiftHeld = false; return; }
+  keysHeld.delete(e.key);
+  if (keysHeld.size === 0) lastKeyTs = null;
+});
+
+function keyMoveLoop(ts) {
+  if (keysHeld.size === 0) { keyRafId = null; lastKeyTs = null; return; }
+  if (lastKeyTs === null) lastKeyTs = ts;
+  const dt   = Math.min((ts - lastKeyTs) / 1000, 0.1);
+  lastKeyTs  = ts;
+  const step = (shiftHeld ? 300 : 50) * dt;
+  let dxM = 0, dyM = 0;
+  if (keysHeld.has('ArrowUp'))    dyM += step;
+  if (keysHeld.has('ArrowDown'))  dyM -= step;
+  if (keysHeld.has('ArrowLeft'))  dxM -= step;
+  if (keysHeld.has('ArrowRight')) dxM += step;
+  moveMarker(dxM, dyM);
+  keyRafId = requestAnimationFrame(keyMoveLoop);
+}
+
+// ── Mouse / touch drag: move the marker by inverting the camera Jacobian ──
+let   isDragging  = false;
+let   dragCard    = null;
+let   dragStartCX = 0, dragStartCY = 0;
+let   dragStartMX = 0, dragStartMY = 0;
+let   dragInvJ    = null, dragScale = 1;
+
+const gridEl = document.getElementById('grid');
+
+function getViewerCard(el) {
+  const v = el.closest('[id^="viewer-"]');
+  return v ? Number(v.id.split('-')[1]) : null;
+}
+
+function beginDrag(clientX, clientY, d) {
+  const img = cardState[d].img;
+  if (!img) return false;
+  const hVal = document.getElementById('heightNum').value;
+  const Z    = hVal === '' ? 0 : Number(hVal);
+  const invJ = computeInvJacobian(img, searchLat, searchLon, Z);
+  if (!invJ) return false;
+  isDragging  = true;
+  dragCard    = d;
+  dragStartCX = clientX;
+  dragStartCY = clientY;
+  [dragStartMX, dragStartMY] = wgs84ToMgi.forward([searchLon, searchLat]);
+  dragInvJ    = invJ;
+  dragScale   = cardState[d].scale;
+  return true;
+}
+
+function applyDrag(clientX, clientY) {
+  if (!isDragging || !dragInvJ) return;
+  const ddxImg = -(clientX - dragStartCX) / dragScale;
+  const ddyImg = -(clientY - dragStartCY) / dragScale;
+  const dX = dragInvJ.dXdPx * ddxImg + dragInvJ.dXdPy * ddyImg;
+  const dY = dragInvJ.dYdPx * ddxImg + dragInvJ.dYdPy * ddyImg;
+  const [newLon, newLat] = wgs84ToMgi.inverse([dragStartMX + dX, dragStartMY + dY]);
+  searchLat = newLat;
+  searchLon = newLon;
+  document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  refreshAllDots();
+  scheduleAutoSwitch();
+}
+
+function endDrag() {
+  isDragging = false;
+  dragInvJ   = null;
+  gridEl.style.cursor = '';
+}
+
+gridEl.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  const d = getViewerCard(e.target);
+  if (d === null) return;
+  if (beginDrag(e.clientX, e.clientY, d)) {
+    gridEl.style.cursor = 'grabbing';
+    e.preventDefault();
+  }
+});
+document.addEventListener('mousemove', e => { if (isDragging) applyDrag(e.clientX, e.clientY); });
+document.addEventListener('mouseup',   ()  => { if (isDragging) endDrag(); });
+
+// ── Pinch-to-zoom state ──
+let isPinching     = false;
+let pinchStartDist = 0;
+let pinchStartZoom = 1;
+let pinchLastRatio = 1;
+
+function pinchDist(t) { return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
+
+function setViewerZoomTo(z) {
+  viewerZoom = Math.max(VZOOM_STEPS[0], Math.min(VZOOM_STEPS[VZOOM_STEPS.length-1], z));
+  const v = viewerZoom;
+  const lbl = v >= 1
+    ? (Number.isInteger(v) ? v+'×' : v.toFixed(2).replace(/\.?0+$/,'')+'×')
+    : v.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')+'×';
+  document.getElementById('vzoomLabel').textContent = lbl;
+  renderAll();
+}
+
+gridEl.addEventListener('touchstart', e => {
+  if (e.touches.length === 1) {
+    isPinching = false;
+    const d = getViewerCard(e.target);
+    if (d === null) return;
+    if (beginDrag(e.touches[0].clientX, e.touches[0].clientY, d)) e.preventDefault();
+  } else if (e.touches.length === 2) {
+    isPinching     = true;
+    isDragging     = false;
+    pinchStartDist = pinchDist(e.touches);
+    pinchStartZoom = viewerZoom;
+    pinchLastRatio = 1;
+    // Anchor the scale to each card's viewport centre (where the marker lives).
+    for (let d = 1; d <= 4; d++) {
+      const area = document.getElementById(`viewer-${d}`);
+      const el   = area?.firstElementChild;
+      if (area && el) {
+        const ox = area.scrollLeft + area.clientWidth  / 2;
+        const oy = area.scrollTop  + area.clientHeight / 2;
+        el.style.transformOrigin = `${ox}px ${oy}px`;
+      }
+    }
+    e.preventDefault();
+  }
+}, { passive: false });
+
+gridEl.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (e.touches.length === 1 && !isPinching) {
+    applyDrag(e.touches[0].clientX, e.touches[0].clientY);
+  } else if (e.touches.length === 2 && isPinching) {
+    pinchLastRatio = pinchDist(e.touches) / pinchStartDist;
+    // CSS scale gives smooth real-time feedback; no DOM rebuild until fingers lift.
+    for (let d = 1; d <= 4; d++) {
+      const el = document.getElementById(`viewer-${d}`)?.firstElementChild;
+      if (el) el.style.transform = `scale(${pinchLastRatio})`;
+    }
+  }
+}, { passive: false });
+
+gridEl.addEventListener('touchend', e => {
+  if (isPinching && e.touches.length < 2) {
+    // Commit: remove preview transforms and do one proper re-render.
+    for (let d = 1; d <= 4; d++) {
+      const el = document.getElementById(`viewer-${d}`)?.firstElementChild;
+      if (el) { el.style.transform = ''; el.style.transformOrigin = ''; }
+    }
+    setViewerZoomTo(pinchStartZoom * pinchLastRatio);
+    isPinching = false;
+  }
+  if (e.touches.length === 0) endDrag();
+});
 
 // ═══════════════════════════════════════════════════════
 //  BOOT

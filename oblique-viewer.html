@@ -68,7 +68,7 @@
     .height-ctrl input[type=range] { width: 80px; accent-color: var(--accent); }
     .height-ctrl input[type=number] { width: 58px; padding: 2px 6px; font-size: .75rem; }
 
-    .viewer-area { flex: 1; overflow: auto; background: #080a0e; }
+    .viewer-area { flex: 1; overflow: auto; background: #080a0e; cursor: grab; }
     .tile-canvas-wrap { display: inline-block; line-height: 0; }
     .tile-row { display: flex; }
     .tile-row img { display: block; flex-shrink: 0; background: #111; }
@@ -169,6 +169,8 @@
       <button class="btn-sm" id="markerToggleBtn"  onclick="toggleMarker()">● Marker</button>
       <button class="btn-sm" id="zoomMarkerBtn"   onclick="toggleZoomToMarker()">⊕ Zoom to</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
+      <span style="font-size:.68rem;color:var(--text-dim);white-space:nowrap"
+            title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads.">⌨ ↑↓←→ 5 m</span>
     </div>
     <div class="viewer-area" id="viewerArea">
       <div class="empty-viewer">← Select an image from the list</div>
@@ -348,6 +350,30 @@ function projectToPixel(img, lat, lon, groundHeight) {
   const py = v / w;
 
   return [px, py];
+}
+
+/**
+ * Inverse Jacobian of the camera projection at (lat, lon, Z).
+ * Returns a 2×2 object { dXdPx, dXdPy, dYdPx, dYdPy } mapping image-pixel
+ * displacements (in native image pixels) to MGI metre displacements.
+ * Used for drag-to-move and could be used for other inverse-projection needs.
+ */
+function computeInvJacobian(img, lat, lon, Z) {
+  if (!img || !img.pToImage) return null;
+  const P = img.pToImage;
+  const [X, Y] = wgs84ToMgi.forward([lon, lat]);
+  const u = P[0][0]*X + P[0][1]*Y + P[0][2]*Z + P[0][3];
+  const v = P[1][0]*X + P[1][1]*Y + P[1][2]*Z + P[1][3];
+  const w = P[2][0]*X + P[2][1]*Y + P[2][2]*Z + P[2][3];
+  if (Math.abs(w) < 1e-10) return null;
+  const w2 = w * w;
+  const a =  (P[0][0]*w - u*P[2][0]) / w2;  // d(px)/dX
+  const b =  (P[0][1]*w - u*P[2][1]) / w2;  // d(px)/dY
+  const c =  (P[1][0]*w - v*P[2][0]) / w2;  // d(py)/dX
+  const d =  (P[1][1]*w - v*P[2][1]) / w2;  // d(py)/dY
+  const det = a*d - b*c;
+  if (Math.abs(det) < 1e-20) return null;
+  return { dXdPx: d/det, dXdPy: -b/det, dYdPx: -c/det, dYdPy: a/det };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -740,6 +766,224 @@ async function downloadCurrent() {
     w.document.write(`<pre style="font:12px monospace;background:#0d1117;color:#c9d1d9;padding:16px">${urls}</pre>`);
   }
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  ARROW KEY NAVIGATION  (moves the search point in MGI space)
+// ═══════════════════════════════════════════════════════════════
+let autoSwitchTimer = null;
+
+/** Move search point by (dxM, dyM) metres (East=+x, North=+y) in MGI. */
+function moveMarker(dxM, dyM) {
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const [newLon, newLat] = wgs84ToMgi.inverse([mx + dxM, my + dyM]);
+  searchLat = newLat;
+  searchLon = newLon;
+  document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  refreshDot();
+  scheduleAutoSwitch();
+}
+
+/** Debounce: after 120 ms of no keys, find the best image for the current direction. */
+function scheduleAutoSwitch() {
+  if (autoSwitchTimer) clearTimeout(autoSwitchTimer);
+  autoSwitchTimer = setTimeout(() => {
+    autoSwitchTimer = null;
+    if (!currentImage) return;
+    const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+    const dir = currentImage.viewDirection;
+    let best = null, bestDist = Infinity;
+    for (const img of allImages) {
+      if (img.viewDirection !== dir) continue;
+      const [cx, cy] = img.mgiCenter;
+      const dist = Math.hypot(qx - cx, qy - cy);
+      if (dist < bestDist) { bestDist = dist; best = img; }
+    }
+    if (best && best.name !== currentImage.name) {
+      switchToImageBg(best, qx, qy);
+    }
+  }, 120);
+}
+
+/** Preload the lowest-res tile of the candidate; switch once it arrives (max 800 ms). */
+function switchToImageBg(img, qx, qy) {
+  img = {
+    ...img,
+    distM:       Math.round(Math.hypot(qx - img.mgiCenter[0], qy - img.mgiCenter[1])),
+    distCenter:  Math.hypot(qx - img.mgiCenter[0], qy - img.mgiCenter[1]),
+    coversPoint: img.footprintMgi ? pointInPolygon2D(qx, qy, img.footprintMgi) : true,
+  };
+  let done = false;
+  const commit = () => {
+    if (done) return; done = true;
+    currentImage = img;
+    currentZoom  = Math.min(currentZoom, img.tileResolution.length - 1);
+    openViewer(img, currentZoom);
+    highlightInList(img.name);
+  };
+  const probe = new Image();
+  probe.onload  = commit;
+  probe.onerror = commit;   // switch even on error — remaining tiles may still load
+  setTimeout(commit, 800);  // fallback: don't wait forever
+  probe.src = `${BASE_URL}/${img.name}/0/0/0.jpg`;
+}
+
+function highlightInList(name) {
+  const list = document.getElementById('resultsList');
+  if (!list._items) return;
+  list.querySelectorAll('.result-item').forEach((el, i) => {
+    el.classList.toggle('active', list._items[i]?.name === name);
+  });
+}
+
+// ── Continuous keyboard movement: fires every animation frame while keys held ──
+const ARROW_KEYS = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'];
+const keysHeld   = new Set();
+let   shiftHeld  = false;
+let   keyRafId   = null, lastKeyTs = null;
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'Shift') { shiftHeld = true; return; }
+  if (!ARROW_KEYS.includes(e.key) || !currentImage) return;
+  e.preventDefault();
+  keysHeld.add(e.key);
+  if (!keyRafId) keyRafId = requestAnimationFrame(keyMoveLoop);
+});
+document.addEventListener('keyup', e => {
+  if (e.key === 'Shift') { shiftHeld = false; return; }
+  keysHeld.delete(e.key);
+  if (keysHeld.size === 0) lastKeyTs = null;
+});
+
+function keyMoveLoop(ts) {
+  if (keysHeld.size === 0 || !currentImage) { keyRafId = null; lastKeyTs = null; return; }
+  if (lastKeyTs === null) lastKeyTs = ts;
+  const dt   = Math.min((ts - lastKeyTs) / 1000, 0.1); // seconds, capped at 100 ms
+  lastKeyTs  = ts;
+  const step = (shiftHeld ? 300 : 50) * dt; // metres this frame
+  let dxM = 0, dyM = 0;
+  if (keysHeld.has('ArrowUp'))    dyM += step;
+  if (keysHeld.has('ArrowDown'))  dyM -= step;
+  if (keysHeld.has('ArrowLeft'))  dxM -= step;
+  if (keysHeld.has('ArrowRight')) dxM += step;
+  moveMarker(dxM, dyM);
+  keyRafId = requestAnimationFrame(keyMoveLoop);
+}
+
+// ── Mouse / touch drag: moves the marker by inverting the camera Jacobian ──
+let   isDragging    = false;
+let   dragStartCX   = 0, dragStartCY = 0;
+let   dragStartMX   = 0, dragStartMY = 0;
+let   dragInvJ      = null, dragScale = 1;
+
+const viewerAreaEl = document.getElementById('viewerArea');
+
+function beginDrag(clientX, clientY) {
+  if (!currentImage) return false;
+  const hVal = document.getElementById('heightNum').value;
+  const Z    = hVal === '' ? 0 : Number(hVal);
+  const invJ = computeInvJacobian(currentImage, searchLat, searchLon, Z);
+  if (!invJ) return false;
+  isDragging  = true;
+  dragStartCX = clientX;
+  dragStartCY = clientY;
+  [dragStartMX, dragStartMY] = wgs84ToMgi.forward([searchLon, searchLat]);
+  dragInvJ    = invJ;
+  dragScale   = currentDispScale;
+  return true;
+}
+
+function applyDrag(clientX, clientY) {
+  if (!isDragging || !dragInvJ) return;
+  const ddxImg = -(clientX - dragStartCX) / dragScale;
+  const ddyImg = -(clientY - dragStartCY) / dragScale;
+  const dX = dragInvJ.dXdPx * ddxImg + dragInvJ.dXdPy * ddyImg;
+  const dY = dragInvJ.dYdPx * ddxImg + dragInvJ.dYdPy * ddyImg;
+  const [newLon, newLat] = wgs84ToMgi.inverse([dragStartMX + dX, dragStartMY + dY]);
+  searchLat = newLat;
+  searchLon = newLon;
+  document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  refreshDot();
+  scheduleAutoSwitch();
+}
+
+function endDrag() {
+  isDragging = false;
+  dragInvJ   = null;
+  viewerAreaEl.style.cursor = 'grab';
+}
+
+viewerAreaEl.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  if (beginDrag(e.clientX, e.clientY)) {
+    viewerAreaEl.style.cursor = 'grabbing';
+    e.preventDefault();
+  }
+});
+document.addEventListener('mousemove', e => { if (isDragging) applyDrag(e.clientX, e.clientY); });
+document.addEventListener('mouseup',   ()  => { if (isDragging) endDrag(); });
+
+// ── Pinch-to-zoom state ──
+let isPinching     = false;
+let pinchStartDist = 0;
+let pinchStartZoom = 1;
+let pinchLastRatio = 1;
+
+function pinchDist(t) { return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
+
+function setViewerZoomTo(z) {
+  viewerZoom = Math.max(VZOOM_STEPS[0], Math.min(VZOOM_STEPS[VZOOM_STEPS.length-1], z));
+  const v = viewerZoom;
+  const lbl = v >= 1
+    ? (Number.isInteger(v) ? v+'×' : v.toFixed(2).replace(/\.?0+$/,'')+'×')
+    : v.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')+'×';
+  document.getElementById('vzoomLabel').textContent = lbl;
+  if (currentImage) renderTiles(currentImage, currentZoom);
+}
+
+viewerAreaEl.addEventListener('touchstart', e => {
+  if (e.touches.length === 1) {
+    isPinching = false;
+    if (beginDrag(e.touches[0].clientX, e.touches[0].clientY)) e.preventDefault();
+  } else if (e.touches.length === 2) {
+    isPinching     = true;
+    isDragging     = false;
+    pinchStartDist = pinchDist(e.touches);
+    pinchStartZoom = viewerZoom;
+    pinchLastRatio = 1;
+    // Anchor the scale to the viewport centre (where the marker lives).
+    const el = viewerAreaEl.firstElementChild;
+    if (el) {
+      const ox = viewerAreaEl.scrollLeft + viewerAreaEl.clientWidth  / 2;
+      const oy = viewerAreaEl.scrollTop  + viewerAreaEl.clientHeight / 2;
+      el.style.transformOrigin = `${ox}px ${oy}px`;
+    }
+    e.preventDefault();
+  }
+}, { passive: false });
+
+viewerAreaEl.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (e.touches.length === 1 && !isPinching) {
+    applyDrag(e.touches[0].clientX, e.touches[0].clientY);
+  } else if (e.touches.length === 2 && isPinching) {
+    pinchLastRatio = pinchDist(e.touches) / pinchStartDist;
+    // CSS scale gives smooth real-time feedback; no DOM rebuild until fingers lift.
+    const el = viewerAreaEl.firstElementChild;
+    if (el) el.style.transform = `scale(${pinchLastRatio})`;
+  }
+}, { passive: false });
+
+viewerAreaEl.addEventListener('touchend', e => {
+  if (isPinching && e.touches.length < 2) {
+    // Commit: remove the preview transform and do one proper re-render.
+    const el = viewerAreaEl.firstElementChild;
+    if (el) { el.style.transform = ''; el.style.transformOrigin = ''; }
+    setViewerZoomTo(pinchStartZoom * pinchLastRatio);
+    isPinching = false;
+  }
+  if (e.touches.length === 0) endDrag();
+});
 
 // ═══════════════════════════════════════════════════════════════
 //  BOOT
