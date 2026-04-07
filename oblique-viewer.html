@@ -38,21 +38,13 @@
     button:hover:not(:disabled) { opacity: .85; }
     .btn-sm { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 3px 9px; font-size: .78rem; }
 
-    .results-header { padding: 6px 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 5px; font-size: .78rem; color: var(--text-dim); }
-    .results-header-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .results-header { padding: 8px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; font-size: .78rem; color: var(--text-dim); }
     .results-header strong { color: var(--text); }
     .sort-select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: .75rem; padding: 2px 6px; margin-left: auto; }
-    .filter-label { display: flex; align-items: center; gap: 4px; font-size: .73rem; cursor: pointer; white-space: nowrap; }
-    .filter-input { width:48px !important; flex:0 0 auto; background:var(--bg); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:.73rem; padding:2px 5px; }
-    .cache-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding-top: 2px; }
-    .cache-select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: .73rem; padding: 2px 5px; }
-    .cache-select:disabled { opacity: .4; }
     .results-list { flex: 1; overflow-y: auto; }
     .result-item { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .12s; }
     .result-item:hover { background: var(--surface2); }
     .result-item.active { background: #1a2740; border-left: 2px solid var(--accent); padding-left: 12px; }
-    .result-item.result-outside { opacity: .55; }
-    .result-item.result-outside .thumb-wrap { filter: grayscale(.6); }
     .thumb-wrap { width: 64px; height: 64px; flex-shrink: 0; background: #0a0c10; border-radius: 4px; overflow: hidden; }
     .thumb-wrap img { width: 64px; height: 64px; object-fit: cover; display: block; }
     .result-meta { flex: 1; min-width: 0; }
@@ -76,7 +68,7 @@
     .height-ctrl input[type=range] { width: 80px; accent-color: var(--accent); }
     .height-ctrl input[type=number] { width: 58px; padding: 2px 6px; font-size: .75rem; }
 
-    .viewer-area { flex: 1; overflow: auto; background: #080a0e; cursor: grab; position: relative; }
+    .viewer-area { flex: 1; overflow: auto; background: #080a0e; cursor: grab; }
     .tile-canvas-wrap { display: inline-block; line-height: 0; }
     .tile-row { display: flex; }
     .tile-row img { display: block; flex-shrink: 0; background: #111; }
@@ -138,62 +130,15 @@
         <span style="font-size:.72rem;color:var(--text-dim)" id="indexStatus">—</span>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
-      <div class="cache-row">
-        <label style="display:flex;align-items:center;gap:5px;font-size:.75rem;cursor:pointer;color:var(--text-dim)"
-               title="Hold decoded tile bitmaps in memory so previously viewed images re-display instantly. Each image at z4 ≈ 42 MB.">
-          <input type="checkbox" id="cacheEnabledCb" onchange="onCacheToggle()">
-          Keep images in memory
-        </label>
-        <select id="cacheSizeSel" class="cache-select" disabled onchange="onCacheSizeChange()"
-                title="Max number of (image × zoom) pairs kept in memory. Memory shown is worst-case (z4).">
-          <option value="3">3 images (~126 MB)</option>
-          <option value="5" selected>5 images (~210 MB)</option>
-          <option value="10">10 images (~420 MB)</option>
-          <option value="20">20 images (~840 MB)</option>
-          <option value="50">50 images (~2.1 GB)</option>
-        </select>
-        <span id="cacheInfo" style="font-size:.72rem;color:var(--text-dim)"></span>
-      </div>
     </div>
 
     <div class="results-header" id="resultsHeader" style="display:none">
-      <!-- Row 1: count + sort -->
-      <div class="results-header-row">
-        <strong id="resultCount">0</strong>&nbsp;images found
-        <select class="sort-select" id="sortSelect" onchange="applySort()">
-          <option value="dist">Sort: Distance</option>
-          <option value="heading">Sort: Heading</option>
-          <option value="dir">Sort: Direction</option>
-          <option value="margin">Sort: H-angle |↑| centred</option>
-          <option value="rotate">Sort: Orbit 360°</option>
-        </select>
-      </div>
-      <!-- Row 2: filters -->
-      <div class="results-header-row">
-        <label class="filter-label" title="Hide images where the marker (plus the radius below) projects outside the visible frame">
-          <input type="checkbox" id="filterOutOfFrame" onchange="applySort()">
-          Hide ⚠ outside
-        </label>
-        <input type="number" id="frameRadiusM" value="0" min="0" max="2000" step="5"
-               class="filter-input" style="width:52px"
-               title="Radius (m) around the marker that must be fully inside the image"
-               oninput="applySort()">
-        <span>m</span>
-        <span style="display:flex;align-items:center;gap:4px;flex-shrink:0"
-              title="Filter by vertical angle ↕ of the marker from image centre. Positive = below centre (near camera). Empty = no limit.">
-          <span>↕</span>
-          <input type="number" id="vertAngleMin" placeholder="min°" step="1" min="-90" max="90"
-                 class="filter-input"
-                 title="Min vertical angle (°) — hide images where the marker is above this"
-                 oninput="applySort()">
-          <span>–</span>
-          <input type="number" id="vertAngleMax" placeholder="max°" step="1" min="-90" max="90"
-                 class="filter-input"
-                 title="Max vertical angle (°) — hide images where the marker is below this"
-                 oninput="applySort()">
-          <span>°</span>
-        </span>
-      </div>
+      <strong id="resultCount">0</strong>&nbsp;images found
+      <select class="sort-select" id="sortSelect" onchange="applySort()">
+        <option value="dist">Sort: Distance</option>
+        <option value="heading">Sort: Heading</option>
+        <option value="dir">Sort: Direction</option>
+      </select>
     </div>
     <div class="results-list" id="resultsList"></div>
   </div>
@@ -216,45 +161,16 @@
       <div class="height-ctrl" title="Ground elevation (Z) used for coordinate projection onto image">
         <span>Z:</span>
         <input type="range" id="heightSlider" min="-100" max="400" step="1" value="0"
-               oninput="document.getElementById('heightNum').value=this.value; onHeightChange()">
+               oninput="document.getElementById('heightNum').value=this.value; refreshDot()">
         <input type="number" id="heightNum" value="0" min="-100" max="400"
-               oninput="document.getElementById('heightSlider').value=this.value; onHeightChange()">
+               oninput="document.getElementById('heightSlider').value=this.value; refreshDot()">
         <span>m</span>
       </div>
       <button class="btn-sm" id="markerToggleBtn"  onclick="toggleMarker()">● Marker</button>
       <button class="btn-sm" id="zoomMarkerBtn"   onclick="toggleZoomToMarker()">⊕ Zoom to</button>
-      <button class="btn-sm" id="pinCenterBtn"    onclick="togglePinCenter()" style="opacity:.5"
-              title="Keep the marker pinned to the exact viewport centre; image translates, dark space fills the edges">⊙ Pin centre</button>
-      <button class="btn-sm" id="overlayBtn"     onclick="toggleOverlay()"  style="opacity:.5"
-              title="Stack images when navigating — each new image is layered on top, aligned so the marker stays at the same screen position. Best combined with ⊙ Pin centre.">⧉ Overlay</button>
-      <select id="overlayLayersSel" class="sort-select" disabled onchange="onOverlayLayersChange()"
-              title="Max layers kept in the overlay stack" style="padding:2px 4px">
-        <option value="2">×2</option>
-        <option value="3" selected>×3</option>
-        <option value="5">×5</option>
-        <option value="10">×10</option>
-        <option value="20">×20</option>
-        <option value="30">×30</option>
-      </select>
-      <input type="number" id="overlayBlurInput" value="2" min="0" max="40" step="0.5" disabled
-             title="Blur (px) added per layer further back from the current image (0 = no blur)"
-             style="width:46px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.73rem;padding:2px 5px;"
-             oninput="onOverlayBlurChange()">
-      <span id="overlayBlurUnit" style="font-size:.73rem;color:var(--text-dim);opacity:.4">px/layer</span>
-      <button class="btn-sm" id="lockImagesBtn"    onclick="toggleLockImages()">🔓 Lock image</button>
-      <button class="btn-sm" id="autoRotateBtn"   onclick="toggleAutoRotate()">↻ Rotate to marker</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
-      <span style="display:flex;align-items:center;gap:4px;font-size:.68rem;color:var(--text-dim);white-space:nowrap"
-            title="Auto-advance through the sorted list (same as . key)">
-        <button type="button" class="btn-sm" id="listPlayBtn" onclick="toggleListPlay()" style="padding:2px 8px">▶</button>
-        <input type="number" id="listPlayIntervalSec" value="1" min="0.1" max="120" step="0.1"
-               title="Seconds between each step"
-               style="width:48px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.72rem;padding:2px 4px"
-               oninput="restartListPlayIfActive()">
-        <span>s</span>
-      </span>
       <span style="font-size:.68rem;color:var(--text-dim);white-space:nowrap"
-            title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads. , / . step through the list.">⌨ ↑↓←→ · , .</span>
+            title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads.">⌨ ↑↓←→ 5 m</span>
     </div>
     <div class="viewer-area" id="viewerArea">
       <div class="empty-viewer">← Select an image from the list</div>
@@ -396,20 +312,6 @@ function parseImageTile(data) {
       ? ((90 - vda * 180 / Math.PI) % 360 + 360) % 360
       : ({ 1:0, 2:90, 3:180, 4:270 }[r[iVD]] ?? 0);
 
-    // Ground point (Z=0) that the image centre pixel looks at.
-    // Solve P·[X,Y,0,1]ᵀ = w·[px_c, py_c, 1]ᵀ for X,Y.
-    // This is a better selection metric than the footprint geographic centroid
-    // because it places the query point near the middle of the chosen image.
-    const px_c = (r[iW] || 14144) / 2, py_c = (r[iH] || 10560) / 2;
-    let lookAtMgi = center.slice(0, 2); // fallback to footprint centroid
-    const Pm = r[iPTI];
-    if (Pm) {
-      const a1=Pm[0][0]-px_c*Pm[2][0], b1=Pm[0][1]-px_c*Pm[2][1], c1=px_c*Pm[2][3]-Pm[0][3];
-      const a2=Pm[1][0]-py_c*Pm[2][0], b2=Pm[1][1]-py_c*Pm[2][1], c2=py_c*Pm[2][3]-Pm[1][3];
-      const det = a1*b2 - b1*a2;
-      if (Math.abs(det) > 1e-10) lookAtMgi = [(c1*b2-b1*c2)/det, (a1*c2-c1*a2)/det];
-    }
-
     allImages.push({
       name:          r[iN],
       width:         r[iW]  || 14144,
@@ -417,11 +319,10 @@ function parseImageTile(data) {
       tileResolution:r[iTR] || [16, 8, 4, 2, 1],
       viewDirection: r[iVD],
       heading,
-      footprintMgi,
-      mgiCenter: center.slice(0, 2), // geographic footprint centroid (kept for debug)
-      lookAtMgi,                     // ground point at image centre — used for selection
-      groundZ:   avgHeight(gc),
-      pToImage:  r[iPTI] || null,
+      footprintMgi,                  // quad in MGI — distance metric
+      mgiCenter: center.slice(0, 2), // kept for legacy / debug
+      groundZ:   avgHeight(gc),      // average Z from corners
+      pToImage:  r[iPTI] || null,    // 3×4 projection matrix
     });
   }
 }
@@ -520,7 +421,7 @@ function doSearch() {
   for (const img of allImages) {
     // Primary metric: distance from query to centerPointOnGround (metres, MGI plane).
     // This ranks images by how central the query point is in the image.
-    const [cx, cy] = img.lookAtMgi;
+    const [cx, cy] = img.mgiCenter;
     const distCenter = Math.hypot(qx - cx, qy - cy);
     if (distCenter > radiusM) continue;
 
@@ -537,117 +438,22 @@ function doSearch() {
     });
   }
 
+  applySort();
   document.getElementById('resultsHeader').style.display = 'flex';
-  applySort();   // applySort sets resultCount (supports "X / Y" when filtered)
+  document.getElementById('resultCount').textContent = searchResults.length;
 }
 
 document.getElementById('coordsInput').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
 document.getElementById('radiusInput').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
 
-/**
- * Signed horizontal angle of the marker from the image centre.
- *   negative = marker is left  of centre
- *   positive = marker is right of centre
- *   0        = perfectly centred horizontally
- *
- * Uses f_x ≈ ‖P[0, 0:3]‖ (camera matrix row norm ≈ focal length in pixels).
- */
-function computeHorizAngle(img, lat, lon, Z) {
-  if (!img.pToImage) return NaN;
-  const res = projectToPixel(img, lat, lon, Z);
-  if (!res) return NaN;
-  const [px] = res;
-  const P  = img.pToImage;
-  const fx = Math.hypot(P[0][0], P[0][1], P[0][2]);
-  if (fx < 1) return NaN;
-  return Math.atan((px - img.width / 2) / fx) * (180 / Math.PI);
-}
-
 function applySort() {
-  const key     = document.getElementById('sortSelect').value;
-  const Z       = Number(document.getElementById('heightNum').value) || 0;
-  const radiusM = Math.max(0, Number(document.getElementById('frameRadiusM')?.value) || 0);
-
-  // Pre-compute the 4 cardinal MGI offsets once (same for every image).
-  // These are used to test whether an area of `radiusM` metres around the
-  // marker is also fully inside each image's frame.
-  let cardinalsMgi = null;
-  if (radiusM > 0) {
-    const [qmx, qmy] = wgs84ToMgi.forward([searchLon, searchLat]);
-    cardinalsMgi = [
-      [qmx + radiusM, qmy],
-      [qmx - radiusM, qmy],
-      [qmx, qmy + radiusM],
-      [qmx, qmy - radiusM],
-    ].map(([ox, oy]) => { const [oLon, oLat] = wgs84ToMgi.inverse([ox, oy]); return [oLat, oLon]; });
-  }
-
-  // Pre-compute signed horizontal angle + in-frame flag for every result.
-  // One projectToPixel call per image covers both needs.
-  const items = searchResults.map(img => {
-    const res = projectToPixel(img, searchLat, searchLon, Z);
-    let inFrame = res != null
-      && res[0] >= 0 && res[0] <= img.width
-      && res[1] >= 0 && res[1] <= img.height;
-    // Also require the radius ring to be inside the frame.
-    if (inFrame && cardinalsMgi) {
-      for (const [oLat, oLon] of cardinalsMgi) {
-        const p = projectToPixel(img, oLat, oLon, Z);
-        if (!p || p[0] < 0 || p[0] > img.width || p[1] < 0 || p[1] > img.height) {
-          inFrame = false;
-          break;
-        }
-      }
-    }
-    let horizAngle = NaN, vertAngle = NaN;
-    if (res && img.pToImage) {
-      const P  = img.pToImage;
-      const fx = Math.hypot(P[0][0], P[0][1], P[0][2]);
-      const fy = Math.hypot(P[1][0], P[1][1], P[1][2]);
-      if (fx >= 1) horizAngle = Math.atan((res[0] - img.width  / 2) / fx) * (180 / Math.PI);
-      if (fy >= 1) vertAngle  = Math.atan((res[1] - img.height / 2) / fy) * (180 / Math.PI);
-      // vertAngle sign: positive = marker below image centre (near ground / closer to camera)
-      //                 negative = marker above image centre (farther away / sky direction)
-    }
-    // Orbit angle: bearing from the marker to the camera (0-360°).
-    const orbitAngle = isFinite(horizAngle)
-      ? ((img.heading + horizAngle + 180) % 360 + 360) % 360
-      : ((img.heading + 180) % 360);
-    return { ...img, horizAngle, vertAngle, inFrame, orbitAngle };
-  });
-
-  // ── Apply filters ────────────────────────────────────────────────────────────
-  const hideOOF  = document.getElementById('filterOutOfFrame')?.checked;
-  const vMinRaw  = document.getElementById('vertAngleMin')?.value;
-  const vMaxRaw  = document.getElementById('vertAngleMax')?.value;
-  const vMin     = (vMinRaw !== '' && vMinRaw != null) ? Number(vMinRaw) : -Infinity;
-  const vMax     = (vMaxRaw !== '' && vMaxRaw != null) ? Number(vMaxRaw) : +Infinity;
-  const hasVert  = isFinite(vMin) || isFinite(vMax);
-
-  let visible = items;
-  if (hideOOF)  visible = visible.filter(it => it.inFrame);
-  if (hasVert)  visible = visible.filter(it =>
-    isFinite(it.vertAngle) && it.vertAngle >= vMin && it.vertAngle <= vMax
-  );
-
-  visible.sort((a, b) =>
+  const key = document.getElementById('sortSelect').value;
+  const sorted = [...searchResults].sort((a, b) =>
     key === 'heading' ? a.heading - b.heading :
     key === 'dir'     ? (a.viewDirection - b.viewDirection) || (a.distCenter - b.distCenter) :
-    key === 'margin'  ? Math.abs(a.horizAngle) - Math.abs(b.horizAngle) :  // most centred first
-    key === 'rotate'  ? a.orbitAngle - b.orbitAngle :
     /* dist */          a.distCenter - b.distCenter
   );
-
-  // Update the count badge: "X / Y" when any filter is active, plain "Y" otherwise.
-  const anyFilter = hideOOF || hasVert;
-  const countEl   = document.getElementById('resultCount');
-  if (countEl) {
-    countEl.textContent = (anyFilter && visible.length !== items.length)
-      ? `${visible.length} / ${items.length}`
-      : items.length;
-  }
-
-  renderList(visible);
+  renderList(sorted);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -675,7 +481,6 @@ function compassSVG(heading) {
 }
 
 function renderList(items) {
-  stopListPlay();
   const list = document.getElementById('resultsList');
   list._items = items;
   if (!items.length) { list.innerHTML = '<div class="no-results">No images in this radius.</div>'; return; }
@@ -684,27 +489,7 @@ function renderList(items) {
     const distStr = (img.distM >= 1000 ? (img.distM/1000).toFixed(2)+' km' : img.distM+' m') +
       (img.coversPoint ? ' ✓' : '');
     const tag = `<span class="tag ${DIR_TAG[img.viewDirection]||'tag-x'}">${DIR_LABELS[img.viewDirection]||'Dir'+img.viewDirection}</span>`;
-    const ha  = img.horizAngle;
-    const angleStr = (ha != null && isFinite(ha))
-      ? `<span title="Horizontal angle of marker from image centre (−=left, +=right)"
-               style="color:${Math.abs(ha)<=10?'var(--success)':Math.abs(ha)<=25?'var(--warning)':'var(--error)'}">
-           ${ha>=0?'+':''}${ha.toFixed(1)}°</span>`
-      : '';
-    const va  = img.vertAngle;
-    const vertStr = (va != null && isFinite(va))
-      ? `<span title="Vertical angle of marker from image centre (−=above centre / far, +=below centre / near camera)"
-               style="color:${Math.abs(va)<=10?'var(--success)':Math.abs(va)<=25?'var(--warning)':'var(--error)'}">
-           ↕ ${va>=0?'+':''}${va.toFixed(1)}°</span>`
-      : '';
-    const orbitStr = (img.orbitAngle != null && isFinite(img.orbitAngle))
-      ? `<span title="Bearing from marker to camera (orbit position, 0°=N clockwise)"
-               style="color:var(--text-dim)">⟳ ${img.orbitAngle.toFixed(1)}°</span>`
-      : '';
-    const outsideStr = img.inFrame === false
-      ? `<span style="color:var(--error);font-weight:600;font-size:.72rem"
-               title="The marker projects outside this image's frame">⚠ outside image</span>`
-      : '';
-    return `<div class="result-item${img.inFrame===false?' result-outside':''}" data-idx="${idx}" onclick="selectImage(${idx},this)">
+    return `<div class="result-item" data-idx="${idx}" onclick="selectImage(${idx},this)">
       <div class="thumb-wrap">
         <img src="${BASE_URL}/${img.name}/0/0/0.jpg" loading="lazy" onerror="this.style.opacity='.15'">
       </div>
@@ -714,10 +499,6 @@ function renderList(items) {
           ${tag}
           <span>${headingArrow(img.heading)} ${img.heading.toFixed(1)}°</span>
           <span>${distStr}</span>
-          ${angleStr}
-          ${vertStr}
-          ${orbitStr}
-          ${outsideStr}
         </div>
       </div>
       <div class="compass-wrap">${compassSVG(img.heading)}</div>
@@ -730,15 +511,6 @@ function renderList(items) {
 // ═══════════════════════════════════════════════════════════════
 let currentImage = null, currentZoom = 1;
 let currentDispScale = 1;  // display pixels per image pixel — SAME at all zoom levels
-let currentContentW  = 0, currentContentH = 0; // content div size (after scale, before rotation)
-let currentRotDeg    = 0;  // degrees currently applied as CSS rotate() on the clip div
-let autoRotate       = false; // when true, rotate so the marker is horizontally centred
-let pinMarkerCenter  = false; // when true, translate the image so the marker is at the exact viewport centre
-let overlayEnabled   = false; // when true, stack images as layers aligned at the marker
-let overlayMaxLayers = 3;    // max layers kept in the overlay stack
-let overlayBlurStep  = 2;    // px of blur added per layer further back (0 = no blur)
-let listPlayTimer    = null;
-let listPlayActive   = false;
 
 // Visual zoom (multiplier on top of the fit-to-viewer base scale).
 // Kept between image switches; independent of tile quality zoom.
@@ -764,7 +536,11 @@ function openViewer(img, zoom) {
   document.getElementById('viewerSub').textContent =
     `${DIR_LABELS[img.viewDirection]||''} · ${img.heading.toFixed(1)}° · ${distStr} · ${img.width}×${img.height}px`;
 
-  // Only initialise Z on the very first image load; preserve the user's value thereafter.
+  // All groundCoordinates in this dataset have Z=0 (the matrix calibration datum).
+  // Use the average groundZ (0 for all current images). Do NOT fall back to 170.
+  const defaultZ = Math.round(img.groundZ);
+  document.getElementById('heightNum').value    = defaultZ;
+  document.getElementById('heightSlider').value = defaultZ;
 
   // zoom pills
   const maxZoom = img.tileResolution.length - 1;
@@ -782,11 +558,9 @@ function openViewer(img, zoom) {
     pills.querySelectorAll('.zoom-pill').forEach(p => p.classList.toggle('active', p===pill));
     currentZoom = z;
     renderTiles(img, z);
-    preloadToCache(img, z);
   };
 
   renderTiles(img, zoom);
-  preloadToCache(img, zoom);
 }
 
 function tileDims(width, height, zoom, tileResolution) {
@@ -811,35 +585,10 @@ function renderTiles(img, zoom) {
   const contentW = Math.round(img.width  * scale);
   const contentH = Math.round(img.height * scale);
 
-  // Compute auto-rotation: rotate so the marker is horizontally centred.
-  // rotDeg = -horizAngle  (positive horizAngle → marker right of centre → rotate left).
-  let rotDeg = 0;
-  if (autoRotate && img.pToImage) {
-    const hVal = document.getElementById('heightNum').value;
-    const Z = hVal === '' ? 0 : Number(hVal);
-    const proj = projectToPixel(img, searchLat, searchLon, Z);
-    if (proj) {
-      const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
-      if (fx >= 1) rotDeg = -Math.atan((proj[0] - img.width / 2) / fx) * (180 / Math.PI);
-    }
-  }
-  currentRotDeg   = rotDeg;
-  currentContentW = contentW;
-  currentContentH = contentH;
-  updateAutoRotateLabel(rotDeg);
-
-  // In pin-centre or overlay mode padding is irrelevant (translate handles positioning).
-  // In normal mode centre the image, with extra room for rotated corners.
-  if (pinMarkerCenter || overlayEnabled) {
-    viewPadX = 0;
-    viewPadY = 0;
-  } else {
-    const rotRad    = Math.abs(rotDeg) * Math.PI / 180;
-    const rotExtraW = Math.round((contentW * (1 - Math.cos(rotRad)) + contentH * Math.sin(rotRad)) / 2);
-    const rotExtraH = Math.round((contentH * (1 - Math.cos(rotRad)) + contentW * Math.sin(rotRad)) / 2);
-    viewPadX = Math.max(0, Math.floor((viewW - contentW) / 2)) + rotExtraW;
-    viewPadY = Math.max(0, Math.floor((viewH - contentH) / 2)) + rotExtraH;
-  }
+  // When content is smaller than the viewport, centre it with padding.
+  // When zoomed in (content > viewport) padding is 0 → overflow:auto scrolls.
+  viewPadX = Math.max(0, Math.floor((viewW - contentW) / 2));
+  viewPadY = Math.max(0, Math.floor((viewH - contentH) / 2));
 
   let tilesHtml = '';
   for (let y = rows - 1; y >= 0; y--) {
@@ -853,47 +602,16 @@ function renderTiles(img, zoom) {
     tilesHtml += '</div>';
   }
 
-  const rotStyle = rotDeg !== 0
-    ? `transform:rotate(${rotDeg}deg);transform-origin:50% 50%;`
-    : '';
-
-  // IDs rotPadDiv / rotClipDiv / dotOverlay always belong to the CURRENT (topmost) layer.
-  // refreshDot() and scrollToMarker() use these IDs so they always affect the live layer.
-  const innerHtml = `
-    <div id="rotClipDiv" style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;${rotStyle}">
-      <div style="position:absolute;top:-${topBlack}px;left:0;">
-        <div class="tile-canvas-wrap">${tilesHtml}</div>
+  // Outer div provides centering padding; inner clip wrapper hides black tile borders.
+  area.innerHTML = `
+    <div style="padding:${viewPadY}px ${viewPadX}px;min-width:max-content;background:#080a0e;">
+      <div style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;">
+        <div style="position:absolute;top:-${topBlack}px;left:0;">
+          <div class="tile-canvas-wrap">${tilesHtml}</div>
+        </div>
+        <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${contentW}px;height:${contentH}px;overflow:visible;pointer-events:none;"></svg>
       </div>
-      <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${contentW}px;height:${contentH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
-
-  if (overlayEnabled) {
-    // ── OVERLAY MODE ─────────────────────────────────────────────
-    // Strip IDs from the previous current layer so only the new layer owns them.
-    const oldPad  = area.querySelector('#rotPadDiv');
-    const oldClip = area.querySelector('#rotClipDiv');
-    const oldSvg  = area.querySelector('#dotOverlay');
-    if (oldPad)  oldPad.removeAttribute('id');
-    if (oldClip) oldClip.removeAttribute('id');
-    if (oldSvg)  oldSvg.remove();   // old layers get no dot overlay
-
-    // Append the new layer; it is position:absolute so all layers stack on top of each other.
-    const layer = document.createElement('div');
-    layer.id    = 'rotPadDiv';
-    layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform;';
-    layer.innerHTML = innerHtml;
-    area.appendChild(layer);
-
-    // Trim oldest layers once we exceed the limit, then re-apply blur.
-    while (area.children.length > overlayMaxLayers) area.removeChild(area.firstChild);
-    updateOverlayBlur();
-  } else {
-    // ── SINGLE MODE ──────────────────────────────────────────────
-    area.innerHTML = `
-      <div id="rotPadDiv" style="padding:${viewPadY}px ${viewPadX}px;min-width:max-content;background:#080a0e;">
-        ${innerHtml}
-      </div>`;
-  }
 
   refreshDot();
 }
@@ -901,14 +619,6 @@ function renderTiles(img, zoom) {
 // ═══════════════════════════════════════════════════════════════
 //  DOT OVERLAY  – called whenever height changes or image changes
 // ═══════════════════════════════════════════════════════════════
-/** Called when the ground-elevation (Z) slider/input changes.
- *  Refreshes the dot projection AND re-evaluates the inFrame filter so the
- *  "Hide ⚠ outside" checkbox reflects the new elevation immediately. */
-function onHeightChange() {
-  refreshDot();
-  if (searchResults.length) applySort();
-}
-
 function refreshDot() {
   const svgEl = document.getElementById('dotOverlay');
   if (!svgEl || !currentImage) return;
@@ -965,39 +675,6 @@ function refreshDot() {
     }
   }
 
-  // When autoRotate is on, update the CSS rotation live as the marker moves
-  // (no tile rebuild — just change the clip div's transform and padding).
-  if (autoRotate && currentImage.pToImage && result) {
-    const fx = Math.hypot(
-      currentImage.pToImage[0][0],
-      currentImage.pToImage[0][1],
-      currentImage.pToImage[0][2]
-    );
-    const newRot = (fx >= 1)
-      ? -Math.atan((px - currentImage.width / 2) / fx) * (180 / Math.PI)
-      : 0;
-    if (Math.abs(newRot - currentRotDeg) > 0.15) {
-      currentRotDeg = newRot;
-      updateAutoRotateLabel(newRot);
-      const clipDiv = document.getElementById('rotClipDiv');
-      if (clipDiv) clipDiv.style.transform = `rotate(${newRot}deg)`;
-      // Re-derive padding so scrollToMarker stays accurate.
-      // In pin-centre mode padding is always 0 — the translate handles positioning.
-      if (!pinMarkerCenter) {
-        const area2  = document.getElementById('viewerArea');
-        const vW2    = area2.clientWidth  || 800;
-        const vH2    = area2.clientHeight || 600;
-        const rRad   = Math.abs(newRot) * Math.PI / 180;
-        const exW    = Math.round((currentContentW * (1 - Math.cos(rRad)) + currentContentH * Math.sin(rRad)) / 2);
-        const exH    = Math.round((currentContentH * (1 - Math.cos(rRad)) + currentContentW * Math.sin(rRad)) / 2);
-        viewPadX = Math.max(0, Math.floor((vW2 - currentContentW) / 2)) + exW;
-        viewPadY = Math.max(0, Math.floor((vH2 - currentContentH) / 2)) + exH;
-        const padDiv = document.getElementById('rotPadDiv');
-        if (padDiv) padDiv.style.padding = `${viewPadY}px ${viewPadX}px`;
-      }
-    }
-  }
-
   // Scroll to marker if that option is on (independent of marker visibility).
   scrollToMarker();
 }
@@ -1039,126 +716,13 @@ function toggleZoomToMarker() {
   if (zoomToMarker) scrollToMarker();  // snap immediately if just enabled
 }
 
-function togglePinCenter() {
-  pinMarkerCenter = !pinMarkerCenter;
-  const btn = document.getElementById('pinCenterBtn');
-  btn.style.opacity = pinMarkerCenter ? '' : '.5';
-  const area = document.getElementById('viewerArea');
-  if (area) area.style.overflow = (pinMarkerCenter || overlayEnabled) ? 'hidden' : '';
-  if (!pinMarkerCenter) {
-    // Clear the translate so the image returns to normal centred padding.
-    const padDiv = document.getElementById('rotPadDiv');
-    if (padDiv) padDiv.style.transform = '';
-  }
-  if (currentImage) renderTiles(currentImage, currentZoom);
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  TILE MEMORY CACHE
-//  Keeps decoded tile bitmaps alive by holding HTMLImageElement
-//  references in a hidden container.  LRU evicts oldest entries
-//  when the limit is reached.  Each entry = one (image × zoom).
-// ═══════════════════════════════════════════════════════════════
-let tileCacheEnabled = false;
-let tileCacheMax     = 5;
-const tileCacheMap   = new Map();   // "${name}/${zoom}" → { els: HTMLImageElement[], seq: number }
-let   tileCacheSeq   = 0;
-
-function tileCacheEvict() {
-  while (tileCacheMap.size >= tileCacheMax) {
-    let lruKey = null, lruSeq = Infinity;
-    for (const [k, v] of tileCacheMap) {
-      if (v.seq < lruSeq) { lruSeq = v.seq; lruKey = k; }
-    }
-    if (!lruKey) break;
-    tileCacheMap.get(lruKey).els.forEach(el => el.remove());
-    tileCacheMap.delete(lruKey);
-  }
-}
-
-function preloadToCache(img, zoom) {
-  if (!tileCacheEnabled) return;
-  const key = `${img.name}/${zoom}`;
-  if (tileCacheMap.has(key)) {
-    tileCacheMap.get(key).seq = ++tileCacheSeq;   // bump LRU timestamp
-    updateCacheInfo();
-    return;
-  }
-  tileCacheEvict();
-  const {cols, rows} = tileDims(img.width, img.height, zoom, img.tileResolution);
-  const container = document.getElementById('tileCache');
-  const els = [];
-  for (let y = rows - 1; y >= 0; y--) {
-    for (let x = 0; x < cols; x++) {
-      const el = new Image();
-      el.src = `${BASE_URL}/${img.name}/${zoom}/${x}/${y}.jpg`;
-      container.appendChild(el);
-      els.push(el);
-    }
-  }
-  tileCacheMap.set(key, { els, seq: ++tileCacheSeq });
-  updateCacheInfo();
-}
-
-function updateCacheInfo() {
-  const el = document.getElementById('cacheInfo');
-  if (!el) return;
-  el.textContent = tileCacheMap.size
-    ? `${tileCacheMap.size} / ${tileCacheMax} in memory`
-    : '';
-}
-
-function onCacheToggle() {
-  tileCacheEnabled = document.getElementById('cacheEnabledCb').checked;
-  document.getElementById('cacheSizeSel').disabled = !tileCacheEnabled;
-  if (!tileCacheEnabled) {
-    // Release all cached elements.
-    tileCacheMap.forEach(v => v.els.forEach(el => el.remove()));
-    tileCacheMap.clear();
-    updateCacheInfo();
-  } else if (currentImage) {
-    preloadToCache(currentImage, currentZoom);
-  }
-}
-
-function onCacheSizeChange() {
-  tileCacheMax = Number(document.getElementById('cacheSizeSel').value);
-  tileCacheEvict();
-  updateCacheInfo();
-}
-
-/** Position the viewer so the marker is centred (respects zoomToMarker and pinMarkerCenter). */
+/** Scroll the viewer so the marker stays centred (only when zoomToMarker is on). */
 function scrollToMarker() {
   if (!zoomToMarker || markerDX < 0 || markerDY < 0) return;
   const area = document.getElementById('viewerArea');
   if (!area) return;
-
-  // When a CSS rotation is applied, the marker's visual position in the
-  // scrollable coordinate system differs from its position in content space.
-  // Rotate (markerDX, markerDY) around the content centre by the same angle.
-  let vx = markerDX, vy = markerDY;
-  if (currentRotDeg !== 0 && currentContentW > 0) {
-    const cx = currentContentW / 2, cy = currentContentH / 2;
-    const θ  = currentRotDeg * Math.PI / 180;
-    const dx = markerDX - cx, dy = markerDY - cy;
-    vx = cx + dx * Math.cos(θ) - dy * Math.sin(θ);
-    vy = cy + dx * Math.sin(θ) + dy * Math.cos(θ);
-  }
-
-  if (pinMarkerCenter || overlayEnabled) {
-    // Translate the current (topmost) layer so the marker lands at the exact viewport centre.
-    // In overlay mode every layer keeps its own frozen translate, so older images remain
-    // aligned at the same real-world point even as new layers appear on top.
-    const tx = area.clientWidth  / 2 - vx;
-    const ty = area.clientHeight / 2 - vy;
-    const padDiv = document.getElementById('rotPadDiv');
-    if (padDiv) padDiv.style.transform = `translate(${tx}px, ${ty}px)`;
-    area.scrollLeft = 0;
-    area.scrollTop  = 0;
-  } else {
-    area.scrollLeft = viewPadX + vx - area.clientWidth  / 2;
-    area.scrollTop  = viewPadY + vy - area.clientHeight / 2;
-  }
+  area.scrollLeft = viewPadX + markerDX - area.clientWidth  / 2;
+  area.scrollTop  = viewPadY + markerDY - area.clientHeight / 2;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1180,7 +744,7 @@ async function downloadCurrent() {
   let failed = 0;
   const BATCH = 20;
   const loadTile = (x,y) => new Promise(res => {
-    const el = new Image(); //el.crossOrigin='anonymous';
+    const el = new Image(); el.crossOrigin='anonymous';
     el.onload = () => { ctx.drawImage(el, x*TILE_SIZE, (rows-1-y)*TILE_SIZE, TILE_SIZE, TILE_SIZE); res(); };
     el.onerror = () => { failed++; res(); };
     el.src = `${BASE_URL}/${img.name}/${maxZoom}/${x}/${y}.jpg`;
@@ -1197,8 +761,6 @@ async function downloadCurrent() {
     a.download = `${img.name}_z${maxZoom}.jpg`;
     a.click();
   } catch(e) {
-    alert(e);
-    console.log(e);
     const w = window.open('','_blank');
     const urls = tasks.map(([x,y]) => `${BASE_URL}/${img.name}/${maxZoom}/${x}/${y}.jpg`).join('\n');
     w.document.write(`<pre style="font:12px monospace;background:#0d1117;color:#c9d1d9;padding:16px">${urls}</pre>`);
@@ -1221,83 +783,8 @@ function moveMarker(dxM, dyM) {
   scheduleAutoSwitch();
 }
 
-let lockedImages = false;
-function toggleLockImages() {
-  lockedImages = !lockedImages;
-  const btn = document.getElementById('lockImagesBtn');
-  btn.textContent = lockedImages ? '🔒 Locked' : '🔓 Lock image';
-  btn.classList.toggle('active', lockedImages);
-}
-
-function toggleOverlay() {
-  overlayEnabled = !overlayEnabled;
-  const btn = document.getElementById('overlayBtn');
-  btn.style.opacity = overlayEnabled ? '' : '.5';
-  document.getElementById('overlayLayersSel').disabled  = !overlayEnabled;
-  document.getElementById('overlayBlurInput').disabled  = !overlayEnabled;
-  document.getElementById('overlayBlurUnit').style.opacity = overlayEnabled ? '' : '.4';
-  const area = document.getElementById('viewerArea');
-  if (area) area.style.overflow = (pinMarkerCenter || overlayEnabled) ? 'hidden' : '';
-  if (overlayEnabled) {
-    // Start with a clean slate so old single-image content doesn't linger.
-    if (area) area.innerHTML = '';
-    if (currentImage) renderTiles(currentImage, currentZoom);
-  } else {
-    // Back to single-image mode — re-render clears all layers via area.innerHTML.
-    if (currentImage) renderTiles(currentImage, currentZoom);
-  }
-}
-
-function onOverlayLayersChange() {
-  overlayMaxLayers = Number(document.getElementById('overlayLayersSel').value);
-  const area = document.getElementById('viewerArea');
-  if (area && overlayEnabled) {
-    while (area.children.length > overlayMaxLayers) area.removeChild(area.firstChild);
-    updateOverlayBlur();
-  }
-}
-
-function onOverlayBlurChange() {
-  overlayBlurStep = Math.max(0, Number(document.getElementById('overlayBlurInput').value) || 0);
-  updateOverlayBlur();
-}
-
-/** Apply a progressive blur to all overlay layers.
- *  The current (topmost) layer gets 0 blur; each step back adds overlayBlurStep px. */
-function updateOverlayBlur() {
-  if (!overlayEnabled) return;
-  const area = document.getElementById('viewerArea');
-  if (!area) return;
-  const layers = Array.from(area.children);
-  const n = layers.length;
-  layers.forEach((layer, i) => {
-    const stepsBack = n - 1 - i;   // 0 for current top layer
-    const blurPx    = stepsBack * overlayBlurStep;
-    layer.style.filter = blurPx > 0 ? `blur(${blurPx}px)` : '';
-  });
-}
-
-function toggleAutoRotate() {
-  autoRotate = !autoRotate;
-  const btn = document.getElementById('autoRotateBtn');
-  btn.style.opacity = autoRotate ? '' : '.5';
-  if (currentImage) renderTiles(currentImage, currentZoom);
-}
-
-/** Update the rotate button label to show the applied angle. */
-function updateAutoRotateLabel(deg) {
-  const btn = document.getElementById('autoRotateBtn');
-  if (!btn) return;
-  if (!autoRotate || deg === 0) {
-    btn.textContent = '↻ Rotate to marker';
-  } else {
-    btn.textContent = `↻ ${deg >= 0 ? '+' : ''}${deg.toFixed(1)}°`;
-  }
-}
-
 /** Debounce: after 120 ms of no keys, find the best image for the current direction. */
 function scheduleAutoSwitch() {
-  if (lockedImages) return;
   if (autoSwitchTimer) clearTimeout(autoSwitchTimer);
   autoSwitchTimer = setTimeout(() => {
     autoSwitchTimer = null;
@@ -1307,7 +794,7 @@ function scheduleAutoSwitch() {
     let best = null, bestDist = Infinity;
     for (const img of allImages) {
       if (img.viewDirection !== dir) continue;
-      const [cx, cy] = img.lookAtMgi;
+      const [cx, cy] = img.mgiCenter;
       const dist = Math.hypot(qx - cx, qy - cy);
       if (dist < bestDist) { bestDist = dist; best = img; }
     }
@@ -1321,8 +808,8 @@ function scheduleAutoSwitch() {
 function switchToImageBg(img, qx, qy) {
   img = {
     ...img,
-    distM:       Math.round(Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1])),
-    distCenter:  Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1]),
+    distM:       Math.round(Math.hypot(qx - img.mgiCenter[0], qy - img.mgiCenter[1])),
+    distCenter:  Math.hypot(qx - img.mgiCenter[0], qy - img.mgiCenter[1]),
     coversPoint: img.footprintMgi ? pointInPolygon2D(qx, qy, img.footprintMgi) : true,
   };
   let done = false;
@@ -1348,49 +835,6 @@ function highlightInList(name) {
   });
 }
 
-/** delta: -1 = previous (, key), +1 = next (. key) — wraps */
-function stepResultList(delta) {
-  const list  = document.getElementById('resultsList');
-  const items = list?._items;
-  if (!items || items.length === 0) return;
-  const curIdx = currentImage ? items.findIndex(it => it.name === currentImage.name) : -1;
-  const newIdx = ((curIdx + delta) % items.length + items.length) % items.length;
-  const elems  = list.querySelectorAll('.result-item');
-  if (elems[newIdx]) {
-    selectImage(newIdx, elems[newIdx]);
-    elems[newIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  }
-}
-
-function stopListPlay() {
-  if (listPlayTimer != null) {
-    clearInterval(listPlayTimer);
-    listPlayTimer = null;
-  }
-  listPlayActive = false;
-  const btn = document.getElementById('listPlayBtn');
-  if (btn) btn.textContent = '▶';
-}
-
-function startListPlay() {
-  stopListPlay();
-  const sec = Number(document.getElementById('listPlayIntervalSec')?.value);
-  const ms  = Math.max(50, Math.round((Number.isFinite(sec) && sec > 0 ? sec : 1) * 1000));
-  listPlayTimer = setInterval(() => stepResultList(1), ms);
-  listPlayActive = true;
-  const btn = document.getElementById('listPlayBtn');
-  if (btn) btn.textContent = '⏸';
-}
-
-function toggleListPlay() {
-  if (listPlayActive) stopListPlay();
-  else startListPlay();
-}
-
-function restartListPlayIfActive() {
-  if (listPlayActive) startListPlay();
-}
-
 // ── Continuous keyboard movement: fires every animation frame while keys held ──
 const ARROW_KEYS = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'];
 const keysHeld   = new Set();
@@ -1400,14 +844,6 @@ let   keyRafId   = null, lastKeyTs = null;
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
   if (e.key === 'Shift') { shiftHeld = true; return; }
-
-  // , / . — step through the result list (wraps around)
-  if (e.key === ',' || e.key === '.') {
-    e.preventDefault();
-    stepResultList(e.key === '.' ? 1 : -1);
-    return;
-  }
-
   if (!ARROW_KEYS.includes(e.key) || !currentImage) return;
   e.preventDefault();
   keysHeld.add(e.key);
@@ -1562,8 +998,5 @@ document.getElementById('viewerArea').addEventListener('wheel', e => {
 
 loadIndex();
 </script>
-<!-- Hidden container that keeps tile <img> elements alive so their decoded bitmaps
-     remain in the browser's image cache between image switches. -->
-<div id="tileCache" style="position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;visibility:hidden;"></div>
 </body>
 </html>
