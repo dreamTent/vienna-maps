@@ -142,8 +142,13 @@
           <input type="number" id="radiusInput" value="200" min="10" max="5000" step="10">
         </div>
       </div>
-      <div style="display:flex;gap:6px;align-items:center">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
         <button id="searchBtn" onclick="doSearch()" disabled>Search</button>
+        <label style="display:flex;align-items:center;gap:5px;font-size:.75rem;cursor:pointer;color:var(--text-dim)"
+               title="Run Search again when coordinates change (typing, arrow keys, drag)">
+          <input type="checkbox" id="autoSearchOnMoveCb">
+          Auto-search on move
+        </label>
         <span style="font-size:.72rem;color:var(--text-dim)" id="indexStatus">—</span>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
@@ -160,8 +165,20 @@
           <option value="10">10 images (~420 MB)</option>
           <option value="20">20 images (~840 MB)</option>
           <option value="50">50 images (~2.1 GB)</option>
+          <option value="70">70 images (~2.9 GB)</option>
+          <option value="100">100 images (~4.2 GB)</option>
         </select>
+        <button type="button" class="btn-sm" id="preloadListBtn" onclick="preloadResultList()" disabled
+                title="Decode tiles for every image in the current list into memory, up to the max above. Order keeps best-ranked matches (LRU). Uses the current tile-quality zoom (z), or z1 if none open.">
+          Preload list
+        </button>
+        <label class="filter-label" style="margin-left:2px"
+               title="After each search or sort, run Preload list automatically">
+          <input type="checkbox" id="preloadListAutoCb" disabled onchange="onPreloadListAutoChange()">
+          Auto-preload
+        </label>
         <span id="cacheInfo" style="font-size:.72rem;color:var(--text-dim)"></span>
+        <span id="preloadProgress" style="font-size:.72rem;color:var(--accent2);min-width:12em"></span>
       </div>
     </div>
 
@@ -250,7 +267,20 @@
              style="width:46px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.73rem;padding:2px 5px;"
              oninput="onOverlayBlurChange()">
       <span id="overlayBlurUnit" style="font-size:.73rem;color:var(--text-dim);opacity:.4">px/layer</span>
+      <label class="filter-label" title="Off: per-camera pan offset only. On: back layers are warped with a perspective homography from the ground plane (fixed Z) into the active image’s view — correct for pinhole cameras on a flat slice; not a full spherical/terrain reprojection.">
+        <input type="checkbox" id="overlayStretchToMainCb" disabled onchange="if(overlayEnabled)syncOverlayLayersToMarker()">
+        Reproject to main
+      </label>
       <button class="btn-sm" id="lockImagesBtn"    onclick="toggleLockImages()">🔓 Lock image</button>
+      <label class="filter-label" style="margin-left:4px"
+             title="Decode every tile for the next view before swapping. Current image stays until the new one is ready.">
+        <input type="checkbox" id="waitFullTilesSwitchCb">
+        Wait full tiles
+      </label>
+      <label class="filter-label" title="When off, auto-switch runs after you release keys or finish dragging (not every frame).">
+        <input type="checkbox" id="autoSwitchWhileMovingCb" checked>
+        Switch while moving
+      </label>
       <button class="btn-sm" id="autoRotateBtn"   onclick="toggleAutoRotate()">↻ Rotate to marker</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
       <span style="display:flex;align-items:center;gap:4px;font-size:.68rem;color:var(--text-dim);white-space:nowrap"
@@ -263,7 +293,7 @@
         <span>s</span>
       </span>
       <span style="font-size:.68rem;color:var(--text-dim);white-space:nowrap"
-            title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads. , / . step through the list.">⌨ ↑↓←→ · , .</span>
+            title="Arrow keys: move along view (↑↓←→, Shift=×10). + / # visual zoom (DE layout). , / . list.">⌨ ↑↓←→ +# · , .</span>
     </div>
     <div class="viewer-area" id="viewerArea">
       <div class="empty-viewer">← Select an image from the list</div>
@@ -517,6 +547,152 @@ function computeInvJacobian(img, lat, lon, Z) {
   return { dXdPx: d/det, dXdPy: -b/det, dYdPx: -c/det, dYdPy: a/det };
 }
 
+/**
+ * Ray–ground-plane intersection in MGI: image pixel (px,py) at fixed ground Z (metres).
+ * Inverts the same pinhole model as projectToPixel (single planar Z slice).
+ */
+function pixelToGroundMgi(img, px, py, Z) {
+  if (!img.pToImage) return null;
+  const P = img.pToImage;
+  const a11 = P[0][0] - px * P[2][0];
+  const a12 = P[0][1] - px * P[2][1];
+  const b1 = px * (P[2][2] * Z + P[2][3]) - P[0][2] * Z - P[0][3];
+  const a21 = P[1][0] - py * P[2][0];
+  const a22 = P[1][1] - py * P[2][1];
+  const b2 = py * (P[2][2] * Z + P[2][3]) - P[1][2] * Z - P[1][3];
+  const det = a11 * a22 - a12 * a21;
+  if (Math.abs(det) < 1e-18) return null;
+  const X = (b1 * a22 - b2 * a12) / det;
+  const Y = (a11 * b2 - a21 * b1) / det;
+  return [X, Y];
+}
+
+function groundMgiToPixel(img, X, Y, Z) {
+  if (!img.pToImage) return null;
+  const P = img.pToImage;
+  const u = P[0][0] * X + P[0][1] * Y + P[0][2] * Z + P[0][3];
+  const v = P[1][0] * X + P[1][1] * Y + P[1][2] * Z + P[1][3];
+  const w = P[2][0] * X + P[2][1] * Y + P[2][2] * Z + P[2][3];
+  if (Math.abs(w) < 1e-10) return null;
+  return [u / w, v / w];
+}
+
+function applyHomography2D(H, x, y) {
+  const w = H[2][0] * x + H[2][1] * y + H[2][2];
+  if (Math.abs(w) < 1e-14) return null;
+  return [
+    (H[0][0] * x + H[0][1] * y + H[0][2]) / w,
+    (H[1][0] * x + H[1][1] * y + H[1][2]) / w,
+  ];
+}
+
+/** Solve 8×8 system A x = b (partial pivot). */
+function solveLinear8(A, b) {
+  const n = 8;
+  const M = A.map((row, i) => row.slice().concat(b[i]));
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(M[r][col]) > Math.abs(M[pivot][col])) pivot = r;
+    }
+    if (Math.abs(M[pivot][col]) < 1e-14) return null;
+    if (pivot !== col) [M[col], M[pivot]] = [M[pivot], M[col]];
+    const div = M[col][col];
+    for (let j = col; j <= n; j++) M[col][j] /= div;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col];
+      if (f !== 0) for (let j = col; j <= n; j++) M[r][j] -= f * M[col][j];
+    }
+  }
+  return M.map(row => row[n]);
+}
+
+/** Homography H with h₂₂=1 mapping src → dst (four point pairs, pixel coords). */
+function homographyFrom4Points2D(srcPts, dstPts) {
+  const A = [];
+  const b = [];
+  for (let i = 0; i < 4; i++) {
+    const x = srcPts[i][0], y = srcPts[i][1];
+    const xp = dstPts[i][0], yp = dstPts[i][1];
+    A.push([x, y, 1, 0, 0, 0, -xp * x, -xp * y]);
+    b.push(xp);
+    A.push([0, 0, 0, x, y, 1, -yp * x, -yp * y]);
+    b.push(yp);
+  }
+  const h8 = solveLinear8(A, b);
+  if (!h8) return null;
+  return [
+    [h8[0], h8[1], h8[2]],
+    [h8[3], h8[4], h8[5]],
+    [h8[6], h8[7], 1],
+  ];
+}
+
+/**
+ * Two perspective views of the same ground plane (fixed Z) are related by a plane homography.
+ * This matches the “ball” / perspective field of view better than uniform scale; it is still
+ * a planar slice — very large footprints need terrain + ellipsoid for strict spherical mapping.
+ */
+function homographyLayerNativeToMainNative(imgLayer, imgMain, Z) {
+  const W = imgLayer.width, H = imgLayer.height;
+  const corners = [[0, 0], [W, 0], [W, H], [0, H]];
+  const src = [];
+  const dst = [];
+  for (let i = 0; i < 4; i++) {
+    const px = corners[i][0], py = corners[i][1];
+    const g = pixelToGroundMgi(imgLayer, px, py, Z);
+    if (!g) return null;
+    const m = groundMgiToPixel(imgMain, g[0], g[1], Z);
+    if (!m) return null;
+    src.push([px, py]);
+    dst.push([m[0], m[1]]);
+  }
+  return homographyFrom4Points2D(src, dst);
+}
+
+function overlayNativeToPadXY(px, py, scale, rotDeg, cw, ch) {
+  let vx = px * scale;
+  let vy = py * scale;
+  if (rotDeg !== 0 && cw > 0 && ch > 0) {
+    const cx = cw / 2, cy = ch / 2;
+    const θ = rotDeg * Math.PI / 180;
+    const dx0 = vx - cx, dy0 = vy - cy;
+    vx = cx + dx0 * Math.cos(θ) - dy0 * Math.sin(θ);
+    vy = cy + dx0 * Math.sin(θ) + dy0 * Math.cos(θ);
+  }
+  return [vx, vy];
+}
+
+/** Where a main-image native pixel lands in viewerArea coords (same stack as the top layer). */
+function mainNativeToViewportPx(pmx, pmy, viewW, viewH) {
+  const o = markerVisualInPadPx();
+  if (!o) return null;
+  let vx = pmx * currentDispScale;
+  let vy = pmy * currentDispScale;
+  const cw = currentContentW, ch = currentContentH;
+  const rotDeg = currentRotDeg;
+  if (rotDeg !== 0 && cw > 0 && ch > 0) {
+    const cx = cw / 2, cy = ch / 2;
+    const θ = rotDeg * Math.PI / 180;
+    const dx0 = vx - cx, dy0 = vy - cy;
+    vx = cx + dx0 * Math.cos(θ) - dy0 * Math.sin(θ);
+    vy = cy + dx0 * Math.sin(θ) + dy0 * Math.cos(θ);
+  }
+  return { x: vx + viewW / 2 - o.vx, y: vy + viewH / 2 - o.vy };
+}
+
+function homography3x3ToMatrix3dString(H) {
+  const h = H;
+  const m = [
+    h[0][0], h[1][0], 0, h[2][0],
+    h[0][1], h[1][1], 0, h[2][1],
+    0, 0, 1, 0,
+    h[0][2], h[1][2], 0, h[2][2],
+  ];
+  return `matrix3d(${m.join(',')})`;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  LOAD INDEX
 // ═══════════════════════════════════════════════════════════════
@@ -543,12 +719,15 @@ function setBadgeReady(count) {
 }
 
 async function onImageSetChange() {
+  if (positionSearchTimer) { clearTimeout(positionSearchTimer); positionSearchTimer = null; }
   setBadgeLoading('Switching set…');
   document.getElementById('progressFill').style.display = '';
   document.getElementById('progressFill').style.width = '0%';
 
   document.getElementById('resultsHeader').style.display = 'none';
-  document.getElementById('resultsList').innerHTML = '';
+  const rl = document.getElementById('resultsList');
+  if (rl) { rl.innerHTML = ''; rl._items = []; }
+  updatePreloadControls();
   document.getElementById('viewerHeader').style.display = 'none';
   document.getElementById('viewerArea').innerHTML = '<div class="empty-viewer">← Select an image from the list</div>';
   currentImage = null;
@@ -631,11 +810,31 @@ async function loadIndex() {
 //  SEARCH
 // ═══════════════════════════════════════════════════════════════
 let searchLat = 0, searchLon = 0, searchResults = [];
+let positionSearchTimer = null;
 
-function doSearch() {
+/** Debounced re-search when Auto-search is on (typing, arrows, drag). */
+function schedulePositionSearch() {
+  const cb = document.getElementById('autoSearchOnMoveCb');
+  if (!cb || !cb.checked) return;
+  clearTimeout(positionSearchTimer);
+  positionSearchTimer = setTimeout(() => {
+    positionSearchTimer = null;
+    if (!document.getElementById('autoSearchOnMoveCb')?.checked) return;
+    doSearch({ silent: true });
+  }, 200);
+}
+
+/**
+ * @param {{ silent?: boolean }} [opts] — silent: no alert if lat/lon invalid (auto-search while typing)
+ */
+function doSearch(opts) {
+  const silent = opts && opts.silent === true;
   const raw = document.getElementById('coordsInput').value.trim();
   const parts = raw.split(/[\s,]+/).map(Number);
-  if (parts.length < 2 || parts.some(isNaN)) { alert('Enter: lat, lon'); return; }
+  if (parts.length < 2 || parts.some(isNaN)) {
+    if (!silent) alert('Enter: lat, lon');
+    return;
+  }
   [searchLat, searchLon] = parts;
 
   const radiusM = Math.max(1, Number(document.getElementById('radiusInput').value) || 200);
@@ -667,6 +866,7 @@ function doSearch() {
 }
 
 document.getElementById('coordsInput').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
+document.getElementById('coordsInput').addEventListener('input', () => { schedulePositionSearch(); });
 document.getElementById('radiusInput').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
 
 /**
@@ -803,7 +1003,11 @@ function renderList(items) {
   stopListPlay();
   const list = document.getElementById('resultsList');
   list._items = items;
-  if (!items.length) { list.innerHTML = '<div class="no-results">No images in this radius.</div>'; return; }
+  if (!items.length) {
+    list.innerHTML = '<div class="no-results">No images in this radius.</div>';
+    updatePreloadControls();
+    return;
+  }
 
   list.innerHTML = items.map((img, idx) => {
     const distStr = (img.distM >= 1000 ? (img.distM/1000).toFixed(2)+' km' : img.distM+' m') +
@@ -848,6 +1052,107 @@ function renderList(items) {
       <div class="compass-wrap">${compassSVG(img.heading)}</div>
     </div>`;
   }).join('');
+  updatePreloadControls();
+  if (document.getElementById('preloadListAutoCb')?.checked) {
+    requestAnimationFrame(() => preloadResultList());
+  }
+}
+
+/** Enable/disable Preload list / Auto-preload when cache or list changes. */
+function updatePreloadControls() {
+  const btn = document.getElementById('preloadListBtn');
+  const autoCb = document.getElementById('preloadListAutoCb');
+  if (!btn) return;
+  const list = document.getElementById('resultsList');
+  const hasItems = list?._items && list._items.length > 0;
+  btn.disabled = !tileCacheEnabled || !hasItems;
+  if (autoCb) autoCb.disabled = !tileCacheEnabled;
+}
+
+let preloadRunId = 0;
+
+function setPreloadProgress(msg) {
+  const el = document.getElementById('preloadProgress');
+  if (el) el.textContent = msg || '';
+}
+
+/**
+ * Fill the tile cache with as many current list images as the limit allows.
+ * Preloads in reverse list order so LRU ends up keeping the best-ranked rows first.
+ * Shows tile download progress in #preloadProgress.
+ */
+async function preloadResultList() {
+  if (!tileCacheEnabled) {
+    alert('Enable "Keep images in memory" first.');
+    return;
+  }
+  const list = document.getElementById('resultsList');
+  const items = list?._items;
+  if (!items || !items.length) return;
+
+  preloadRunId++;
+  const run = preloadRunId;
+
+  const zBase = currentImage
+    ? Math.min(currentZoom, currentImage.tileResolution.length - 1)
+    : Math.min(currentZoom, items[0].tileResolution.length - 1);
+
+  const tasks = [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    const img = items[i];
+    const z = Math.min(zBase, img.tileResolution.length - 1);
+    tasks.push({ img, z });
+  }
+
+  let totalTiles = 0;
+  for (const { img, z } of tasks) {
+    const key = `${img.setId}/${img.name}/${z}`;
+    if (tileCacheMap.has(key)) continue;
+    const { cols, rows } = tileDims(img.width, img.height, z, img.tileResolution);
+    totalTiles += cols * rows;
+  }
+
+  const btn = document.getElementById('preloadListBtn');
+  const preloadAllCached = totalTiles === 0;
+
+  if (preloadAllCached) {
+    setPreloadProgress('Preload: already in cache');
+    setTimeout(() => { if (run === preloadRunId) setPreloadProgress(''); }, 2200);
+    return;
+  }
+
+  let loadedTiles = 0;
+  const bump = () => {
+    if (run !== preloadRunId) return;
+    loadedTiles++;
+    setPreloadProgress(`Preloading… ${loadedTiles}/${totalTiles} tiles`);
+  };
+
+  setPreloadProgress(`Preloading… 0/${totalTiles} tiles`);
+  if (btn) btn.disabled = true;
+
+  try {
+    for (const { img, z } of tasks) {
+      if (run !== preloadRunId) break;
+      const key = `${img.setId}/${img.name}/${z}`;
+      if (tileCacheMap.has(key)) {
+        tileCacheMap.get(key).seq = ++tileCacheSeq;
+        updateCacheInfo();
+        continue;
+      }
+      await preloadToCacheWithTileProgress(img, z, bump);
+    }
+    if (run === preloadRunId) {
+      setPreloadProgress(`Done · ${loadedTiles}/${totalTiles} tiles`);
+      setTimeout(() => { if (run === preloadRunId) setPreloadProgress(''); }, 2800);
+    }
+  } finally {
+    if (run === preloadRunId) updatePreloadControls();
+  }
+}
+
+function onPreloadListAutoChange() {
+  if (document.getElementById('preloadListAutoCb')?.checked) preloadResultList();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -872,14 +1177,27 @@ let viewerZoom = 1;          // current visual zoom multiplier
 let viewPadX = 0, viewPadY = 0;  // centering padding so marker-scroll math is correct
 let markerDX = -1, markerDY = -1; // last marker display position (px), -1 = no marker
 
+let imageSwitchGen = 0;
+
 function selectImage(idx, el) {
+  imageSwitchGen++;
+  const gen = imageSwitchGen;
   document.querySelectorAll('.result-item.active').forEach(e => e.classList.remove('active'));
   el.classList.add('active');
   currentImage = document.getElementById('resultsList')._items[idx];
-  // Clamp tile-quality zoom to the new image's available levels, but keep it otherwise.
   const maxZoom = currentImage.tileResolution.length - 1;
   currentZoom = Math.min(currentZoom, maxZoom);
-  openViewer(currentImage, currentZoom);
+
+  const img = currentImage;
+  const z = currentZoom;
+  if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
+    waitForAllTilesDecoded(img, z).then(() => {
+      if (gen !== imageSwitchGen) return;
+      openViewer(img, z);
+    });
+    return;
+  }
+  openViewer(img, z);
 }
 
 function openViewer(img, zoom) {
@@ -917,6 +1235,26 @@ function openViewer(img, zoom) {
 function tileDims(width, height, zoom, tileResolution) {
   const res = tileResolution[zoom];
   return { cols: Math.ceil(width/(tileSize*res)), rows: Math.ceil(height/(tileSize*res)) };
+}
+
+/** Pre-decode all JPEG tiles for an image at zoom (same URLs as the viewer). Used before swapping views. */
+function waitForAllTilesDecoded(img, zoom) {
+  const { cols, rows } = tileDims(img.width, img.height, zoom, img.tileResolution);
+  if (cols * rows === 0) return Promise.resolve();
+  const promises = [];
+  for (let y = rows - 1; y >= 0; y--) {
+    for (let x = 0; x < cols; x++) {
+      promises.push(new Promise(resolve => {
+        const el = new Image();
+        const done = () => resolve();
+        el.onload = done;
+        el.onerror = done;
+        el.src = `${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg`;
+        if (el.complete && el.naturalWidth) done();
+      }));
+    }
+  }
+  return Promise.all(promises);
 }
 
 function renderTiles(img, zoom) {
@@ -1007,6 +1345,8 @@ function renderTiles(img, zoom) {
     layer.id    = 'rotPadDiv';
     layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform;';
     layer.innerHTML = innerHtml;
+    layer._overlayImage = img;
+    layer._overlayRotDeg = rotDeg;
     area.appendChild(layer);
 
     // Trim oldest layers once we exceed the limit, then re-apply blur.
@@ -1225,6 +1565,45 @@ function preloadToCache(img, zoom) {
   updateCacheInfo();
 }
 
+/**
+ * Same as preloadToCache, but waits for each tile to load (or fail) and calls onTile once per tile.
+ */
+async function preloadToCacheWithTileProgress(img, zoom, onTile) {
+  if (!tileCacheEnabled) return;
+  const key = `${img.setId}/${img.name}/${zoom}`;
+  if (tileCacheMap.has(key)) {
+    tileCacheMap.get(key).seq = ++tileCacheSeq;
+    updateCacheInfo();
+    return;
+  }
+  tileCacheEvict();
+  const { cols, rows } = tileDims(img.width, img.height, zoom, img.tileResolution);
+  const container = document.getElementById('tileCache');
+  const els = [];
+  const promises = [];
+  for (let y = rows - 1; y >= 0; y--) {
+    for (let x = 0; x < cols; x++) {
+      promises.push(
+        new Promise(resolve => {
+          const el = new Image();
+          const done = () => {
+            onTile?.();
+            resolve();
+          };
+          el.onload = done;
+          el.onerror = done;
+          el.src = `${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg`;
+          container.appendChild(el);
+          els.push(el);
+        })
+      );
+    }
+  }
+  tileCacheMap.set(key, { els, seq: ++tileCacheSeq });
+  updateCacheInfo();
+  await Promise.all(promises);
+}
+
 function updateCacheInfo() {
   const el = document.getElementById('cacheInfo');
   if (!el) return;
@@ -1244,6 +1623,7 @@ function onCacheToggle() {
   } else if (currentImage) {
     preloadToCache(currentImage, currentZoom);
   }
+  updatePreloadControls();
 }
 
 function onCacheSizeChange() {
@@ -1252,15 +1632,11 @@ function onCacheSizeChange() {
   updateCacheInfo();
 }
 
-/** Position the viewer so the marker is centred (respects zoomToMarker and pinMarkerCenter). */
-function scrollToMarker() {
-  if (!zoomToMarker || markerDX < 0 || markerDY < 0) return;
-  const area = document.getElementById('viewerArea');
-  if (!area) return;
-
-  // When a CSS rotation is applied, the marker's visual position in the
-  // scrollable coordinate system differs from its position in content space.
-  // Rotate (markerDX, markerDY) around the content centre by the same angle.
+/**
+ * Marker position (px) in rotPadDiv / scroll space, including clip rotation — same math as scroll/pinch.
+ */
+function markerVisualInPadPx() {
+  if (markerDX < 0 || markerDY < 0) return null;
   let vx = markerDX, vy = markerDY;
   if (currentRotDeg !== 0 && currentContentW > 0) {
     const cx = currentContentW / 2, cy = currentContentH / 2;
@@ -1269,20 +1645,139 @@ function scrollToMarker() {
     vx = cx + dx * Math.cos(θ) - dy * Math.sin(θ);
     vy = cy + dx * Math.sin(θ) + dy * Math.cos(θ);
   }
+  return { vx, vy };
+}
 
-  if (pinMarkerCenter || overlayEnabled) {
-    // Translate the current (topmost) layer so the marker lands at the exact viewport centre.
-    // In overlay mode every layer keeps its own frozen translate, so older images remain
-    // aligned at the same real-world point even as new layers appear on top.
-    const tx = area.clientWidth  / 2 - vx;
-    const ty = area.clientHeight / 2 - vy;
+/** ⊙ Pin centre: translate that keeps the marker in the viewport middle (for pinch we must keep this with scale). */
+function getPinCenterTranslateParts() {
+  if (!pinMarkerCenter || !zoomToMarker) return null;
+  const o = markerVisualInPadPx();
+  if (!o) return null;
+  const area = document.getElementById('viewerArea');
+  if (!area) return null;
+  return {
+    vx: o.vx,
+    vy: o.vy,
+    tx: area.clientWidth / 2 - o.vx,
+    ty: area.clientHeight / 2 - o.vy,
+  };
+}
+
+/**
+ * ⧉ Overlay: each layer uses its own camera so the ground marker is centred in that view
+ * (layers are offset behind each other). Optional “Reproject to main” applies a plane
+ * homography (ground Z) + CSS matrix3d so back layers match the main image’s perspective.
+ */
+function syncOverlayLayersToMarker() {
+  if (!overlayEnabled || !zoomToMarker) return;
+  const area = document.getElementById('viewerArea');
+  if (!area) return;
+  const viewW = area.clientWidth || 800;
+  const viewH = area.clientHeight || 600;
+  const layers = Array.from(area.children);
+  const hVal = document.getElementById('heightNum').value;
+  const Z = hVal === '' ? 0 : Number(hVal);
+
+  const main = currentImage;
+  const reprojectToMain = document.getElementById('overlayStretchToMainCb')?.checked;
+
+  layers.forEach((layer, idx) => {
+    const img = layer._overlayImage;
+    if (!img) return;
+    const isTop = idx === layers.length - 1;
+    const rotDeg = isTop ? currentRotDeg : (layer._overlayRotDeg || 0);
+    const baseFit = Math.min(viewW / img.width, viewH / img.height);
+    const scale = baseFit * viewerZoom;
+    const proj = projectToPixel(img, searchLat, searchLon, Z);
+    if (!proj) return;
+    let vx = proj[0] * scale;
+    let vy = proj[1] * scale;
+    const cw = Math.round(img.width * scale);
+    const ch = Math.round(img.height * scale);
+    if (rotDeg !== 0 && cw > 0 && ch > 0) {
+      const cx = cw / 2, cy = ch / 2;
+      const θ = rotDeg * Math.PI / 180;
+      const dx0 = vx - cx, dy0 = vy - cy;
+      vx = cx + dx0 * Math.cos(θ) - dy0 * Math.sin(θ);
+      vy = cy + dx0 * Math.sin(θ) + dy0 * Math.cos(θ);
+    }
+
+    const tx = viewW / 2 - vx;
+    const ty = viewH / 2 - vy;
+
+    if (isTop || !reprojectToMain || !main || !main.pToImage || !img.pToImage || img === main) {
+      layer.style.transformOrigin = '';
+      layer.style.transform = `translate(${tx}px, ${ty}px)`;
+      return;
+    }
+
+    const Hnm = homographyLayerNativeToMainNative(img, main, Z);
+    if (!Hnm) {
+      layer.style.transformOrigin = '';
+      layer.style.transform = `translate(${tx}px, ${ty}px)`;
+      return;
+    }
+
+    const Wn = img.width, Hn = img.height;
+    const nc = [[0, 0], [Wn, 0], [Wn, Hn], [0, Hn]];
+    const srcPad = [];
+    const dstVp = [];
+    for (let k = 0; k < 4; k++) {
+      const pm = applyHomography2D(Hnm, nc[k][0], nc[k][1]);
+      if (!pm) {
+        layer.style.transformOrigin = '';
+        layer.style.transform = `translate(${tx}px, ${ty}px)`;
+        return;
+      }
+      const vp = mainNativeToViewportPx(pm[0], pm[1], viewW, viewH);
+      if (!vp) {
+        layer.style.transformOrigin = '';
+        layer.style.transform = `translate(${tx}px, ${ty}px)`;
+        return;
+      }
+      srcPad.push(overlayNativeToPadXY(nc[k][0], nc[k][1], scale, rotDeg, cw, ch));
+      dstVp.push([vp.x, vp.y]);
+    }
+
+    const Hvp = homographyFrom4Points2D(srcPad, dstVp);
+    if (!Hvp) {
+      layer.style.transformOrigin = '';
+      layer.style.transform = `translate(${tx}px, ${ty}px)`;
+      return;
+    }
+
+    layer.style.transformOrigin = '0 0';
+    layer.style.transform = homography3x3ToMatrix3dString(Hvp);
+  });
+  updateOverlayBlur();
+}
+
+/** Position the viewer so the marker is centred (respects zoomToMarker and pinMarkerCenter). */
+function scrollToMarker() {
+  if (!zoomToMarker || markerDX < 0 || markerDY < 0) return;
+  const area = document.getElementById('viewerArea');
+  if (!area) return;
+
+  if (overlayEnabled) {
+    syncOverlayLayersToMarker();
+    area.scrollLeft = 0;
+    area.scrollTop = 0;
+    return;
+  }
+
+  const o = markerVisualInPadPx();
+  if (!o) return;
+
+  if (pinMarkerCenter) {
+    const tx = area.clientWidth / 2 - o.vx;
+    const ty = area.clientHeight / 2 - o.vy;
     const padDiv = document.getElementById('rotPadDiv');
     if (padDiv) padDiv.style.transform = `translate(${tx}px, ${ty}px)`;
     area.scrollLeft = 0;
-    area.scrollTop  = 0;
+    area.scrollTop = 0;
   } else {
-    area.scrollLeft = viewPadX + vx - area.clientWidth  / 2;
-    area.scrollTop  = viewPadY + vy - area.clientHeight / 2;
+    area.scrollLeft = viewPadX + o.vx - area.clientWidth / 2;
+    area.scrollTop = viewPadY + o.vy - area.clientHeight / 2;
   }
 }
 
@@ -1334,8 +1829,10 @@ async function downloadCurrent() {
 //  ARROW KEY NAVIGATION  (moves the search point in MGI space)
 // ═══════════════════════════════════════════════════════════════
 let autoSwitchTimer = null;
+/** Last time performAutoSwitch ran when “Switch while moving” is on (throttle, not debounce). */
+let lastThrottledAutoSwitch = 0;
 
-/** Move search point by (dxM, dyM) metres (East=+x, North=+y) in MGI. */
+/** Move search point by (dxM, dyM) metres (East=+x, North=+y) in MGI ground plane. */
 function moveMarker(dxM, dyM) {
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
   const [newLon, newLat] = wgs84ToMgi.inverse([mx + dxM, my + dyM]);
@@ -1343,7 +1840,8 @@ function moveMarker(dxM, dyM) {
   searchLon = newLon;
   document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
   refreshDot();
-  scheduleAutoSwitch();
+  if (document.getElementById('autoSwitchWhileMovingCb')?.checked !== false) scheduleAutoSwitch();
+  schedulePositionSearch();
 }
 
 let lockedImages = false;
@@ -1361,6 +1859,8 @@ function toggleOverlay() {
   document.getElementById('overlayLayersSel').disabled  = !overlayEnabled;
   document.getElementById('overlayBlurInput').disabled  = !overlayEnabled;
   document.getElementById('overlayBlurUnit').style.opacity = overlayEnabled ? '' : '.4';
+  const st = document.getElementById('overlayStretchToMainCb');
+  if (st) st.disabled = !overlayEnabled;
   const area = document.getElementById('viewerArea');
   if (area) area.style.overflow = (pinMarkerCenter || overlayEnabled) ? 'hidden' : '';
   if (overlayEnabled) {
@@ -1388,7 +1888,9 @@ function onOverlayBlurChange() {
 }
 
 /** Apply a progressive blur to all overlay layers.
- *  The current (topmost) layer gets 0 blur; each step back adds overlayBlurStep px. */
+ *  The current (topmost) layer gets 0 blur; each step back adds overlayBlurStep px.
+ *  Explicit z-index keeps paint order correct when transform + filter both create stacking contexts
+ *  (otherwise blurred layers can paint above the sharp top layer, especially with stacked transforms). */
 function updateOverlayBlur() {
   if (!overlayEnabled) return;
   const area = document.getElementById('viewerArea');
@@ -1396,6 +1898,7 @@ function updateOverlayBlur() {
   const layers = Array.from(area.children);
   const n = layers.length;
   layers.forEach((layer, i) => {
+    if (layer._overlayImage) layer.style.zIndex = String(i + 1);
     const stepsBack = n - 1 - i;   // 0 for current top layer
     const blurPx    = stepsBack * overlayBlurStep;
     layer.style.filter = blurPx > 0 ? `blur(${blurPx}px)` : '';
@@ -1420,48 +1923,92 @@ function updateAutoRotateLabel(deg) {
   }
 }
 
-/** Debounce: after 120 ms of no keys, find the best image for the current direction. */
-function scheduleAutoSwitch() {
-  if (lockedImages) return;
-  if (autoSwitchTimer) clearTimeout(autoSwitchTimer);
-  autoSwitchTimer = setTimeout(() => {
-    autoSwitchTimer = null;
-    if (!currentImage) return;
-    const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
-    const dir = currentImage.viewDirection;
-    let best = null, bestDist = Infinity;
-    for (const img of allImages) {
-      if (img.viewDirection !== dir) continue;
-      const [cx, cy] = img.lookAtMgi;
-      const dist = Math.hypot(qx - cx, qy - cy);
-      if (dist < bestDist) { bestDist = dist; best = img; }
-    }
-    if (best && best.name !== currentImage.name) {
-      switchToImageBg(best, qx, qy);
-    }
-  }, 120);
+const AUTO_SWITCH_MS = 120;
+
+/** Find best same-direction image and switch if closer than current. */
+function performAutoSwitch() {
+  if (!currentImage) return;
+  const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const dir = currentImage.viewDirection;
+  let best = null, bestDist = Infinity;
+  for (const img of allImages) {
+    if (img.viewDirection !== dir) continue;
+    const [cx, cy] = img.lookAtMgi;
+    const dist = Math.hypot(qx - cx, qy - cy);
+    if (dist < bestDist) { bestDist = dist; best = img; }
+  }
+  if (best && best.name !== currentImage.name) {
+    switchToImageBg(best, qx, qy);
+  }
 }
 
-/** Preload the lowest-res tile of the candidate; switch once it arrives (max 800 ms). */
+/**
+ * When “Switch while moving” is on: throttle (runs during drag/held keys, at most every 120 ms).
+ * When off: debounce (waits 120 ms after last event — only when you pause / release).
+ */
+function scheduleAutoSwitch() {
+  if (lockedImages) return;
+  const whileMoving = document.getElementById('autoSwitchWhileMovingCb')?.checked !== false;
+
+  if (!whileMoving) {
+    if (autoSwitchTimer) clearTimeout(autoSwitchTimer);
+    autoSwitchTimer = setTimeout(() => {
+      autoSwitchTimer = null;
+      performAutoSwitch();
+    }, AUTO_SWITCH_MS);
+    return;
+  }
+
+  const now = Date.now();
+  if (now - lastThrottledAutoSwitch >= AUTO_SWITCH_MS) {
+    lastThrottledAutoSwitch = now;
+    performAutoSwitch();
+    return;
+  }
+  if (autoSwitchTimer) return;
+  autoSwitchTimer = setTimeout(() => {
+    autoSwitchTimer = null;
+    lastThrottledAutoSwitch = Date.now();
+    performAutoSwitch();
+  }, AUTO_SWITCH_MS - (now - lastThrottledAutoSwitch));
+}
+
+/** Auto-switch to a better image for the same view direction; honours Wait full tiles / fast probe. */
 function switchToImageBg(img, qx, qy) {
+  imageSwitchGen++;
+  const gen = imageSwitchGen;
   img = {
     ...img,
     distM:       Math.round(Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1])),
     distCenter:  Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1]),
     coversPoint: img.footprintMgi ? pointInPolygon2D(qx, qy, img.footprintMgi) : true,
   };
+  const z = Math.min(currentZoom, img.tileResolution.length - 1);
+
+  if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
+    waitForAllTilesDecoded(img, z).then(() => {
+      if (gen !== imageSwitchGen) return;
+      currentImage = img;
+      currentZoom = z;
+      openViewer(img, z);
+      highlightInList(img.name);
+    });
+    return;
+  }
+
   let done = false;
   const commit = () => {
     if (done) return; done = true;
+    if (gen !== imageSwitchGen) return;
     currentImage = img;
-    currentZoom  = Math.min(currentZoom, img.tileResolution.length - 1);
-    openViewer(img, currentZoom);
+    currentZoom = z;
+    openViewer(img, z);
     highlightInList(img.name);
   };
   const probe = new Image();
   probe.onload  = commit;
-  probe.onerror = commit;   // switch even on error — remaining tiles may still load
-  setTimeout(commit, 800);  // fallback: don't wait forever
+  probe.onerror = commit;
+  setTimeout(commit, 800);
   probe.src = `${img.remoteBaseUrl}/${img.name}/0/0/0.jpg`;
 }
 
@@ -1526,6 +2073,20 @@ document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
   if (e.key === 'Shift') { shiftHeld = true; return; }
 
+  // Visual zoom: + and # (German QWERTZ), also = − numpad (when an image is open)
+  if (currentImage) {
+    const k = e.key;
+    const zoomIn =
+      k === '+' || k === '=' || e.code === 'NumpadAdd';
+    const zoomOut =
+      k === '#' || k === '-' || e.code === 'NumpadSubtract';
+    if (zoomIn || zoomOut) {
+      e.preventDefault();
+      changeViewZoom(zoomIn ? 1 : -1);
+      return;
+    }
+  }
+
   // , / . — step through the result list (wraps around)
   if (e.key === ',' || e.key === '.') {
     e.preventDefault();
@@ -1542,6 +2103,10 @@ document.addEventListener('keyup', e => {
   if (e.key === 'Shift') { shiftHeld = false; return; }
   keysHeld.delete(e.key);
   if (keysHeld.size === 0) lastKeyTs = null;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+  if (ARROW_KEYS.includes(e.key) && document.getElementById('autoSwitchWhileMovingCb')?.checked === false) {
+    scheduleAutoSwitch();
+  }
 });
 
 function keyMoveLoop(ts) {
@@ -1550,11 +2115,28 @@ function keyMoveLoop(ts) {
   const dt   = Math.min((ts - lastKeyTs) / 1000, 0.1); // seconds, capped at 100 ms
   lastKeyTs  = ts;
   const step = (shiftHeld ? 300 : 50) * dt; // metres this frame
+  // View-relative: current image heading is camera view direction on the ground (° from north).
+  const h = currentImage.heading * Math.PI / 180;
+  const sin = Math.sin, cos = Math.cos;
   let dxM = 0, dyM = 0;
-  if (keysHeld.has('ArrowUp'))    dyM += step;
-  if (keysHeld.has('ArrowDown'))  dyM -= step;
-  if (keysHeld.has('ArrowLeft'))  dxM -= step;
-  if (keysHeld.has('ArrowRight')) dxM += step;
+  if (keysHeld.has('ArrowUp')) {
+    dxM += step * sin(h);
+    dyM += step * cos(h);
+  }
+  if (keysHeld.has('ArrowDown')) {
+    dxM -= step * sin(h);
+    dyM -= step * cos(h);
+  }
+  if (keysHeld.has('ArrowLeft')) {
+    const hl = h - Math.PI / 2;
+    dxM += step * sin(hl);
+    dyM += step * cos(hl);
+  }
+  if (keysHeld.has('ArrowRight')) {
+    const hr = h + Math.PI / 2;
+    dxM += step * sin(hr);
+    dyM += step * cos(hr);
+  }
   moveMarker(dxM, dyM);
   keyRafId = requestAnimationFrame(keyMoveLoop);
 }
@@ -1593,13 +2175,15 @@ function applyDrag(clientX, clientY) {
   searchLon = newLon;
   document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
   refreshDot();
-  scheduleAutoSwitch();
+  if (document.getElementById('autoSwitchWhileMovingCb')?.checked !== false) scheduleAutoSwitch();
+  schedulePositionSearch();
 }
 
 function endDrag() {
   isDragging = false;
   dragInvJ   = null;
   viewerAreaEl.style.cursor = 'grab';
+  if (document.getElementById('autoSwitchWhileMovingCb')?.checked === false) scheduleAutoSwitch();
 }
 
 viewerAreaEl.addEventListener('mousedown', e => {
@@ -1640,12 +2224,14 @@ viewerAreaEl.addEventListener('touchstart', e => {
     pinchStartDist = pinchDist(e.touches);
     pinchStartZoom = viewerZoom;
     pinchLastRatio = 1;
-    // Anchor the scale to the viewport centre (where the marker lives).
     const el = viewerAreaEl.firstElementChild;
     if (el) {
-      const ox = viewerAreaEl.scrollLeft + viewerAreaEl.clientWidth  / 2;
-      const oy = viewerAreaEl.scrollTop  + viewerAreaEl.clientHeight / 2;
-      el.style.transformOrigin = `${ox}px ${oy}px`;
+      const m = markerVisualInPadPx();
+      if (m) {
+        el.style.transformOrigin = `${m.vx}px ${m.vy}px`;
+      } else {
+        el.style.transformOrigin = `${viewerAreaEl.scrollLeft + viewerAreaEl.clientWidth / 2}px ${viewerAreaEl.scrollTop + viewerAreaEl.clientHeight / 2}px`;
+      }
     }
     e.preventDefault();
   }
@@ -1657,9 +2243,15 @@ viewerAreaEl.addEventListener('touchmove', e => {
     applyDrag(e.touches[0].clientX, e.touches[0].clientY);
   } else if (e.touches.length === 2 && isPinching) {
     pinchLastRatio = pinchDist(e.touches) / pinchStartDist;
-    // CSS scale gives smooth real-time feedback; no DOM rebuild until fingers lift.
     const el = viewerAreaEl.firstElementChild;
-    if (el) el.style.transform = `scale(${pinchLastRatio})`;
+    if (!el) return;
+    // ⊙ Pin centre already uses translate(tx,ty) on rotPadDiv — must not replace with scale() alone.
+    const pc = getPinCenterTranslateParts();
+    if (pc) {
+      el.style.transform = `translate(${pc.tx}px, ${pc.ty}px) scale(${pinchLastRatio})`;
+    } else {
+      el.style.transform = `scale(${pinchLastRatio})`;
+    }
   }
 }, { passive: false });
 
