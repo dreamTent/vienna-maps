@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Vienna Oblique Aerial Photography Map and Finder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Infinite scroll — Vienna oblique</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.0/proj4.js"></script>
   <style>
     :root {
@@ -13,7 +13,9 @@
       --success: #3fb950; --warning: #d29922; --error: #f85149;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; }
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px;
+      overscroll-behavior: none;
+    }
 
     .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 10px 20px; display: flex; align-items: center; gap: 10px; }
     .header h1 { font-size: .95rem; font-weight: 600; flex: 1; }
@@ -106,6 +108,110 @@
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: var(--bg); }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* Mobile “infinite scroll”: map only — left + viewer toolbars stay in DOM for scripts */
+    body.infinite-scroll .header { display: none !important; }
+    body.infinite-scroll .left-panel { display: none !important; }
+    body.infinite-scroll #viewerHeader { display: none !important; }
+    body.infinite-scroll .app { height: 100vh; height: 100dvh; }
+    body.infinite-scroll .right-panel { min-height: 0; }
+    /* Keep map below fixed UI (orbit FAB is a body-level sibling after .app) */
+    body.infinite-scroll .app {
+      position: relative;
+      z-index: 0;
+    }
+    /* Pinch / one-finger pan — avoid browser scroll & zoom stealing gestures */
+    .right-panel .viewer-area {
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    /* Must sit above tile stack (many overlay layers use inline z-index 1…n) */
+    .orbit-fab {
+      position: fixed;
+      right: max(12px, env(safe-area-inset-right));
+      bottom: max(12px, env(safe-area-inset-bottom));
+      z-index: 2147483646;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 10px;
+      pointer-events: none;
+    }
+    .orbit-fab > * { pointer-events: auto; }
+    .orbit-dpad {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      background: rgba(22, 27, 34, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px 10px;
+      box-shadow: 0 4px 20px rgba(0,0,0,.45);
+    }
+    .orbit-mid {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .orbit-hub {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--border);
+      opacity: 0.7;
+    }
+    .orbit-btn {
+      min-width: 48px;
+      min-height: 48px;
+      padding: 0 14px;
+      border-radius: 10px;
+      font-size: 1.05rem;
+      font-weight: 700;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation;
+    }
+    .orbit-btn:active { opacity: 0.85; transform: scale(0.97); }
+    .orbit-n { color: #4fc3f7; }
+    .orbit-e { color: #81c784; }
+    .orbit-s { color: #ff8a65; }
+    .orbit-w { color: #ce93d8; }
+    .orbit-zoom {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(22, 27, 34, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 4px 6px;
+      box-shadow: 0 4px 20px rgba(0,0,0,.45);
+    }
+    .orbit-tool {
+      min-width: 48px;
+      min-height: 48px;
+      width: 48px;
+      height: 48px;
+      border-radius: 10px;
+      font-size: 1.2rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .orbit-vzoom {
+      min-width: 40px;
+      text-align: center;
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      font-family: monospace;
+    }
   </style>
 </head>
 <body>
@@ -115,7 +221,7 @@
     <circle cx="12" cy="12" r="10"/>
     <polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26 12,2" fill="#58a6ff" stroke="none"/>
   </svg>
-  <h1>Vienna Oblique Image Finder</h1>
+  <h1>Infinite scroll</h1>
   <div class="badge" id="badge">
     <div class="spinner" id="spinner"></div>
     <span id="badgeText">Loading index…</span>
@@ -138,7 +244,7 @@
         </div>
         <div class="field" style="flex:2">
           <label>Latitude, Longitude</label>
-          <input type="text" id="coordsInput" value="48.2767386234921, 16.44324030796789">
+          <input type="text" id="coordsInput" value="48.2297801, 16.4137043">
         </div>
         <div class="field" style="flex:0 0 90px">
           <label title="Max distance from query point to the image ground footprint (quad edge)">Radius (m)</label>
@@ -772,6 +878,11 @@ async function loadIndex() {
   try {
     if (setSel) setSel.disabled = true;
 
+    if (document.getElementById('orbitFab')) {
+      const va = document.getElementById('viewerArea');
+      if (va) va.innerHTML = '<div class="empty-viewer">Loading index…</div>';
+    }
+
     const set = getActiveImageSet();
     activeSetId = set.id;
     activeRemoteBaseUrl = set.remoteBaseUrl;
@@ -792,6 +903,10 @@ async function loadIndex() {
       setBadgeLoading('Manifest failed');
       document.getElementById('badgeText').textContent = `Error: ${set.imageJsonPath}`;
       document.getElementById('searchBtn').disabled = false;
+      if (document.getElementById('orbitFab')) {
+        const va = document.getElementById('viewerArea');
+        if (va) va.innerHTML = '<div class="empty-viewer">Manifest failed — open the full viewer or check paths.</div>';
+      }
       return;
     }
 
@@ -828,6 +943,7 @@ async function loadIndex() {
     document.getElementById('progressFill').style.display = 'none';
     document.getElementById('searchBtn').disabled = false;
     updateCacheSizeDropdownLabels();
+    if (typeof initInfiniteScrollMode === 'function') initInfiniteScrollMode();
   } finally {
     if (setSel) setSel.disabled = false;
   }
@@ -1746,6 +1862,8 @@ function changeViewZoom(dir) {
     ? (Number.isInteger(viewerZoom) ? viewerZoom + '×' : viewerZoom.toFixed(2).replace(/\.?0+$/,'') + '×')
     : viewerZoom.toFixed(2).replace(/0+$/,'').replace(/\.$/,'') + '×';
   document.getElementById('vzoomLabel').textContent = lbl;
+  const orbitVz = document.getElementById('orbitVzoomLabel');
+  if (orbitVz) orbitVz.textContent = lbl;
 
   if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
@@ -1991,8 +2109,8 @@ function getPinCenterTranslateParts() {
 }
 
 /**
- * ⧉ Overlay uses translate(tx,ty) on each layer. Pinch preview must combine that with scale — scale-only
- * drops the translate and misaligns the image.
+ * ⧉ Overlay uses translate(tx,ty) on each layer (syncOverlayLayersToMarker). Pinch preview must
+ * combine that translate with scale — scale-only would drop the translate and jump the image.
  */
 function getMarkerCentreTranslateParts() {
   if (!zoomToMarker) return null;
@@ -2244,6 +2362,12 @@ function onOverlayLayersChange() {
 function onOverlayBlurChange() {
   overlayBlurFixed = Math.max(0, Number(document.getElementById('overlayBlurFixedInput')?.value) || 0);
   overlayBlurStep = Math.max(0, Number(document.getElementById('overlayBlurInput').value) || 0);
+  if (document.getElementById('orbitFab')) {
+    try {
+      localStorage.setItem('infOverlayBlurFixed', String(overlayBlurFixed));
+      localStorage.setItem('infOverlayBlurStep', String(overlayBlurStep));
+    } catch (_) {}
+  }
   updateOverlayBlur();
 }
 
@@ -2577,6 +2701,7 @@ let pinchLastRatio = 1;
 
 function pinchDist(t) { return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
 
+/** Top tile stack layer (overlay stacks neighbors under #rotPadDiv — must not pinch the first child). */
 function getPinchLayerEl() {
   return document.getElementById('rotPadDiv');
 }
@@ -2588,13 +2713,17 @@ function setViewerZoomTo(z) {
     ? (Number.isInteger(v) ? v+'×' : v.toFixed(2).replace(/\.?0+$/,'')+'×')
     : v.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')+'×';
   document.getElementById('vzoomLabel').textContent = lbl;
+  const orbitVz = document.getElementById('orbitVzoomLabel');
+  if (orbitVz) orbitVz.textContent = lbl;
   if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
 
 viewerAreaEl.addEventListener('touchstart', e => {
   if (e.touches.length === 1) {
     isPinching = false;
-    if (beginDrag(e.touches[0].clientX, e.touches[0].clientY)) e.preventDefault();
+    const started = beginDrag(e.touches[0].clientX, e.touches[0].clientY);
+    if (started) e.preventDefault();
+    else if (document.body.classList.contains('infinite-scroll') && currentImage) e.preventDefault();
   } else if (e.touches.length === 2) {
     isPinching     = true;
     isDragging     = false;
@@ -2660,6 +2789,120 @@ viewerAreaEl.addEventListener('touchcancel', e => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+//  INFINITE SCROLL (fullscreen map — no search UI)
+// ═══════════════════════════════════════════════════════════════
+
+let infiniteScrollModeInitialized = false;
+
+function orbitToDirection(dir) {
+  if (![1, 2, 3, 4].includes(dir) || !searchResults.length) return;
+  let best = null;
+  for (const img of searchResults) {
+    if (img.viewDirection !== dir) continue;
+    if (!best || img.distCenter < best.distCenter) best = img;
+  }
+  if (!best) return;
+  applySort();
+  const list = document.getElementById('resultsList');
+  const items = list._items || [];
+  let idx = items.findIndex(i => i.name === best.name);
+  if (idx < 0) {
+    imageSwitchGen++;
+    const gen = imageSwitchGen;
+    currentImage = best;
+    const z = getTileZoomIndex(best);
+    if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
+      waitForAllTilesDecoded(best, z).then(() => {
+        if (gen !== imageSwitchGen) return;
+        openViewer(best, z);
+      });
+    } else {
+      openViewer(best, z);
+    }
+    return;
+  }
+  selectImage(idx, document.createElement('div'));
+}
+
+function initInfiniteScrollMode() {
+  if (infiniteScrollModeInitialized) return;
+  infiniteScrollModeInitialized = true;
+  document.body.classList.add('infinite-scroll');
+
+  const coords = document.getElementById('coordsInput');
+  if (coords) coords.value = '48.2297801, 16.4137043';
+  const rad = document.getElementById('radiusInput');
+  if (rad) rad.value = '2000';
+  const autoSearch = document.getElementById('autoSearchOnMoveCb');
+  if (autoSearch) autoSearch.checked = false;
+
+  const wft = document.getElementById('waitFullTilesSwitchCb');
+  if (wft) wft.checked = true;
+  const rep = document.getElementById('overlayStretchToMainCb');
+  if (rep) rep.checked = true;
+  const nsel = document.getElementById('overlayNeighborPreloadSel');
+  if (nsel) nsel.value = '64';
+
+  try {
+    const bf = localStorage.getItem('infOverlayBlurFixed');
+    const bs = localStorage.getItem('infOverlayBlurStep');
+    const fIn = document.getElementById('overlayBlurFixedInput');
+    const sIn = document.getElementById('overlayBlurInput');
+    if (fIn && bf !== null) fIn.value = bf;
+    if (sIn && bs !== null) sIn.value = bs;
+  } catch (_) {}
+  overlayBlurFixed = Math.max(0, Number(document.getElementById('overlayBlurFixedInput')?.value) || 0);
+  overlayBlurStep = Math.max(0, Number(document.getElementById('overlayBlurInput')?.value) || 0);
+
+  markerVisible = false;
+  const mb = document.getElementById('markerToggleBtn');
+  if (mb) {
+    mb.textContent = '○ Marker';
+    mb.style.opacity = '.5';
+  }
+
+  doSearch({ silent: true });
+  applySort();
+  const list = document.getElementById('resultsList');
+  const items = list._items;
+  if (!items || !items.length) {
+    const area = document.getElementById('viewerArea');
+    if (area) {
+      area.innerHTML = '<div class="empty-viewer">No images in search radius for this point.</div>';
+    }
+    return;
+  }
+
+  imageSwitchGen++;
+  const gen = imageSwitchGen;
+  currentImage = items[0];
+  const maxZ = currentImage.tileResolution.length - 1;
+  currentZoom = Math.min(currentZoom, maxZ);
+  const img = currentImage;
+  const z = getTileZoomIndex(img);
+
+  const finishOverlayInit = () => {
+    if (!overlayEnabled) toggleOverlay();
+    const ovl = document.getElementById('overlayBtn');
+    if (ovl) ovl.style.opacity = '';
+    const vz = document.getElementById('vzoomLabel');
+    const orbitVz = document.getElementById('orbitVzoomLabel');
+    if (vz && orbitVz) orbitVz.textContent = vz.textContent;
+  };
+
+  if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
+    waitForAllTilesDecoded(img, z).then(() => {
+      if (gen !== imageSwitchGen) return;
+      openViewer(img, z);
+      finishOverlayInit();
+    });
+    return;
+  }
+  openViewer(img, z);
+  finishOverlayInit();
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  BOOT
 // ═══════════════════════════════════════════════════════════════
 
@@ -2675,5 +2918,22 @@ loadIndex();
 <!-- Hidden container that keeps tile <img> elements alive so their decoded bitmaps
      remain in the browser's image cache between image switches. -->
 <div id="tileCache" style="position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;visibility:hidden;"></div>
+
+<div class="orbit-fab" id="orbitFab" aria-label="Orbit and zoom">
+  <div class="orbit-dpad">
+    <button type="button" class="orbit-btn orbit-n" onclick="orbitToDirection(1)" title="Nearest North-facing view">N</button>
+    <div class="orbit-mid">
+      <button type="button" class="orbit-btn orbit-w" onclick="orbitToDirection(4)" title="Nearest West-facing view">W</button>
+      <span class="orbit-hub" title="Centre"></span>
+      <button type="button" class="orbit-btn orbit-e" onclick="orbitToDirection(2)" title="Nearest East-facing view">E</button>
+    </div>
+    <button type="button" class="orbit-btn orbit-s" onclick="orbitToDirection(3)" title="Nearest South-facing view">S</button>
+  </div>
+  <div class="orbit-zoom">
+    <button type="button" class="orbit-tool" onclick="changeViewZoom(-1)">−</button>
+    <span class="orbit-vzoom" id="orbitVzoomLabel">1×</span>
+    <button type="button" class="orbit-tool" onclick="changeViewZoom(+1)">+</button>
+  </div>
+</div>
 </body>
 </html>
