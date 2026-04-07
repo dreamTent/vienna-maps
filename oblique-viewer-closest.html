@@ -134,6 +134,7 @@
     <!-- Marker & zoom-to toggles -->
     <button class="btn-sm active" id="markerBtn"  onclick="toggleMarker()">● Marker</button>
     <button class="btn-sm active" id="zoomToBtn"  onclick="toggleZoomTo()">⊕ Zoom to</button>
+    <button class="btn-sm" id="lockImagesBtn" onclick="toggleLockImages()">🔓 Lock images</button>
 
     <div class="sep"></div>
 
@@ -619,8 +620,17 @@ function moveMarker(dxM, dyM) {
   scheduleAutoSwitch();
 }
 
+let lockedImages = false;
+function toggleLockImages() {
+  lockedImages = !lockedImages;
+  const btn = document.getElementById('lockImagesBtn');
+  btn.textContent = lockedImages ? '🔒 Locked' : '🔓 Lock images';
+  btn.classList.toggle('active', lockedImages);
+}
+
 /** Debounce: after 120 ms find the best image per direction and switch if needed. */
 function scheduleAutoSwitch() {
+  if (lockedImages) return;
   if (autoSwitchTimer) clearTimeout(autoSwitchTimer);
   autoSwitchTimer = setTimeout(() => {
     autoSwitchTimer = null;

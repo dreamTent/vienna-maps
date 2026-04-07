@@ -168,6 +168,7 @@
       </div>
       <button class="btn-sm" id="markerToggleBtn"  onclick="toggleMarker()">● Marker</button>
       <button class="btn-sm" id="zoomMarkerBtn"   onclick="toggleZoomToMarker()">⊕ Zoom to</button>
+      <button class="btn-sm" id="lockImagesBtn"   onclick="toggleLockImages()">🔓 Lock image</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
       <span style="font-size:.68rem;color:var(--text-dim);white-space:nowrap"
             title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads.">⌨ ↑↓←→ 5 m</span>
@@ -779,8 +780,17 @@ function moveMarker(dxM, dyM) {
   scheduleAutoSwitch();
 }
 
+let lockedImages = false;
+function toggleLockImages() {
+  lockedImages = !lockedImages;
+  const btn = document.getElementById('lockImagesBtn');
+  btn.textContent = lockedImages ? '🔒 Locked' : '🔓 Lock image';
+  btn.classList.toggle('active', lockedImages);
+}
+
 /** Debounce: after 120 ms of no keys, find the best image for the current direction. */
 function scheduleAutoSwitch() {
+  if (lockedImages) return;
   if (autoSwitchTimer) clearTimeout(autoSwitchTimer);
   autoSwitchTimer = setTimeout(() => {
     autoSwitchTimer = null;
