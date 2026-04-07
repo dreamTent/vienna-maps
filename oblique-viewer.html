@@ -68,10 +68,16 @@
     .height-ctrl input[type=range] { width: 80px; accent-color: var(--accent); }
     .height-ctrl input[type=number] { width: 58px; padding: 2px 6px; font-size: .75rem; }
 
-    .viewer-area { flex: 1; overflow: hidden; background: #080a0e; display: flex; align-items: center; justify-content: center; }
+    .viewer-area { flex: 1; overflow: auto; background: #080a0e; }
     .tile-canvas-wrap { display: inline-block; line-height: 0; }
     .tile-row { display: flex; }
     .tile-row img { display: block; flex-shrink: 0; background: #111; }
+
+    /* visual zoom controls */
+    .vzoom-ctrl { display: flex; align-items: center; gap: 3px; }
+    .vzoom-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 4px; width: 22px; height: 22px; font-size: 1rem; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .vzoom-btn:hover { border-color: var(--accent); color: var(--accent2); }
+    .vzoom-label { font-size: .75rem; color: var(--text-dim); min-width: 36px; text-align: center; font-family: monospace; }
     .empty-viewer { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-dim); font-size: .9rem; }
 
     .progress-bar { height: 3px; background: var(--border); }
@@ -145,6 +151,12 @@
         <div class="viewer-sub" id="viewerSub">—</div>
       </div>
       <div class="zoom-pills" id="zoomPills"></div>
+      <!-- visual zoom (independent of tile quality) -->
+      <div class="vzoom-ctrl" title="Visual zoom — also scroll to keep marker centred (mouse wheel)">
+        <button class="vzoom-btn" onclick="changeViewZoom(-1)">−</button>
+        <span class="vzoom-label" id="vzoomLabel">1×</span>
+        <button class="vzoom-btn" onclick="changeViewZoom(+1)">+</button>
+      </div>
       <!-- height control for dot projection -->
       <div class="height-ctrl" title="Ground elevation (Z) used for coordinate projection onto image">
         <span>Z:</span>
@@ -154,6 +166,7 @@
                oninput="document.getElementById('heightSlider').value=this.value; refreshDot()">
         <span>m</span>
       </div>
+      <button class="btn-sm" id="markerToggleBtn" onclick="toggleMarker()">● Hide marker</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
     </div>
     <div class="viewer-area" id="viewerArea">
@@ -472,12 +485,21 @@ function renderList(items) {
 let currentImage = null, currentZoom = 1;
 let currentDispScale = 1;  // display pixels per image pixel — SAME at all zoom levels
 
+// Visual zoom (multiplier on top of the fit-to-viewer base scale).
+// Kept between image switches; independent of tile quality zoom.
+const VZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 6, 8, 12, 16];
+let viewerZoom = 1;          // current visual zoom multiplier
+let viewPadX = 0, viewPadY = 0;  // centering padding so marker-scroll math is correct
+let markerDX = -1, markerDY = -1; // last marker display position (px), -1 = no marker
+
 function selectImage(idx, el) {
   document.querySelectorAll('.result-item.active').forEach(e => e.classList.remove('active'));
   el.classList.add('active');
   currentImage = document.getElementById('resultsList')._items[idx];
-  currentZoom  = 1;
-  openViewer(currentImage, 1);
+  // Clamp tile-quality zoom to the new image's available levels, but keep it otherwise.
+  const maxZoom = currentImage.tileResolution.length - 1;
+  currentZoom = Math.min(currentZoom, maxZoom);
+  openViewer(currentImage, currentZoom);
 }
 
 function openViewer(img, zoom) {
@@ -524,21 +546,22 @@ function renderTiles(img, zoom) {
   const {cols, rows} = tileDims(img.width, img.height, zoom, img.tileResolution);
   const res = img.tileResolution[zoom];
 
-  // Scale to fit image content in BOTH viewer dimensions.
+  // Base scale fits image to viewer; viewerZoom multiplies on top of that.
   const viewW = area.clientWidth  || 800;
   const viewH = area.clientHeight || 600;
-  const scale = Math.min(viewW / img.width, viewH / img.height);
+  const baseScale = Math.min(viewW / img.width, viewH / img.height);
+  const scale     = baseScale * viewerZoom;
   const dispTileW = Math.max(1, Math.round(TILE_SIZE * res * scale));
   currentDispScale = scale;
 
-  // Tile rows are ordered y=rows-1…0 (top→bottom) so the content's top-left
-  // aligns with tile (0, rows-1). The tile space is always a multiple of the
-  // tile size and may exceed the image in both axes → black border at the TOP
-  // (extra rows above content) and RIGHT (partial column on the right).
-  // We clip them away with an overflow:hidden wrapper.
   const topBlack = Math.round((rows * TILE_SIZE * res - img.height) * scale);
   const contentW = Math.round(img.width  * scale);
   const contentH = Math.round(img.height * scale);
+
+  // When content is smaller than the viewport, centre it with padding.
+  // When zoomed in (content > viewport) padding is 0 → overflow:auto scrolls.
+  viewPadX = Math.max(0, Math.floor((viewW - contentW) / 2));
+  viewPadY = Math.max(0, Math.floor((viewH - contentH) / 2));
 
   let tilesHtml = '';
   for (let y = rows - 1; y >= 0; y--) {
@@ -552,14 +575,15 @@ function renderTiles(img, zoom) {
     tilesHtml += '</div>';
   }
 
-  // Clip wrapper: exactly image-content size; tile canvas shifted up to hide topBlack.
-  // SVG overlay sits on top at the same origin → dot coords are simply px*scale, py*scale.
+  // Outer div provides centering padding; inner clip wrapper hides black tile borders.
   area.innerHTML = `
-    <div style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;flex-shrink:0;">
-      <div style="position:absolute;top:-${topBlack}px;left:0;">
-        <div class="tile-canvas-wrap">${tilesHtml}</div>
+    <div style="padding:${viewPadY}px ${viewPadX}px;min-width:max-content;background:#080a0e;">
+      <div style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;">
+        <div style="position:absolute;top:-${topBlack}px;left:0;">
+          <div class="tile-canvas-wrap">${tilesHtml}</div>
+        </div>
+        <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${contentW}px;height:${contentH}px;overflow:visible;pointer-events:none;"></svg>
       </div>
-      <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${contentW}px;height:${contentH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
 
   refreshDot();
@@ -577,9 +601,10 @@ function refreshDot() {
   const groundHeight = hVal === '' ? 0 : Number(hVal);
   const result = projectToPixel(currentImage, searchLat, searchLon, groundHeight);
 
+  svgEl.style.display = markerVisible ? '' : 'none';
   svgEl.innerHTML = '';   // clear previous dot
 
-  if (!result) return;
+  if (!result || !markerVisible) return;
   const [px, py] = result;
 
   // The clip wrapper has (0,0) at the image content's top-left, so:
@@ -588,6 +613,10 @@ function refreshDot() {
   const scale = currentDispScale;
   const dx = px * scale;
   const dy = py * scale;
+
+  // Remember marker position so scrollToMarker() can centre on it.
+  markerDX = dx;
+  markerDY = dy;
 
   const W = Math.round(currentImage.width  * scale);
   const H = Math.round(currentImage.height * scale);
@@ -621,6 +650,47 @@ function refreshDot() {
       <line x1="${cx}" y1="${cy}" x2="${ex}" y2="${ey}" stroke="${stroke}" stroke-width="1.5" stroke-dasharray="4,3" opacity=".6"/>
       <text x="${ex}" y="${ey}" text-anchor="middle" dominant-baseline="middle" fill="${stroke}" font-size="11">→</text>`;
   }
+
+  // Always scroll to keep the marker centred (especially relevant when zoomed in).
+  scrollToMarker();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  VISUAL ZOOM  (viewerZoom multiplier, persists across images)
+// ═══════════════════════════════════════════════════════════════
+function changeViewZoom(dir) {
+  // Find the closest step index, then step in the requested direction.
+  let idx = 0, best = Infinity;
+  VZOOM_STEPS.forEach((v, i) => { const d = Math.abs(v - viewerZoom); if (d < best) { best = d; idx = i; } });
+  idx = Math.max(0, Math.min(VZOOM_STEPS.length - 1, idx + dir));
+  viewerZoom = VZOOM_STEPS[idx];
+
+  const lbl = viewerZoom >= 1
+    ? (Number.isInteger(viewerZoom) ? viewerZoom + '×' : viewerZoom.toFixed(2).replace(/\.?0+$/,'') + '×')
+    : viewerZoom.toFixed(2).replace(/0+$/,'').replace(/\.$/,'') + '×';
+  document.getElementById('vzoomLabel').textContent = lbl;
+
+  if (currentImage) renderTiles(currentImage, currentZoom);
+}
+
+let markerVisible = true;
+
+function toggleMarker() {
+  markerVisible = !markerVisible;
+  const btn = document.getElementById('markerToggleBtn');
+  btn.textContent = markerVisible ? '● Hide marker' : '○ Show marker';
+  btn.style.opacity = markerVisible ? '' : '.6';
+  const svgEl = document.getElementById('dotOverlay');
+  if (svgEl) svgEl.style.display = markerVisible ? '' : 'none';
+}
+
+/** Scroll the viewer so the marker stays centred. */
+function scrollToMarker() {
+  if (markerDX < 0 || markerDY < 0) return;
+  const area = document.getElementById('viewerArea');
+  if (!area) return;
+  area.scrollLeft = viewPadX + markerDX - area.clientWidth  / 2;
+  area.scrollTop  = viewPadY + markerDY - area.clientHeight / 2;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -668,6 +738,14 @@ async function downloadCurrent() {
 // ═══════════════════════════════════════════════════════════════
 //  BOOT
 // ═══════════════════════════════════════════════════════════════
+
+// Mouse-wheel zooms in/out, keeping the marker centred.
+document.getElementById('viewerArea').addEventListener('wheel', e => {
+  if (!currentImage) return;
+  e.preventDefault();
+  changeViewZoom(e.deltaY < 0 ? 1 : -1);
+}, { passive: false });
+
 loadIndex();
 </script>
 </body>
