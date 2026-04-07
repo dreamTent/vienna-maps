@@ -92,6 +92,12 @@
     .zoom-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
     .zoom-pill:hover:not(.active) { border-color: var(--accent); color: var(--text); }
 
+    .card-lock-btn { background: none; border: 1px solid transparent; border-radius: 4px;
+                     padding: 1px 5px; font-size: .78rem; cursor: pointer; margin-left: auto;
+                     color: var(--text-dim); line-height: 1.4; }
+    .card-lock-btn:hover { border-color: var(--border); color: var(--text); }
+    .card-lock-btn.active { border-color: var(--accent); color: var(--accent2); background: var(--surface2); }
+
     /* ── tile viewer inside card ── */
     .card-viewer { flex: 1; overflow: auto; background: #080a0e; min-height: 0;
                    scrollbar-width: none; cursor: grab; }
@@ -134,7 +140,6 @@
     <!-- Marker & zoom-to toggles -->
     <button class="btn-sm active" id="markerBtn"  onclick="toggleMarker()">● Marker</button>
     <button class="btn-sm active" id="zoomToBtn"  onclick="toggleZoomTo()">⊕ Zoom to</button>
-    <button class="btn-sm" id="lockImagesBtn" onclick="toggleLockImages()">🔓 Lock images</button>
 
     <div class="sep"></div>
 
@@ -405,6 +410,7 @@ function renderCard(d) {
 
   const distStr = img.distM >= 1000 ? (img.distM/1000).toFixed(2)+' km' : img.distM+' m';
 
+  const isLocked = lockedCards.has(d);
   card.className = `dir-card ${cls}`;
   card.innerHTML = `
     <div class="card-hdr">
@@ -412,6 +418,10 @@ function renderCard(d) {
       <span style="font-weight:600;font-size:.82rem">${label}</span>
       <span class="card-name">${img.name}</span>
       <span class="card-dist">${distStr}</span>
+      <button class="card-lock-btn${isLocked?' active':''}"
+              onclick="toggleCardLock(${d})"
+              title="${isLocked?'Locked – click to allow auto-switch':'Click to lock this view'}"
+      >${isLocked?'🔒':'🔓'}</button>
     </div>
     <div class="card-viewer" id="viewer-${d}"></div>`;
 
@@ -620,22 +630,27 @@ function moveMarker(dxM, dyM) {
   scheduleAutoSwitch();
 }
 
-let lockedImages = false;
-function toggleLockImages() {
-  lockedImages = !lockedImages;
-  const btn = document.getElementById('lockImagesBtn');
-  btn.textContent = lockedImages ? '🔒 Locked' : '🔓 Lock images';
-  btn.classList.toggle('active', lockedImages);
+const lockedCards = new Set(); // directions (1–4) whose image should not auto-switch
+
+function toggleCardLock(d) {
+  lockedCards.has(d) ? lockedCards.delete(d) : lockedCards.add(d);
+  const btn = document.querySelector(`#card-${d} .card-lock-btn`);
+  if (btn) {
+    const locked = lockedCards.has(d);
+    btn.textContent = locked ? '🔒' : '🔓';
+    btn.classList.toggle('active', locked);
+    btn.title = locked ? 'Locked – click to allow auto-switch' : 'Click to lock this view';
+  }
 }
 
 /** Debounce: after 120 ms find the best image per direction and switch if needed. */
 function scheduleAutoSwitch() {
-  if (lockedImages) return;
   if (autoSwitchTimer) clearTimeout(autoSwitchTimer);
   autoSwitchTimer = setTimeout(() => {
     autoSwitchTimer = null;
     const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
     for (let d = 1; d <= 4; d++) {
+      if (lockedCards.has(d)) continue;
       let best = null, bestDist = Infinity;
       for (const img of allImages) {
         if (img.viewDirection !== d) continue;
