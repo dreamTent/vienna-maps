@@ -124,6 +124,15 @@
   <div class="left-panel">
     <div class="search-box">
       <div class="search-row">
+        <div class="field" style="flex:1;min-width:120px">
+          <label>Image set</label>
+          <select id="imageSetSel" class="cache-select" style="width:100%"
+                  title="Local tile index and remote image tiles for this capture year"
+                  onchange="onImageSetChange()">
+            <option value="2023">Wien 2023</option>
+            <option value="2020">Wien 2020</option>
+          </select>
+        </div>
         <div class="field" style="flex:2">
           <label>Latitude, Longitude</label>
           <input type="text" id="coordsInput" value="48.2767386234921, 16.44324030796789">
@@ -233,6 +242,8 @@
         <option value="3" selected>×3</option>
         <option value="5">×5</option>
         <option value="10">×10</option>
+        <option value="20">×20</option>
+        <option value="30">×30</option>
       </select>
       <input type="number" id="overlayBlurInput" value="2" min="0" max="40" step="0.5" disabled
              title="Blur (px) added per layer further back from the current image (0 = no blur)"
@@ -242,6 +253,15 @@
       <button class="btn-sm" id="lockImagesBtn"    onclick="toggleLockImages()">🔓 Lock image</button>
       <button class="btn-sm" id="autoRotateBtn"   onclick="toggleAutoRotate()">↻ Rotate to marker</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
+      <span style="display:flex;align-items:center;gap:4px;font-size:.68rem;color:var(--text-dim);white-space:nowrap"
+            title="Auto-advance through the sorted list (same as . key)">
+        <button type="button" class="btn-sm" id="listPlayBtn" onclick="toggleListPlay()" style="padding:2px 8px">▶</button>
+        <input type="number" id="listPlayIntervalSec" value="1" min="0.1" max="120" step="0.1"
+               title="Seconds between each step"
+               style="width:48px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.72rem;padding:2px 4px"
+               oninput="restartListPlayIfActive()">
+        <span>s</span>
+      </span>
       <span style="font-size:.68rem;color:var(--text-dim);white-space:nowrap"
             title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads. , / . step through the list.">⌨ ↑↓←→ · , .</span>
     </div>
@@ -255,25 +275,48 @@
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG
 // ═══════════════════════════════════════════════════════════════
-const BASE_URL = 'https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/91bf9860-34d7-4f9a-b841-32be753b09e5';
-const MGI_PROJ = '+proj=tmerc +lat_0=0 +lon_0=16.3333333333333 +k=1 +x_0=0 +y_0=-5000000 +ellps=bessel +towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232 +units=m +no_defs';
-const TILE_SIZE = 1024;
-const TILE_FILES = [
-  '12/2233/1418','12/2234/1418','12/2235/1418','12/2232/1418','12/2236/1418',
-  '12/2231/1419','12/2232/1419','12/2233/1419','12/2234/1419','12/2235/1419','12/2236/1419',
-  '12/2231/1420','12/2232/1420','12/2233/1420','12/2234/1420','12/2235/1420','12/2236/1420','12/2237/1420',
-  '12/2231/1421','12/2232/1421','12/2233/1421','12/2234/1421','12/2235/1421','12/2236/1421','12/2237/1421',
-  '12/2232/1422','12/2233/1422','12/2234/1422','12/2235/1422','12/2236/1422','12/2237/1422',
-  '12/2231/1418','12/2231/1422','12/2235/1417','12/2234/1417','12/2233/1417'
+/** Fallback CRS if manifest is missing generalImageInfo.crs (matches 2023 dataset). */
+const MGI_PROJ_FALLBACK = '+proj=tmerc +lat_0=0 +lon_0=16.3333333333333 +k=1 +x_0=0 +y_0=-5000000 +ellps=bessel +towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232 +units=m +no_defs';
+
+/**
+ * Each set: remote pyramid base URL, local `image.json` path, local folder of per-tile JSON indexes.
+ * Tile lists and CRS come from the manifest at runtime.
+ */
+const IMAGE_SETS = [
+  {
+    id: '2023',
+    label: 'Wien 2023',
+    remoteBaseUrl: 'https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/91bf9860-34d7-4f9a-b841-32be753b09e5',
+    imageJsonPath: 'sources/2023/image.json',
+    tilesDir: 'sources/2023/tiles',
+  },
+  {
+    id: '2020',
+    label: 'Wien 2020',
+    remoteBaseUrl: 'https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/Oblique_Wien_2020',
+    imageJsonPath: 'sources/2020/image.json',
+    tilesDir: 'sources/2020/tiles',
+  },
 ];
+
+let tileSize = 1024;
+/** Set during index load; copied onto each image row as remoteBaseUrl / setId. */
+let activeRemoteBaseUrl = IMAGE_SETS[0].remoteBaseUrl;
+let activeSetId = IMAGE_SETS[0].id;
+
+function normalizeCrs(crs) {
+  if (!crs || typeof crs !== 'string') return MGI_PROJ_FALLBACK;
+  return crs.trim().replace(/\s*\+type=crs\s*/gi, ' ').replace(/\s+/g, ' ').trim();
+}
+
 const DIR_LABELS = { 1:'North', 2:'East', 3:'South', 4:'West', 5:'Nadir' };
 const DIR_TAG    = { 1:'tag-n', 2:'tag-e', 3:'tag-s', 4:'tag-w', 5:'tag-x' };
 
 // ═══════════════════════════════════════════════════════════════
-//  PROJECTIONS
+//  PROJECTIONS  (redefined when switching image sets from manifest CRS)
 // ═══════════════════════════════════════════════════════════════
-proj4.defs('MGI', MGI_PROJ);
-const wgs84ToMgi  = proj4('EPSG:4326', 'MGI');
+proj4.defs('MGI', MGI_PROJ_FALLBACK);
+let wgs84ToMgi = proj4('EPSG:4326', 'MGI');
 
 // ═══════════════════════════════════════════════════════════════
 //  PLANAR GEOMETRY (MGI ground plane, metres)
@@ -411,6 +454,8 @@ function parseImageTile(data) {
       lookAtMgi,                     // ground point at image centre — used for selection
       groundZ:   avgHeight(gc),
       pToImage:  r[iPTI] || null,
+      remoteBaseUrl: activeRemoteBaseUrl,
+      setId:         activeSetId,
     });
   }
 }
@@ -468,27 +513,110 @@ function computeInvJacobian(img, lat, lon, Z) {
 //  LOAD INDEX
 // ═══════════════════════════════════════════════════════════════
 let loadedCount = 0;
-async function loadIndex() {
-  const total = TILE_FILES.length;
-  await Promise.all(TILE_FILES.map(async tile => {
-    try {
-      const resp = await fetch(`tiles/${tile.replace(/\//g,'_')}.json`);
-      if (resp.ok) parseImageTile(await resp.json());
-    } catch(e) { console.warn('Skipped', tile, e.message); }
-    finally {
-      loadedCount++;
-      document.getElementById('progressFill').style.width = (loadedCount/total*100)+'%';
-      document.getElementById('indexStatus').textContent = `${loadedCount}/${total}`;
-    }
-  }));
 
+function getActiveImageSet() {
+  const v = document.getElementById('imageSetSel')?.value;
+  return IMAGE_SETS.find(s => s.id === v) || IMAGE_SETS[0];
+}
+
+function setBadgeLoading(msg) {
+  document.getElementById('badgeText').textContent = msg || 'Loading index…';
+  document.getElementById('spinner').style.display = '';
+  document.querySelectorAll('#badge .dot.ok').forEach(n => n.remove());
+}
+
+function setBadgeReady(count) {
   document.getElementById('spinner').style.display = 'none';
   const badge = document.getElementById('badge');
-  badge.insertBefore(Object.assign(document.createElement('div'), {className:'dot ok'}), badge.firstChild);
-  document.getElementById('badgeText').textContent = `${allImages.length.toLocaleString()} images`;
-  document.getElementById('indexStatus').textContent = '';
-  document.getElementById('progressFill').style.display = 'none';
-  document.getElementById('searchBtn').disabled = false;
+  if (!badge.querySelector('.dot.ok')) {
+    badge.insertBefore(Object.assign(document.createElement('div'), {className:'dot ok'}), badge.firstChild);
+  }
+  document.getElementById('badgeText').textContent = `${count.toLocaleString()} images`;
+}
+
+async function onImageSetChange() {
+  setBadgeLoading('Switching set…');
+  document.getElementById('progressFill').style.display = '';
+  document.getElementById('progressFill').style.width = '0%';
+
+  document.getElementById('resultsHeader').style.display = 'none';
+  document.getElementById('resultsList').innerHTML = '';
+  document.getElementById('viewerHeader').style.display = 'none';
+  document.getElementById('viewerArea').innerHTML = '<div class="empty-viewer">← Select an image from the list</div>';
+  currentImage = null;
+  searchResults = [];
+  stopListPlay();
+
+  const tc = document.getElementById('tileCache');
+  if (tc) tc.innerHTML = '';
+  tileCacheMap.clear();
+
+  await loadIndex();
+}
+
+async function loadIndex() {
+  const setSel = document.getElementById('imageSetSel');
+  try {
+    if (setSel) setSel.disabled = true;
+
+    const set = getActiveImageSet();
+    activeSetId = set.id;
+    activeRemoteBaseUrl = set.remoteBaseUrl;
+
+    setBadgeLoading('Loading manifest…');
+    document.getElementById('searchBtn').disabled = true;
+    document.getElementById('progressFill').style.display = '';
+    document.getElementById('progressFill').style.width = '0%';
+    document.getElementById('indexStatus').textContent = '';
+
+    let manifest;
+    try {
+      const manResp = await fetch(set.imageJsonPath);
+      if (!manResp.ok) throw new Error(`${set.imageJsonPath}: ${manResp.status}`);
+      manifest = await manResp.json();
+    } catch (e) {
+      console.error(e);
+      setBadgeLoading('Manifest failed');
+      document.getElementById('badgeText').textContent = `Error: ${set.imageJsonPath}`;
+      document.getElementById('searchBtn').disabled = false;
+      return;
+    }
+
+    const crs = normalizeCrs(manifest.generalImageInfo?.crs);
+    proj4.defs('MGI', crs);
+    wgs84ToMgi = proj4('EPSG:4326', 'MGI');
+    tileSize = Number(manifest.generalImageInfo?.['tile-width']) || Number(manifest.generalImageInfo?.['tile-height']) || 1024;
+
+    const tileFiles = manifest.availableTiles;
+    if (!tileFiles || !tileFiles.length) {
+      setBadgeLoading('No tiles in manifest');
+      document.getElementById('searchBtn').disabled = false;
+      return;
+    }
+
+    allImages.length = 0;
+    loadedCount = 0;
+    const total = tileFiles.length;
+
+    await Promise.all(tileFiles.map(async tile => {
+      try {
+        const resp = await fetch(`${set.tilesDir}/${tile.replace(/\//g,'_')}.json`);
+        if (resp.ok) parseImageTile(await resp.json());
+      } catch(e) { console.warn('Skipped', tile, e.message); }
+      finally {
+        loadedCount++;
+        document.getElementById('progressFill').style.width = (loadedCount/total*100)+'%';
+        document.getElementById('indexStatus').textContent = `${loadedCount}/${total}`;
+      }
+    }));
+
+    setBadgeReady(allImages.length);
+    document.getElementById('indexStatus').textContent = '';
+    document.getElementById('progressFill').style.display = 'none';
+    document.getElementById('searchBtn').disabled = false;
+  } finally {
+    if (setSel) setSel.disabled = false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -664,6 +792,7 @@ function compassSVG(heading) {
 }
 
 function renderList(items) {
+  stopListPlay();
   const list = document.getElementById('resultsList');
   list._items = items;
   if (!items.length) { list.innerHTML = '<div class="no-results">No images in this radius.</div>'; return; }
@@ -694,7 +823,7 @@ function renderList(items) {
       : '';
     return `<div class="result-item${img.inFrame===false?' result-outside':''}" data-idx="${idx}" onclick="selectImage(${idx},this)">
       <div class="thumb-wrap">
-        <img src="${BASE_URL}/${img.name}/0/0/0.jpg" loading="lazy" onerror="this.style.opacity='.15'">
+        <img src="${img.remoteBaseUrl}/${img.name}/0/0/0.jpg" loading="lazy" onerror="this.style.opacity='.15'">
       </div>
       <div class="result-meta">
         <div class="result-name">${img.name}</div>
@@ -725,6 +854,8 @@ let pinMarkerCenter  = false; // when true, translate the image so the marker is
 let overlayEnabled   = false; // when true, stack images as layers aligned at the marker
 let overlayMaxLayers = 3;    // max layers kept in the overlay stack
 let overlayBlurStep  = 2;    // px of blur added per layer further back (0 = no blur)
+let listPlayTimer    = null;
+let listPlayActive   = false;
 
 // Visual zoom (multiplier on top of the fit-to-viewer base scale).
 // Kept between image switches; independent of tile quality zoom.
@@ -777,7 +908,7 @@ function openViewer(img, zoom) {
 
 function tileDims(width, height, zoom, tileResolution) {
   const res = tileResolution[zoom];
-  return { cols: Math.ceil(width/(TILE_SIZE*res)), rows: Math.ceil(height/(TILE_SIZE*res)) };
+  return { cols: Math.ceil(width/(tileSize*res)), rows: Math.ceil(height/(tileSize*res)) };
 }
 
 function renderTiles(img, zoom) {
@@ -790,10 +921,10 @@ function renderTiles(img, zoom) {
   const viewH = area.clientHeight || 600;
   const baseScale = Math.min(viewW / img.width, viewH / img.height);
   const scale     = baseScale * viewerZoom;
-  const dispTileW = Math.max(1, Math.round(TILE_SIZE * res * scale));
+  const dispTileW = Math.max(1, Math.round(tileSize * res * scale));
   currentDispScale = scale;
 
-  const topBlack = Math.round((rows * TILE_SIZE * res - img.height) * scale);
+  const topBlack = Math.round((rows * tileSize * res - img.height) * scale);
   const contentW = Math.round(img.width  * scale);
   const contentH = Math.round(img.height * scale);
 
@@ -831,7 +962,7 @@ function renderTiles(img, zoom) {
   for (let y = rows - 1; y >= 0; y--) {
     tilesHtml += '<div class="tile-row">';
     for (let x = 0; x < cols; x++) {
-      tilesHtml += `<img src="${BASE_URL}/${img.name}/${zoom}/${x}/${y}.jpg"
+      tilesHtml += `<img src="${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg"
                         width="${dispTileW}" height="${dispTileW}"
                         loading="lazy" onerror="this.style.opacity='.1'"
                         title="z${zoom}/${x}/${y}">`;
@@ -1064,7 +1195,7 @@ function tileCacheEvict() {
 
 function preloadToCache(img, zoom) {
   if (!tileCacheEnabled) return;
-  const key = `${img.name}/${zoom}`;
+  const key = `${img.setId}/${img.name}/${zoom}`;
   if (tileCacheMap.has(key)) {
     tileCacheMap.get(key).seq = ++tileCacheSeq;   // bump LRU timestamp
     updateCacheInfo();
@@ -1077,7 +1208,7 @@ function preloadToCache(img, zoom) {
   for (let y = rows - 1; y >= 0; y--) {
     for (let x = 0; x < cols; x++) {
       const el = new Image();
-      el.src = `${BASE_URL}/${img.name}/${zoom}/${x}/${y}.jpg`;
+      el.src = `${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg`;
       container.appendChild(el);
       els.push(el);
     }
@@ -1167,9 +1298,9 @@ async function downloadCurrent() {
   const BATCH = 20;
   const loadTile = (x,y) => new Promise(res => {
     const el = new Image(); //el.crossOrigin='anonymous';
-    el.onload = () => { ctx.drawImage(el, x*TILE_SIZE, (rows-1-y)*TILE_SIZE, TILE_SIZE, TILE_SIZE); res(); };
+    el.onload = () => { ctx.drawImage(el, x*tileSize, (rows-1-y)*tileSize, tileSize, tileSize); res(); };
     el.onerror = () => { failed++; res(); };
-    el.src = `${BASE_URL}/${img.name}/${maxZoom}/${x}/${y}.jpg`;
+    el.src = `${img.remoteBaseUrl}/${img.name}/${maxZoom}/${x}/${y}.jpg`;
   });
 
   for (let i=0; i<tasks.length; i+=BATCH) {
@@ -1186,7 +1317,7 @@ async function downloadCurrent() {
     alert(e);
     console.log(e);
     const w = window.open('','_blank');
-    const urls = tasks.map(([x,y]) => `${BASE_URL}/${img.name}/${maxZoom}/${x}/${y}.jpg`).join('\n');
+    const urls = tasks.map(([x,y]) => `${img.remoteBaseUrl}/${img.name}/${maxZoom}/${x}/${y}.jpg`).join('\n');
     w.document.write(`<pre style="font:12px monospace;background:#0d1117;color:#c9d1d9;padding:16px">${urls}</pre>`);
   }
 }
@@ -1323,7 +1454,7 @@ function switchToImageBg(img, qx, qy) {
   probe.onload  = commit;
   probe.onerror = commit;   // switch even on error — remaining tiles may still load
   setTimeout(commit, 800);  // fallback: don't wait forever
-  probe.src = `${BASE_URL}/${img.name}/0/0/0.jpg`;
+  probe.src = `${img.remoteBaseUrl}/${img.name}/0/0/0.jpg`;
 }
 
 function highlightInList(name) {
@@ -1332,6 +1463,49 @@ function highlightInList(name) {
   list.querySelectorAll('.result-item').forEach((el, i) => {
     el.classList.toggle('active', list._items[i]?.name === name);
   });
+}
+
+/** delta: -1 = previous (, key), +1 = next (. key) — wraps */
+function stepResultList(delta) {
+  const list  = document.getElementById('resultsList');
+  const items = list?._items;
+  if (!items || items.length === 0) return;
+  const curIdx = currentImage ? items.findIndex(it => it.name === currentImage.name) : -1;
+  const newIdx = ((curIdx + delta) % items.length + items.length) % items.length;
+  const elems  = list.querySelectorAll('.result-item');
+  if (elems[newIdx]) {
+    selectImage(newIdx, elems[newIdx]);
+    elems[newIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function stopListPlay() {
+  if (listPlayTimer != null) {
+    clearInterval(listPlayTimer);
+    listPlayTimer = null;
+  }
+  listPlayActive = false;
+  const btn = document.getElementById('listPlayBtn');
+  if (btn) btn.textContent = '▶';
+}
+
+function startListPlay() {
+  stopListPlay();
+  const sec = Number(document.getElementById('listPlayIntervalSec')?.value);
+  const ms  = Math.max(50, Math.round((Number.isFinite(sec) && sec > 0 ? sec : 1) * 1000));
+  listPlayTimer = setInterval(() => stepResultList(1), ms);
+  listPlayActive = true;
+  const btn = document.getElementById('listPlayBtn');
+  if (btn) btn.textContent = '⏸';
+}
+
+function toggleListPlay() {
+  if (listPlayActive) stopListPlay();
+  else startListPlay();
+}
+
+function restartListPlayIfActive() {
+  if (listPlayActive) startListPlay();
 }
 
 // ── Continuous keyboard movement: fires every animation frame while keys held ──
@@ -1346,18 +1520,8 @@ document.addEventListener('keydown', e => {
 
   // , / . — step through the result list (wraps around)
   if (e.key === ',' || e.key === '.') {
-    const list  = document.getElementById('resultsList');
-    const items = list?._items;
-    if (!items || items.length === 0) return;
     e.preventDefault();
-    const curIdx = currentImage ? items.findIndex(it => it.name === currentImage.name) : -1;
-    const delta  = e.key === '.' ? 1 : -1;
-    const newIdx = ((curIdx + delta) % items.length + items.length) % items.length;
-    const elems  = list.querySelectorAll('.result-item');
-    if (elems[newIdx]) {
-      selectImage(newIdx, elems[newIdx]);
-      elems[newIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    }
+    stepResultList(e.key === '.' ? 1 : -1);
     return;
   }
 

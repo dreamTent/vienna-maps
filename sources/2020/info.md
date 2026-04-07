@@ -1,0 +1,1 @@
+base url: https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/Oblique_Wien_2020
