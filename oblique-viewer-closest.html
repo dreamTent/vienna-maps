@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vienna Oblique Image Finder</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.0/proj4.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #1c2128;
+      --border: #30363d;
+      --accent: #388bfd;
+      --accent2: #58a6ff;
+      --text: #c9d1d9;
+      --text-dim: #8b949e;
+      --success: #3fb950;
+      --warning: #d29922;
+      --error: #f85149;
+      --north: #4fc3f7;
+      --east:  #81c784;
+      --south: #ff8a65;
+      --west:  #ce93d8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; }
+
+    /* ── header ── */
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .header svg { color: var(--accent2); flex-shrink: 0; }
+    .header h1 { font-size: 1rem; font-weight: 600; color: var(--text); flex: 1; }
+    .loader-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 4px 10px;
+    }
+    .spinner {
+      width: 10px; height: 10px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent2);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .dot.ok { background: var(--success); }
+    .dot.err { background: var(--error); }
+
+    /* ── layout ── */
+    .container { max-width: 1600px; margin: 0 auto; padding: 20px 24px; }
+
+    /* ── input panel ── */
+    .input-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 20px;
+      margin-bottom: 20px;
+    }
+    .input-row { display: flex; gap: 10px; align-items: flex-end; }
+    .input-group { flex: 1; }
+    .input-group label { display: block; font-size: 0.75rem; color: var(--text-dim); margin-bottom: 5px; }
+    input[type="text"] {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 7px 12px;
+      font-size: 0.9rem;
+      font-family: monospace;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input[type="text"]:focus { border-color: var(--accent); }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 7px 18px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      white-space: nowrap;
+    }
+    button:hover:not(:disabled) { opacity: 0.85; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    .btn-secondary {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .btn-small { padding: 4px 12px; font-size: 0.8rem; }
+
+    /* ── progress ── */
+    .progress-section { margin-bottom: 20px; }
+    .progress-label { font-size: 0.78rem; color: var(--text-dim); margin-bottom: 5px; }
+    .progress-track { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .progress-fill { height: 100%; background: var(--accent); transition: width 0.2s; border-radius: 2px; }
+
+    /* ── direction grid ── */
+    .directions-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+    }
+    @media (max-width: 900px) { .directions-grid { grid-template-columns: 1fr; } }
+
+    /* ── direction card ── */
+    .dir-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .dir-card-header {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .dir-badge {
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.85rem;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .dir-card[data-dir="1"] .dir-badge { background: #0c2d40; color: var(--north); }
+    .dir-card[data-dir="2"] .dir-badge { background: #0c2a0e; color: var(--east); }
+    .dir-card[data-dir="3"] .dir-badge { background: #2a1508; color: var(--south); }
+    .dir-card[data-dir="4"] .dir-badge { background: #210f33; color: var(--west); }
+    .dir-info { flex: 1; min-width: 0; }
+    .dir-title { font-weight: 600; font-size: 0.9rem; }
+    .dir-imgname { font-family: monospace; font-size: 0.75rem; color: var(--text-dim); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dir-dist { font-size: 0.75rem; color: var(--text-dim); white-space: nowrap; }
+
+    /* ── tile viewer ── */
+    .tile-viewer {
+      flex: 1;
+      position: relative;
+      background: #0a0c10;
+      overflow: auto;
+      min-height: 220px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: flex-start;
+    }
+    .tile-canvas-wrap {
+      position: relative;
+      flex-shrink: 0;
+    }
+    .tile-row { display: flex; }
+    .tile-row img {
+      display: block;
+      width: 64px;  /* overridden by zoom */
+      height: 64px;
+      background: #1a1a24;
+      border: none;
+      flex-shrink: 0;
+    }
+    .tile-row img.loading-img {
+      opacity: 0.3;
+      filter: blur(2px);
+    }
+
+    /* ── card controls ── */
+    .dir-controls {
+      padding: 8px 14px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .zoom-label { font-size: 0.75rem; color: var(--text-dim); }
+    .zoom-pills { display: flex; gap: 4px; flex: 1; }
+    .zoom-pill {
+      padding: 3px 9px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: all 0.1s;
+    }
+    .zoom-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .zoom-pill:hover:not(.active) { border-color: var(--accent); color: var(--text); }
+
+    /* ── meta row ── */
+    .dir-meta { padding: 8px 14px; border-top: 1px solid var(--border); display: flex; gap: 16px; flex-wrap: wrap; }
+    .meta-item { font-size: 0.75rem; }
+    .meta-label { color: var(--text-dim); }
+    .meta-value { color: var(--text); font-family: monospace; }
+
+    /* ── empty/error states ── */
+    .empty-state {
+      padding: 40px 20px;
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 0.85rem;
+    }
+    .toast {
+      position: fixed; bottom: 20px; right: 20px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 0.82rem;
+      z-index: 999;
+      max-width: 320px;
+      display: none;
+    }
+    .toast.show { display: block; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+    <circle cx="12" cy="12" r="10"/>
+    <polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26 12,2" fill="currentColor" stroke="none"/>
+  </svg>
+  <h1>Vienna Oblique Image Finder</h1>
+  <div class="loader-badge" id="loaderBadge">
+    <div class="spinner" id="loaderSpinner"></div>
+    <span id="loaderText">Loading index…</span>
+  </div>
+</div>
+
+<div class="container">
+
+  <div class="input-panel">
+    <div class="input-row">
+      <div class="input-group">
+        <label>Latitude, Longitude (WGS84)</label>
+        <input type="text" id="coordsInput" value="48.2767386234921, 16.44324030796789" placeholder="48.xxx, 16.xxx" />
+      </div>
+      <button id="searchBtn" onclick="doSearch()" disabled>Find Images</button>
+    </div>
+  </div>
+
+  <div class="progress-section" id="loadProgress">
+    <div class="progress-label" id="progressLabel">Loading tile index files… 0 / 36</div>
+    <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+  </div>
+
+  <div id="results"></div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ═══════════════════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════════════════
+const BASE_URL = 'https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/91bf9860-34d7-4f9a-b841-32be753b09e5';
+const MGI_PROJ  = '+proj=tmerc +lat_0=0 +lon_0=16.3333333333333 +k=1 +x_0=0 +y_0=-5000000 +ellps=bessel +towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232 +units=m +no_defs';
+const TILE_SIZE = 1024;
+
+const TILE_FILES = [
+  '12/2233/1418','12/2234/1418','12/2235/1418','12/2232/1418','12/2236/1418',
+  '12/2231/1419','12/2232/1419','12/2233/1419','12/2234/1419','12/2235/1419','12/2236/1419',
+  '12/2231/1420','12/2232/1420','12/2233/1420','12/2234/1420','12/2235/1420','12/2236/1420','12/2237/1420',
+  '12/2231/1421','12/2232/1421','12/2233/1421','12/2234/1421','12/2235/1421','12/2236/1421','12/2237/1421',
+  '12/2232/1422','12/2233/1422','12/2234/1422','12/2235/1422','12/2236/1422','12/2237/1422',
+  '12/2231/1418','12/2231/1422','12/2235/1417','12/2234/1417','12/2233/1417'
+];
+
+const DIR_INFO = {
+  1: { label: 'North', arrow: '↑', color: 'var(--north)' },
+  2: { label: 'East',  arrow: '→', color: 'var(--east)'  },
+  3: { label: 'South', arrow: '↓', color: 'var(--south)' },
+  4: { label: 'West',  arrow: '←', color: 'var(--west)'  },
+  5: { label: 'Nadir', arrow: '⊙', color: '#aaa'         },
+};
+
+// ═══════════════════════════════════════════════════════
+//  PROJ4 SETUP
+// ═══════════════════════════════════════════════════════
+proj4.defs('MGI', MGI_PROJ);
+const toMercatorFromMGI    = proj4('MGI',        'EPSG:3857');
+const toMercatorFromWGS84  = proj4('EPSG:4326',  'EPSG:3857');
+
+// ═══════════════════════════════════════════════════════
+//  IMAGE INDEX
+// ═══════════════════════════════════════════════════════
+const allImages = [];   // { name, width, height, tileResolution, viewDirection, cx, cy }
+
+function parseImageTile(data) {
+  const rows = data.images;
+  if (!rows || rows.length < 2) return;
+  const hdr = rows[0];
+  const iName   = hdr.indexOf('name');
+  const iW      = hdr.indexOf('width');
+  const iH      = hdr.indexOf('height');
+  const iTR     = hdr.indexOf('tile-resolution');
+  const iVD     = hdr.indexOf('view-direction');
+  const iCenter = hdr.indexOf('centerPointOnGround');
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const center = r[iCenter];
+    if (!center) continue;
+    const [cx, cy] = toMercatorFromMGI.forward([center[0], center[1]]);
+    allImages.push({
+      name: r[iName],
+      width: r[iW] || 14144,
+      height: r[iH] || 10560,
+      tileResolution: r[iTR] || [16, 8, 4, 2, 1],
+      viewDirection: r[iVD],
+      cx, cy
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  LOAD ALL TILE JSONs
+// ═══════════════════════════════════════════════════════
+let loadedCount = 0;
+
+async function loadIndex() {
+  const total = TILE_FILES.length;
+
+  const tasks = TILE_FILES.map(async (tile) => {
+    const fname = tile.replace(/\//g, '_');
+    try {
+      const resp = await fetch(`tiles/${fname}.json`);
+      if (!resp.ok) throw new Error(resp.status);
+      const data = await resp.json();
+      parseImageTile(data);
+    } catch(e) {
+      console.warn(`Skipped ${tile}:`, e.message);
+    } finally {
+      loadedCount++;
+      const pct = Math.round(loadedCount / total * 100);
+      document.getElementById('progressFill').style.width = pct + '%';
+      document.getElementById('progressLabel').textContent =
+        `Loading tile index… ${loadedCount} / ${total}`;
+    }
+  });
+
+  await Promise.all(tasks);
+
+  // Done
+  document.getElementById('loadProgress').style.display = 'none';
+  document.getElementById('loaderSpinner').style.display = 'none';
+  document.querySelector('#loaderBadge .dot')?.remove();
+  const badge = document.getElementById('loaderBadge');
+  const dot = document.createElement('div');
+  dot.className = 'dot ok';
+  badge.insertBefore(dot, badge.firstChild);
+  document.getElementById('loaderText').textContent = `${allImages.length.toLocaleString()} images indexed`;
+  document.getElementById('searchBtn').disabled = false;
+}
+
+// ═══════════════════════════════════════════════════════
+//  SEARCH
+// ═══════════════════════════════════════════════════════
+function doSearch() {
+  const raw = document.getElementById('coordsInput').value.trim();
+  const parts = raw.split(/[\s,]+/).map(Number);
+  if (parts.length < 2 || parts.some(isNaN)) {
+    showToast('Enter coordinates as: lat, lon', 'error');
+    return;
+  }
+  const [lat, lon] = parts;
+  const [mx, my] = toMercatorFromWGS84.forward([lon, lat]);
+
+  // Find nearest per direction
+  const best = {};   // viewDirection → { ...image, dist }
+  for (const img of allImages) {
+    const dist = Math.hypot(img.cx - mx, img.cy - my);
+    const d = img.viewDirection;
+    if (!best[d] || dist < best[d].dist) best[d] = { ...img, dist };
+  }
+
+  renderResults(best, lat, lon);
+}
+
+document.getElementById('coordsInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doSearch();
+});
+
+// ═══════════════════════════════════════════════════════
+//  RENDER RESULTS
+// ═══════════════════════════════════════════════════════
+function renderResults(best, lat, lon) {
+  const container = document.getElementById('results');
+  if (!Object.keys(best).length) {
+    container.innerHTML = '<div class="empty-state">No images found for these coordinates.</div>';
+    return;
+  }
+
+  const dirs = Object.keys(best).map(Number).sort();
+
+  container.innerHTML = `
+    <p style="font-size:0.78rem;color:var(--text-dim);margin-bottom:12px;">
+      Nearest oblique captures for <code style="color:var(--text)">${lat.toFixed(6)}, ${lon.toFixed(6)}</code>
+      — ${dirs.length} direction(s) found
+    </p>
+    <div class="directions-grid" id="dirGrid"></div>
+  `;
+
+  const grid = document.getElementById('dirGrid');
+  for (const d of dirs) {
+    const img = best[d];
+    const info = DIR_INFO[d] || { label: `Dir ${d}`, arrow: '?', color: '#aaa' };
+    const maxZoom = img.tileResolution.length - 1;
+    const card = document.createElement('div');
+    card.className = 'dir-card';
+    card.dataset.dir = d;
+    card.dataset.imgName = img.name;
+    card.dataset.width = img.width;
+    card.dataset.height = img.height;
+    card.dataset.maxZoom = maxZoom;
+    card.dataset.trJson = JSON.stringify(img.tileResolution);
+    card.dataset.currentZoom = 1;   // default to zoom 1 (4 tiles — quick overview)
+
+    const distM = Math.round(img.dist);
+    const distStr = distM >= 1000 ? (distM / 1000).toFixed(2) + ' km' : distM + ' m';
+
+    const zoomPills = Array.from({ length: maxZoom + 1 }, (_, z) => {
+      const { cols, rows } = tileDims(img.width, img.height, z, img.tileResolution);
+      const active = z === 1 ? 'active' : '';
+      return `<span class="zoom-pill ${active}" data-zoom="${z}" title="${cols}×${rows} tiles">
+        z${z} <span style="opacity:.6;font-size:.7em">${cols * rows}t</span>
+      </span>`;
+    }).join('');
+
+    card.innerHTML = `
+      <div class="dir-card-header">
+        <div class="dir-badge">${info.arrow}</div>
+        <div class="dir-info">
+          <div class="dir-title">${info.label}</div>
+          <div class="dir-imgname">${img.name}</div>
+        </div>
+        <div class="dir-dist">${distStr}</div>
+      </div>
+      <div class="tile-viewer" id="viewer-${d}">
+        <div class="empty-state" style="padding:20px">Loading…</div>
+      </div>
+      <div class="dir-controls">
+        <span class="zoom-label">Zoom:</span>
+        <div class="zoom-pills" id="pills-${d}">${zoomPills}</div>
+        <button class="btn-secondary btn-small" onclick="downloadTiles(${d})">⬇ Download z${maxZoom}</button>
+      </div>
+      <div class="dir-meta">
+        <div class="meta-item"><span class="meta-label">Image: </span><span class="meta-value">${img.name}</span></div>
+        <div class="meta-item"><span class="meta-label">Size: </span><span class="meta-value">${img.width}×${img.height}px</span></div>
+        <div class="meta-item"><span class="meta-label">Levels: </span><span class="meta-value">${img.tileResolution.join(', ')}</span></div>
+      </div>
+    `;
+    grid.appendChild(card);
+
+    // Pill click handler
+    document.getElementById(`pills-${d}`).addEventListener('click', e => {
+      const pill = e.target.closest('.zoom-pill');
+      if (!pill) return;
+      const z = Number(pill.dataset.zoom);
+      card.dataset.currentZoom = z;
+      pill.closest('.zoom-pills').querySelectorAll('.zoom-pill')
+          .forEach(p => p.classList.toggle('active', p === pill));
+      renderTileGrid(d, img.name, img.width, img.height, z, img.tileResolution);
+    });
+
+    // Initial render at zoom 1
+    renderTileGrid(d, img.name, img.width, img.height, 1, img.tileResolution);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  TILE GRID RENDERER
+// ═══════════════════════════════════════════════════════
+function tileDims(width, height, zoom, tileResolution) {
+  const res = tileResolution[zoom];
+  return {
+    cols: Math.ceil(width  / (TILE_SIZE * res)),
+    rows: Math.ceil(height / (TILE_SIZE * res)),
+  };
+}
+
+function renderTileGrid(dirId, imageName, width, height, zoom, tileResolution) {
+  const viewer = document.getElementById(`viewer-${dirId}`);
+  const { cols, rows } = tileDims(width, height, zoom, tileResolution);
+
+  // Scale tiles to fit viewer width nicely
+  const maxViewerW = viewer.clientWidth || 600;
+  const naturalTileW = TILE_SIZE / tileResolution[zoom];  // screen px at 1:1
+  // We want the whole image to be at most 3× the viewer width when side-scrolling
+  const imgW = cols * naturalTileW;
+  const scale = Math.min(1, maxViewerW / imgW);
+  const dispW = Math.round(naturalTileW * scale);
+
+  let html = '<div class="tile-canvas-wrap">';
+  for (let y = rows - 1; y >= 0; y--) {
+    html += '<div class="tile-row">';
+    for (let x = 0; x < cols; x++) {
+      const url = `${BASE_URL}/${imageName}/${zoom}/${x}/${y}.jpg`;
+      html += `<img src="${url}" width="${dispW}" height="${dispW}"
+                    loading="lazy"
+                    onerror="this.style.opacity='.15'"
+                    title="z${zoom}/${x}/${y}">`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  viewer.innerHTML = html;
+}
+
+// ═══════════════════════════════════════════════════════
+//  DOWNLOAD  (full-res zoom 4, tries canvas → fallback URL list)
+// ═══════════════════════════════════════════════════════
+async function downloadTiles(dirId) {
+  const card = document.querySelector(`.dir-card[data-dir="${dirId}"]`);
+  const imageName     = card.dataset.imgName;
+  const width         = Number(card.dataset.width);
+  const height        = Number(card.dataset.height);
+  const maxZoom       = Number(card.dataset.maxZoom);
+  const tileResolution = JSON.parse(card.dataset.trJson);
+
+  const { cols, rows } = tileDims(width, height, maxZoom, tileResolution);
+  const totalTiles = cols * rows;
+
+  showToast(`Fetching ${totalTiles} tiles for ${imageName} (z${maxZoom})…`);
+
+  // Build canvas
+  const canvas = document.createElement('canvas');
+  canvas.width  = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+
+  const tileW = TILE_SIZE;
+  const tileH = TILE_SIZE;
+  let done = 0, failed = 0;
+
+  const loadTile = (x, y) => new Promise(resolve => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      // y=0 is the bottom row in URL convention; flip for canvas (y=0 = top)
+      const canvasY = (rows - 1 - y) * tileH;
+      ctx.drawImage(img, x * tileW, canvasY, tileW, tileH);
+      done++;
+      resolve(true);
+    };
+    img.onerror = () => { failed++; resolve(false); };
+    img.src = `${BASE_URL}/${imageName}/${maxZoom}/${x}/${y}.jpg`;
+  });
+
+  // Load all tiles (batched to avoid flooding)
+  const BATCH = 20;
+  const allTasks = [];
+  for (let y = 0; y < rows; y++)
+    for (let x = 0; x < cols; x++)
+      allTasks.push([x, y]);
+
+  for (let i = 0; i < allTasks.length; i += BATCH) {
+    await Promise.all(allTasks.slice(i, i + BATCH).map(([x, y]) => loadTile(x, y)));
+    showToast(`Downloading… ${Math.min(i + BATCH, totalTiles)} / ${totalTiles}`, 'progress');
+  }
+
+  if (failed === totalTiles) {
+    // CORS blocked — fall back to URL list
+    showToast('CORS blocked. Showing URL list instead.', 'warn');
+    showUrlList(imageName, maxZoom, cols, rows);
+    return;
+  }
+
+  // Download canvas as JPEG
+  try {
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = `${imageName}_z${maxZoom}.jpg`;
+    a.click();
+    showToast(`Downloaded ${imageName}_z${maxZoom}.jpg (${failed} tiles failed)`, 'ok');
+  } catch (e) {
+    showToast('Canvas tainted by CORS. Showing URL list.', 'warn');
+    showUrlList(imageName, maxZoom, cols, rows);
+  }
+}
+
+function showUrlList(imageName, zoom, cols, rows) {
+  const urls = [];
+  for (let y = 0; y < rows; y++)
+    for (let x = 0; x < cols; x++)
+      urls.push(`${BASE_URL}/${imageName}/${zoom}/${x}/${y}.jpg`);
+
+  const w = window.open('', '_blank');
+  w.document.write(`<html><head><title>${imageName} tile URLs</title>
+    <style>body{font-family:monospace;font-size:12px;background:#0d1117;color:#c9d1d9;padding:16px}
+    a{color:#58a6ff;display:block;margin-bottom:2px}</style></head><body>
+    <h3 style="margin-bottom:12px">${urls.length} tile URLs for ${imageName} z${zoom}</h3>
+    ${urls.map(u => `<a href="${u}" target="_blank">${u}</a>`).join('')}
+    </body></html>`);
+}
+
+// ═══════════════════════════════════════════════════════
+//  TOAST
+// ═══════════════════════════════════════════════════════
+let toastTimer;
+function showToast(msg, type = 'info') {
+  const el = document.getElementById('toast');
+  const colors = { ok: 'var(--success)', warn: 'var(--warning)', error: 'var(--error)', info: 'var(--text-dim)', progress: 'var(--accent2)' };
+  el.style.borderColor = colors[type] || colors.info;
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  if (type !== 'progress') toastTimer = setTimeout(() => el.classList.remove('show'), 4000);
+}
+
+// ═══════════════════════════════════════════════════════
+//  BOOT
+// ═══════════════════════════════════════════════════════
+loadIndex();
+</script>
+</body>
+</html>
