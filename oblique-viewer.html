@@ -277,6 +277,8 @@
 // ═══════════════════════════════════════════════════════════════
 /** Fallback CRS if manifest is missing generalImageInfo.crs (matches 2023 dataset). */
 const MGI_PROJ_FALLBACK = '+proj=tmerc +lat_0=0 +lon_0=16.3333333333333 +k=1 +x_0=0 +y_0=-5000000 +ellps=bessel +towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232 +units=m +no_defs';
+/** Standard Austria MGI ↔ WGS84 (ETRS89) 7-parameter shift; required for correct lat/lon ↔ ground metres. */
+const MGI_TOWGS84 = '+towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232';
 
 /**
  * Each set: remote pyramid base URL, local `image.json` path, local folder of per-tile JSON indexes.
@@ -306,7 +308,13 @@ let activeSetId = IMAGE_SETS[0].id;
 
 function normalizeCrs(crs) {
   if (!crs || typeof crs !== 'string') return MGI_PROJ_FALLBACK;
-  return crs.trim().replace(/\s*\+type=crs\s*/gi, ' ').replace(/\s+/g, ' ').trim();
+  let s = crs.trim().replace(/\s*\+type=crs\s*/gi, ' ').replace(/\s+/g, ' ').trim();
+  // 2020 manifest CRS omits +towgs84; without it, WGS84 (e.g. Google Maps) ↔ MGI is wrong by ~100 m fixed shift.
+  // 2023 includes towgs84 — keep behaviour aligned when the string already has it.
+  if (/ellps=bessel/i.test(s) && !/\+towgs84=/i.test(s)) {
+    s = `${s.replace(/\s*\+no_defs\s*$/i, '').trim()} ${MGI_TOWGS84} +no_defs`;
+  }
+  return s;
 }
 
 const DIR_LABELS = { 1:'North', 2:'East', 3:'South', 4:'West', 5:'Nadir' };
