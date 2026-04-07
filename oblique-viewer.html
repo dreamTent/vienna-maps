@@ -156,10 +156,15 @@
 
     <div class="results-header" id="resultsHeader" style="display:none">
       <strong id="resultCount">0</strong>&nbsp;images found
-      <label class="filter-label" title="Hide images where the marker projects outside the visible frame">
+      <label class="filter-label" title="Hide images where the marker (plus the radius below) projects outside the visible frame">
         <input type="checkbox" id="filterOutOfFrame" onchange="applySort()">
         Hide ⚠ outside
       </label>
+      <input type="number" id="frameRadiusM" value="0" min="0" max="2000" step="5"
+             title="Radius (m) around the marker that must be fully inside the image"
+             style="width:52px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.73rem;padding:2px 5px;"
+             oninput="applySort()">
+      <span style="font-size:.73rem;color:var(--text-dim)">m</span>
       <select class="sort-select" id="sortSelect" onchange="applySort()">
         <option value="dist">Sort: Distance</option>
         <option value="heading">Sort: Heading</option>
@@ -512,16 +517,41 @@ function computeHorizAngle(img, lat, lon, Z) {
 }
 
 function applySort() {
-  const key = document.getElementById('sortSelect').value;
-  const Z   = Number(document.getElementById('heightNum').value) || 0;
+  const key     = document.getElementById('sortSelect').value;
+  const Z       = Number(document.getElementById('heightNum').value) || 0;
+  const radiusM = Math.max(0, Number(document.getElementById('frameRadiusM')?.value) || 0);
+
+  // Pre-compute the 4 cardinal MGI offsets once (same for every image).
+  // These are used to test whether an area of `radiusM` metres around the
+  // marker is also fully inside each image's frame.
+  let cardinalsMgi = null;
+  if (radiusM > 0) {
+    const [qmx, qmy] = wgs84ToMgi.forward([searchLon, searchLat]);
+    cardinalsMgi = [
+      [qmx + radiusM, qmy],
+      [qmx - radiusM, qmy],
+      [qmx, qmy + radiusM],
+      [qmx, qmy - radiusM],
+    ].map(([ox, oy]) => { const [oLon, oLat] = wgs84ToMgi.inverse([ox, oy]); return [oLat, oLon]; });
+  }
 
   // Pre-compute signed horizontal angle + in-frame flag for every result.
   // One projectToPixel call per image covers both needs.
   const items = searchResults.map(img => {
     const res = projectToPixel(img, searchLat, searchLon, Z);
-    const inFrame = res != null
+    let inFrame = res != null
       && res[0] >= 0 && res[0] <= img.width
       && res[1] >= 0 && res[1] <= img.height;
+    // Also require the radius ring to be inside the frame.
+    if (inFrame && cardinalsMgi) {
+      for (const [oLat, oLon] of cardinalsMgi) {
+        const p = projectToPixel(img, oLat, oLon, Z);
+        if (!p || p[0] < 0 || p[0] > img.width || p[1] < 0 || p[1] > img.height) {
+          inFrame = false;
+          break;
+        }
+      }
+    }
     let horizAngle = NaN;
     if (res && img.pToImage) {
       const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
