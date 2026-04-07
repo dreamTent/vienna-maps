@@ -40,6 +40,7 @@
                    color: var(--text); padding: 4px 8px; font-size: .8rem; font-family: monospace;
                    outline: none; width: 230px; }
     .coord-input:focus { border-color: var(--accent); }
+    select.coord-input { cursor: pointer; appearance: auto; }
     .btn { background: var(--accent); color: #fff; border: none; border-radius: 5px; padding: 4px 12px;
            font-size: .8rem; font-weight: 600; cursor: pointer; white-space: nowrap; }
     .btn:disabled { opacity: .4; cursor: default; }
@@ -121,6 +122,16 @@
   </div>
 
   <div class="controls">
+    <label class="lbl" for="imageSetSel">Set</label>
+    <select id="imageSetSel" class="coord-input" style="width:auto;min-width:132px"
+            title="Local tile index and remote image tiles for this capture year"
+            onchange="onImageSetChange()">
+      <option value="2023">Wien 2023</option>
+      <option value="2020">Wien 2020</option>
+    </select>
+
+    <div class="sep"></div>
+
     <input class="coord-input" id="coordsInput" type="text"
            value="48.2767386234921, 16.44324030796789" placeholder="lat, lon">
     <button class="btn" id="searchBtn" onclick="doSearch()" disabled>Find</button>
@@ -178,30 +189,54 @@
 
 <script>
 // ═══════════════════════════════════════════════════════
-//  CONFIG
+//  CONFIG  (aligned with oblique-viewer.html)
 // ═══════════════════════════════════════════════════════
-const BASE_URL  = 'https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/91bf9860-34d7-4f9a-b841-32be753b09e5';
-const MGI_PROJ  = '+proj=tmerc +lat_0=0 +lon_0=16.3333333333333 +k=1 +x_0=0 +y_0=-5000000 +ellps=bessel +towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232 +units=m +no_defs';
-const TILE_SIZE = 1024;
+/** Fallback CRS if manifest is missing generalImageInfo.crs (matches 2023 dataset). */
+const MGI_PROJ_FALLBACK = '+proj=tmerc +lat_0=0 +lon_0=16.3333333333333 +k=1 +x_0=0 +y_0=-5000000 +ellps=bessel +towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232 +units=m +no_defs';
+const MGI_TOWGS84 = '+towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232';
 
-const TILE_FILES = [
-  '12/2233/1418','12/2234/1418','12/2235/1418','12/2232/1418','12/2236/1418',
-  '12/2231/1419','12/2232/1419','12/2233/1419','12/2234/1419','12/2235/1419','12/2236/1419',
-  '12/2231/1420','12/2232/1420','12/2233/1420','12/2234/1420','12/2235/1420','12/2236/1420','12/2237/1420',
-  '12/2231/1421','12/2232/1421','12/2233/1421','12/2234/1421','12/2235/1421','12/2236/1421','12/2237/1421',
-  '12/2232/1422','12/2233/1422','12/2234/1422','12/2235/1422','12/2236/1422','12/2237/1422',
-  '12/2231/1418','12/2231/1422','12/2235/1417','12/2234/1417','12/2233/1417'
+/**
+ * Each set: remote pyramid base URL, local `image.json` path, local folder of per-tile JSON indexes.
+ */
+const IMAGE_SETS = [
+  {
+    id: '2023',
+    label: 'Wien 2023',
+    remoteBaseUrl: 'https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/91bf9860-34d7-4f9a-b841-32be753b09e5',
+    imageJsonPath: 'sources/2023/image.json',
+    tilesDir: 'sources/2023/tiles',
+  },
+  {
+    id: '2020',
+    label: 'Wien 2020',
+    remoteBaseUrl: 'https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/Oblique_Wien_2020',
+    imageJsonPath: 'sources/2020/image.json',
+    tilesDir: 'sources/2020/tiles',
+  },
 ];
+
+let tileSize = 1024;
+let activeRemoteBaseUrl = IMAGE_SETS[0].remoteBaseUrl;
+let activeSetId = IMAGE_SETS[0].id;
+
+function normalizeCrs(crs) {
+  if (!crs || typeof crs !== 'string') return MGI_PROJ_FALLBACK;
+  let s = crs.trim().replace(/\s*\+type=crs\s*/gi, ' ').replace(/\s+/g, ' ').trim();
+  if (/ellps=bessel/i.test(s) && !/\+towgs84=/i.test(s)) {
+    s = `${s.replace(/\s*\+no_defs\s*$/i, '').trim()} ${MGI_TOWGS84} +no_defs`;
+  }
+  return s;
+}
 
 const DIR_LABEL = { 1:'North', 2:'East', 3:'South', 4:'West', 5:'Nadir' };
 const DIR_ARROW = { 1:'↑', 2:'→', 3:'↓', 4:'←', 5:'⊙' };
 const DIR_CLASS = { 1:'card-n', 2:'card-e', 3:'card-s', 4:'card-w', 5:'card-x' };
 
 // ═══════════════════════════════════════════════════════
-//  PROJECTIONS
+//  PROJECTIONS  (redefined when switching image sets from manifest CRS)
 // ═══════════════════════════════════════════════════════
-proj4.defs('MGI', MGI_PROJ);
-const wgs84ToMgi = proj4('EPSG:4326', 'MGI');
+proj4.defs('MGI', MGI_PROJ_FALLBACK);
+let wgs84ToMgi = proj4('EPSG:4326', 'MGI');
 
 // ═══════════════════════════════════════════════════════
 //  GEOMETRY HELPERS  (identical to oblique-viewer.html)
@@ -322,24 +357,101 @@ function computeInvJacobian(img, lat, lon, Z) {
 //  LOAD INDEX
 // ═══════════════════════════════════════════════════════
 let loadedCount = 0;
-async function loadIndex() {
-  const total = TILE_FILES.length;
-  await Promise.all(TILE_FILES.map(async tile => {
-    try {
-      const r = await fetch(`tiles/${tile.replace(/\//g,'_')}.json`);
-      if (r.ok) parseImageTile(await r.json());
-    } catch(e) { console.warn('Skipped', tile); }
-    finally {
-      loadedCount++;
-      document.getElementById('progressFill').style.width = (loadedCount/total*100)+'%';
-    }
-  }));
-  document.getElementById('progressFill').style.display = 'none';
+
+function getActiveImageSet() {
+  const v = document.getElementById('imageSetSel')?.value;
+  return IMAGE_SETS.find(s => s.id === v) || IMAGE_SETS[0];
+}
+
+function setBadgeLoading(msg) {
+  document.getElementById('badgeText').textContent = msg || 'Loading…';
+  document.getElementById('spinner').style.display = '';
+  document.querySelectorAll('#badge .dot.ok').forEach(n => n.remove());
+}
+
+function setBadgeReady(count) {
   document.getElementById('spinner').style.display = 'none';
   const badge = document.getElementById('badge');
-  badge.insertBefore(Object.assign(document.createElement('div'),{className:'dot ok'}), badge.firstChild);
-  document.getElementById('badgeText').textContent = `${allImages.length.toLocaleString()} images`;
-  document.getElementById('searchBtn').disabled = false;
+  if (!badge.querySelector('.dot.ok')) {
+    badge.insertBefore(Object.assign(document.createElement('div'), { className: 'dot ok' }), badge.firstChild);
+  }
+  document.getElementById('badgeText').textContent = `${count.toLocaleString()} images`;
+}
+
+async function onImageSetChange() {
+  setBadgeLoading('Switching set…');
+  document.getElementById('progressFill').style.display = '';
+  document.getElementById('progressFill').style.width = '0%';
+  allImages.length = 0;
+  lockedCards.clear();
+  for (let d = 1; d <= 4; d++) {
+    cardState[d].img = null;
+    cardState[d].dx = cardState[d].dy = -1;
+  }
+  renderAll();
+  await loadIndex();
+}
+
+async function loadIndex() {
+  const setSel = document.getElementById('imageSetSel');
+  try {
+    if (setSel) setSel.disabled = true;
+
+    const set = getActiveImageSet();
+    activeSetId = set.id;
+    activeRemoteBaseUrl = set.remoteBaseUrl;
+
+    setBadgeLoading('Loading manifest…');
+    document.getElementById('searchBtn').disabled = true;
+    document.getElementById('progressFill').style.display = '';
+    document.getElementById('progressFill').style.width = '0%';
+
+    let manifest;
+    try {
+      const manResp = await fetch(set.imageJsonPath);
+      if (!manResp.ok) throw new Error(`${set.imageJsonPath}: ${manResp.status}`);
+      manifest = await manResp.json();
+    } catch (e) {
+      console.error(e);
+      setBadgeLoading('Manifest failed');
+      document.getElementById('badgeText').textContent = `Error: ${set.imageJsonPath}`;
+      document.getElementById('searchBtn').disabled = false;
+      return;
+    }
+
+    const crs = normalizeCrs(manifest.generalImageInfo?.crs);
+    proj4.defs('MGI', crs);
+    wgs84ToMgi = proj4('EPSG:4326', 'MGI');
+    tileSize = Number(manifest.generalImageInfo?.['tile-width']) || Number(manifest.generalImageInfo?.['tile-height']) || 1024;
+
+    const tileFiles = manifest.availableTiles;
+    if (!tileFiles || !tileFiles.length) {
+      setBadgeLoading('No tiles in manifest');
+      document.getElementById('searchBtn').disabled = false;
+      return;
+    }
+
+    allImages.length = 0;
+    loadedCount = 0;
+    const total = tileFiles.length;
+
+    await Promise.all(tileFiles.map(async tile => {
+      try {
+        const resp = await fetch(`${set.tilesDir}/${tile.replace(/\//g, '_')}.json`);
+        if (resp.ok) parseImageTile(await resp.json());
+      } catch (e) { console.warn('Skipped', tile, e.message); }
+      finally {
+        loadedCount++;
+        document.getElementById('progressFill').style.width = (loadedCount / total * 100) + '%';
+      }
+    }));
+
+    setBadgeReady(allImages.length);
+    document.getElementById('progressFill').style.display = 'none';
+    document.getElementById('searchBtn').disabled = false;
+  } finally {
+    if (setSel) setSel.disabled = false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -351,6 +463,7 @@ const cardState = {1:{scale:1,padX:0,padY:0,dx:-1,dy:-1,img:null},
                    2:{scale:1,padX:0,padY:0,dx:-1,dy:-1,img:null},
                    3:{scale:1,padX:0,padY:0,dx:-1,dy:-1,img:null},
                    4:{scale:1,padX:0,padY:0,dx:-1,dy:-1,img:null}};
+const lockedCards = new Set(); // directions (1–4) whose image should not auto-switch
 
 function doSearch() {
   const raw = document.getElementById('coordsInput').value.trim();
@@ -390,7 +503,7 @@ document.getElementById('coordsInput').addEventListener('keydown', e => { if(e.k
 // ═══════════════════════════════════════════════════════
 function tileDims(width, height, zoom, tileResolution) {
   const res = tileResolution[zoom];
-  return { cols: Math.ceil(width/(TILE_SIZE*res)), rows: Math.ceil(height/(TILE_SIZE*res)) };
+  return { cols: Math.ceil(width/(tileSize*res)), rows: Math.ceil(height/(tileSize*res)) };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -458,9 +571,9 @@ function renderTiles(d) {
   const viewH = area.clientHeight || 300;
   const baseScale = Math.min(viewW/img.width, viewH/img.height);
   const scale     = baseScale * viewerZoom;
-  const dispTileW = Math.max(1, Math.round(TILE_SIZE * res * scale));
+  const dispTileW = Math.max(1, Math.round(tileSize * res * scale));
 
-  const topBlack = Math.round((rows * TILE_SIZE * res - img.height) * scale);
+  const topBlack = Math.round((rows * tileSize * res - img.height) * scale);
   const contentW = Math.round(img.width  * scale);
   const contentH = Math.round(img.height * scale);
 
@@ -472,7 +585,7 @@ function renderTiles(d) {
   for (let y = rows-1; y >= 0; y--) {
     tilesHtml += '<div class="tile-row">';
     for (let x = 0; x < cols; x++) {
-      tilesHtml += `<img src="${BASE_URL}/${img.name}/${zoom}/${x}/${y}.jpg"
+      tilesHtml += `<img src="${activeRemoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg"
                         width="${dispTileW}" height="${dispTileW}"
                         loading="lazy" onerror="this.style.opacity='.1'"
                         title="z${zoom}/${x}/${y}">`;
@@ -643,8 +756,6 @@ function moveMarker(dxM, dyM) {
   scheduleAutoSwitch();
 }
 
-const lockedCards = new Set(); // directions (1–4) whose image should not auto-switch
-
 function toggleCardLock(d) {
   lockedCards.has(d) ? lockedCards.delete(d) : lockedCards.add(d);
   const btn = document.querySelector(`#card-${d} .card-lock-btn`);
@@ -696,7 +807,7 @@ function switchCardBg(d, img, qx, qy) {
   probe.onload  = commit;
   probe.onerror = commit;
   setTimeout(commit, 800);
-  probe.src = `${BASE_URL}/${img.name}/0/0/0.jpg`;
+  probe.src = `${activeRemoteBaseUrl}/${img.name}/0/0/0.jpg`;
 }
 
 // ── Continuous keyboard movement: fires every animation frame while keys held ──
