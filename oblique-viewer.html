@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Vienna Oblique Image Finder</title>
+  <title>Vienna Oblique Aerial Photography Map and Finder</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.0/proj4.js"></script>
   <style>
     :root {
@@ -69,7 +69,10 @@
     .zoom-pills { display: flex; gap: 4px; }
     .zoom-pill { padding: 2px 8px; border-radius: 10px; font-size: .75rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text-dim); cursor: pointer; }
     .zoom-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .zoom-pill:hover:not(.active) { border-color: var(--accent); color: var(--text); }
+    /* In auto mode: which pyramid level is actually loaded */
+    .zoom-pill.auto-loaded { border: 2px solid var(--accent2); color: var(--accent2); background: var(--surface2); box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.25); }
+    .zoom-pill:hover:not(.active):not(.auto-loaded) { border-color: var(--accent); color: var(--text); }
+    .zoom-pill.auto-loaded:hover { border-color: var(--accent2); color: #79c0ff; }
 
     /* height control */
     .height-ctrl { display: flex; align-items: center; gap: 5px; font-size: .75rem; color: var(--text-dim); margin-left: auto; }
@@ -1121,8 +1124,10 @@ async function preloadResultList() {
   const run = preloadRunId;
 
   const zBase = currentImage
-    ? Math.min(currentZoom, currentImage.tileResolution.length - 1)
-    : Math.min(currentZoom, items[0].tileResolution.length - 1);
+    ? getTileZoomIndex(currentImage)
+    : (tileZoomAuto && items[0]
+      ? computeAutoTileZoom(items[0])
+      : Math.min(currentZoom, items[0].tileResolution.length - 1));
 
   const tasks = [];
   for (let i = items.length - 1; i >= 0; i--) {
@@ -1186,6 +1191,8 @@ function onPreloadListAutoChange() {
 //  VIEWER
 // ═══════════════════════════════════════════════════════════════
 let currentImage = null, currentZoom = 1;
+/** When true, main image tile zoom follows viewport, visual zoom, image size, and DPR (see computeAutoTileZoom). */
+let tileZoomAuto = true;
 let currentDispScale = 1;  // display pixels per image pixel — SAME at all zoom levels
 let currentContentW  = 0, currentContentH = 0; // content div size (after scale, before rotation)
 let currentRotDeg    = 0;  // degrees currently applied as CSS rotate() on the clip div
@@ -1219,7 +1226,7 @@ function selectImage(idx, el) {
   currentZoom = Math.min(currentZoom, maxZoom);
 
   const img = currentImage;
-  const z = currentZoom;
+  const z = getTileZoomIndex(img);
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
     waitForAllTilesDecoded(img, z).then(() => {
       if (gen !== imageSwitchGen) return;
@@ -1239,23 +1246,34 @@ function openViewer(img, zoom) {
 
   // Only initialise Z on the very first image load; preserve the user's value thereafter.
 
-  // zoom pills
-  const maxZoom = img.tileResolution.length - 1;
+  // zoom pills (auto + z0…zn)
   const pills = document.getElementById('zoomPills');
-  pills.innerHTML = img.tileResolution.map((res, z) => {
-    const {cols, rows} = tileDims(img.width, img.height, z, img.tileResolution);
-    return `<span class="zoom-pill ${z===zoom?'active':''}" data-z="${z}" title="${cols}×${rows} tiles">
-      z${z} <small style="opacity:.6">${cols*rows}t</small>
+  const autoTitle = 'Fit pyramid level to viewport, visual zoom (×), image size, and display density; tiles are ' + tileSize + '×' + tileSize + ' px';
+  pills.innerHTML =
+    `<span class="zoom-pill" data-z="auto" title="${autoTitle}">auto</span>` +
+    img.tileResolution.map((res, zi) => {
+      const { cols, rows } = tileDims(img.width, img.height, zi, img.tileResolution);
+      return `<span class="zoom-pill" data-z="${zi}" title="${cols}×${rows} tiles">
+      z${zi} <small style="opacity:.6">${cols * rows}t</small>
     </span>`;
-  }).join('');
+    }).join('');
   pills.onclick = e => {
     const pill = e.target.closest('.zoom-pill');
     if (!pill) return;
-    const z = Number(pill.dataset.z);
-    pills.querySelectorAll('.zoom-pill').forEach(p => p.classList.toggle('active', p===pill));
-    currentZoom = z;
-    renderTiles(img, z);
-    preloadToCache(img, z);
+    if (pill.dataset.z === 'auto') {
+      tileZoomAuto = true;
+      const zEff = getTileZoomIndex(img);
+      renderTiles(img, zEff);
+      preloadToCache(img, zEff);
+      updateCacheSizeDropdownLabels();
+      return;
+    }
+    const zVal = Number(pill.dataset.z);
+    tileZoomAuto = false;
+    currentZoom = zVal;
+    renderTiles(img, zVal);
+    preloadToCache(img, zVal);
+    updateCacheSizeDropdownLabels();
   };
 
   renderTiles(img, zoom);
@@ -1265,6 +1283,55 @@ function openViewer(img, zoom) {
 function tileDims(width, height, zoom, tileResolution) {
   const res = tileResolution[zoom];
   return { cols: Math.ceil(width/(tileSize*res)), rows: Math.ceil(height/(tileSize*res)) };
+}
+
+/** Device pixels per source image pixel (full frame fit × visual zoom × devicePixelRatio). */
+function screenPxPerImagePx(img) {
+  const area = document.getElementById('viewerArea');
+  const viewW = area.clientWidth || 800;
+  const viewH = area.clientHeight || 600;
+  const baseScale = Math.min(viewW / img.width, viewH / img.height);
+  return baseScale * viewerZoom * (window.devicePixelRatio || 1);
+}
+
+/**
+ * Auto tile zoom: coarsest pyramid level z where decoded tile pixels are not upsampled past
+ * ~1 device pixel per source pixel. Tiles are tileSize×tileSize JPEGs; level z covers
+ * tileSize × tileResolution[z] source pixels per tile (see tileDims).
+ */
+function computeAutoTileZoom(img) {
+  const scale = screenPxPerImagePx(img);
+  const tr = img.tileResolution;
+  const maxZ = tr.length - 1;
+  const eps = 1e-9;
+  for (let zi = 0; zi <= maxZ; zi++) {
+    if (tr[zi] * scale <= 1 + eps) return zi;
+  }
+  return maxZ;
+}
+
+function getTileZoomIndex(img) {
+  if (!img) return 0;
+  const maxZ = img.tileResolution.length - 1;
+  if (tileZoomAuto) return computeAutoTileZoom(img);
+  return Math.max(0, Math.min(maxZ, currentZoom));
+}
+
+/** Sync zoom pill classes: auto pill, manual active z, or auto-loaded border on effective z. */
+function updateZoomPillClasses() {
+  const pills = document.getElementById('zoomPills');
+  if (!pills || !currentImage) return;
+  const zEff = getTileZoomIndex(currentImage);
+  pills.querySelectorAll('.zoom-pill').forEach(p => {
+    const dz = p.dataset.z;
+    if (dz === 'auto') {
+      p.classList.toggle('active', tileZoomAuto);
+      return;
+    }
+    const zi = Number(dz);
+    p.classList.toggle('active', !tileZoomAuto && zi === currentZoom);
+    p.classList.toggle('auto-loaded', tileZoomAuto && zi === zEff);
+  });
 }
 
 /** Pre-decode all JPEG tiles for an image at zoom (same URLs as the viewer). Used before swapping views. */
@@ -1405,7 +1472,9 @@ function scheduleRebuildOverlayNeighborLayers() {
     return;
   }
 
-  const z = currentZoom;
+  // Nearest-neighbor previews (behind the stack when Reproject to main is on) always load z0
+  // tiles so resolution does not follow the main image’s zoom pills.
+  const z = 0;
   const mainName = currentImage.name;
 
   // Keep previous neighbor layers visible until the new set has finished decoding.
@@ -1556,6 +1625,7 @@ function renderTiles(img, zoom) {
 
   refreshDot();
   updateCacheSizeDropdownLabels();
+  updateZoomPillClasses();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1677,7 +1747,7 @@ function changeViewZoom(dir) {
     : viewerZoom.toFixed(2).replace(/0+$/,'').replace(/\.$/,'') + '×';
   document.getElementById('vzoomLabel').textContent = lbl;
 
-  if (currentImage) renderTiles(currentImage, currentZoom);
+  if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
 
 let markerVisible  = true;
@@ -1710,7 +1780,7 @@ function togglePinCenter() {
     const padDiv = document.getElementById('rotPadDiv');
     if (padDiv) padDiv.style.transform = '';
   }
-  if (currentImage) renderTiles(currentImage, currentZoom);
+  if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1809,8 +1879,7 @@ function mbPerCachedImageAtZoom(z) {
 
 function effectiveCacheEstimateZoom() {
   if (!currentImage) return 4;
-  const maxZ = currentImage.tileResolution.length - 1;
-  return Math.max(0, Math.min(maxZ, currentZoom));
+  return getTileZoomIndex(currentImage);
 }
 
 function formatApproximateMemory(totalMb) {
@@ -1836,22 +1905,25 @@ function updateCacheSizeDropdownLabels() {
     opt.textContent = `${n} images (${formatApproximateMemory(mbEach * n)})`;
   }
   const zNote = currentImage
-    ? `current tile zoom z${z} (≈ ${mbEach} MB per image)`
+    ? (tileZoomAuto
+      ? `auto (currently z${z} ≈ ${mbEach} MB per image)`
+      : `current tile zoom z${z} (≈ ${mbEach} MB per image)`)
     : 'z4 (≈ 42 MB per image) until an image is open';
-  sel.title = `Max number of (image × zoom) pairs kept in memory. Totals use ${zNote}; change the z pill to update.`;
+  sel.title = `Max number of (image × zoom) pairs kept in memory. Totals use ${zNote}; change the quality pill to update.`;
 
   const lab = document.getElementById('cacheEnabledLabel');
   if (lab) {
     lab.title = 'Hold decoded tile bitmaps in memory so previously viewed images re-display instantly. '
       + 'Approx. size per image: z0≈0.3 MB, z1≈1 MB, z2≈3 MB, z3≈11 MB, z4≈42 MB. '
-      + 'The limit dropdown updates when you change tile zoom.';
+      + 'The limit dropdown updates when you change quality (auto or z0–zn).';
   }
 
   const pb = document.getElementById('preloadListBtn');
   if (pb) {
     if (currentImage) {
-      const zz = Math.min(currentZoom, currentImage.tileResolution.length - 1);
-      pb.title = `Decode tiles for every image in the current list into memory, up to the max above. Order keeps best-ranked matches (LRU). Uses current tile zoom (z${zz}).`;
+      const zz = getTileZoomIndex(currentImage);
+      const zzLabel = tileZoomAuto ? `auto (z${zz})` : `z${zz}`;
+      pb.title = `Decode tiles for every image in the current list into memory, up to the max above. Order keeps best-ranked matches (LRU). Uses current quality (${zzLabel}).`;
     } else {
       pb.title = 'Decode tiles for every image in the current list into memory, up to the max above. Order keeps best-ranked matches (LRU). When no image is open, zoom follows the first list row per image.';
     }
@@ -1876,7 +1948,7 @@ function onCacheToggle() {
     tileCacheMap.clear();
     updateCacheInfo();
   } else if (currentImage) {
-    preloadToCache(currentImage, currentZoom);
+    preloadToCache(currentImage, getTileZoomIndex(currentImage));
   }
   updatePreloadControls();
 }
@@ -2130,10 +2202,10 @@ function toggleOverlay() {
   if (overlayEnabled) {
     // Start with a clean slate so old single-image content doesn't linger.
     if (area) area.innerHTML = '';
-    if (currentImage) renderTiles(currentImage, currentZoom);
+    if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
   } else {
     // Back to single-image mode — re-render clears all layers via area.innerHTML.
-    if (currentImage) renderTiles(currentImage, currentZoom);
+    if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
   }
 }
 
@@ -2174,7 +2246,7 @@ function toggleAutoRotate() {
   autoRotate = !autoRotate;
   const btn = document.getElementById('autoRotateBtn');
   btn.style.opacity = autoRotate ? '' : '.5';
-  if (currentImage) renderTiles(currentImage, currentZoom);
+  if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
 
 /** Update the rotate button label to show the applied angle. */
@@ -2248,7 +2320,7 @@ function switchToImageBg(img, qx, qy) {
     distCenter:  Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1]),
     coversPoint: img.footprintMgi ? pointInPolygon2D(qx, qy, img.footprintMgi) : true,
   };
-  const z = Math.min(currentZoom, img.tileResolution.length - 1);
+  const z = getTileZoomIndex(img);
 
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
     waitForAllTilesDecoded(img, z).then(() => {
@@ -2414,6 +2486,19 @@ let   dragInvJ      = null, dragScale = 1;
 
 const viewerAreaEl = document.getElementById('viewerArea');
 
+if (typeof ResizeObserver !== 'undefined' && viewerAreaEl) {
+  let viewerResizeRaf = 0;
+  new ResizeObserver(() => {
+    if (!currentImage || !tileZoomAuto) return;
+    cancelAnimationFrame(viewerResizeRaf);
+    viewerResizeRaf = requestAnimationFrame(() => {
+      const z = getTileZoomIndex(currentImage);
+      renderTiles(currentImage, z);
+      if (tileCacheEnabled) preloadToCache(currentImage, z);
+    });
+  }).observe(viewerAreaEl);
+}
+
 function beginDrag(clientX, clientY) {
   if (!currentImage) return false;
   const hVal = document.getElementById('heightNum').value;
@@ -2476,7 +2561,7 @@ function setViewerZoomTo(z) {
     ? (Number.isInteger(v) ? v+'×' : v.toFixed(2).replace(/\.?0+$/,'')+'×')
     : v.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')+'×';
   document.getElementById('vzoomLabel').textContent = lbl;
-  if (currentImage) renderTiles(currentImage, currentZoom);
+  if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
 
 viewerAreaEl.addEventListener('touchstart', e => {
