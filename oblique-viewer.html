@@ -189,17 +189,20 @@
       <div class="height-ctrl" title="Ground elevation (Z) used for coordinate projection onto image">
         <span>Z:</span>
         <input type="range" id="heightSlider" min="-100" max="400" step="1" value="0"
-               oninput="document.getElementById('heightNum').value=this.value; refreshDot()">
+               oninput="document.getElementById('heightNum').value=this.value; onHeightChange()">
         <input type="number" id="heightNum" value="0" min="-100" max="400"
-               oninput="document.getElementById('heightSlider').value=this.value; refreshDot()">
+               oninput="document.getElementById('heightSlider').value=this.value; onHeightChange()">
         <span>m</span>
       </div>
       <button class="btn-sm" id="markerToggleBtn"  onclick="toggleMarker()">● Marker</button>
       <button class="btn-sm" id="zoomMarkerBtn"   onclick="toggleZoomToMarker()">⊕ Zoom to</button>
-      <button class="btn-sm" id="lockImagesBtn"   onclick="toggleLockImages()">🔓 Lock image</button>
+      <button class="btn-sm" id="pinCenterBtn"    onclick="togglePinCenter()" style="opacity:.5"
+              title="Keep the marker pinned to the exact viewport centre; image translates, dark space fills the edges">⊙ Pin centre</button>
+      <button class="btn-sm" id="lockImagesBtn"    onclick="toggleLockImages()">🔓 Lock image</button>
+      <button class="btn-sm" id="autoRotateBtn"   onclick="toggleAutoRotate()">↻ Rotate to marker</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
       <span style="font-size:.68rem;color:var(--text-dim);white-space:nowrap"
-            title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads.">⌨ ↑↓←→ 5 m</span>
+            title="Arrow keys move the marker (Shift = ×10). Best matching image auto-loads. , / . step through the list.">⌨ ↑↓←→ · , .</span>
     </div>
     <div class="viewer-area" id="viewerArea">
       <div class="empty-viewer">← Select an image from the list</div>
@@ -629,6 +632,10 @@ function renderList(items) {
 // ═══════════════════════════════════════════════════════════════
 let currentImage = null, currentZoom = 1;
 let currentDispScale = 1;  // display pixels per image pixel — SAME at all zoom levels
+let currentContentW  = 0, currentContentH = 0; // content div size (after scale, before rotation)
+let currentRotDeg    = 0;  // degrees currently applied as CSS rotate() on the clip div
+let autoRotate       = false; // when true, rotate so the marker is horizontally centred
+let pinMarkerCenter  = false; // when true, translate the image so the marker is at the exact viewport centre
 
 // Visual zoom (multiplier on top of the fit-to-viewer base scale).
 // Kept between image switches; independent of tile quality zoom.
@@ -701,10 +708,35 @@ function renderTiles(img, zoom) {
   const contentW = Math.round(img.width  * scale);
   const contentH = Math.round(img.height * scale);
 
-  // When content is smaller than the viewport, centre it with padding.
-  // When zoomed in (content > viewport) padding is 0 → overflow:auto scrolls.
-  viewPadX = Math.max(0, Math.floor((viewW - contentW) / 2));
-  viewPadY = Math.max(0, Math.floor((viewH - contentH) / 2));
+  // Compute auto-rotation: rotate so the marker is horizontally centred.
+  // rotDeg = -horizAngle  (positive horizAngle → marker right of centre → rotate left).
+  let rotDeg = 0;
+  if (autoRotate && img.pToImage) {
+    const hVal = document.getElementById('heightNum').value;
+    const Z = hVal === '' ? 0 : Number(hVal);
+    const proj = projectToPixel(img, searchLat, searchLon, Z);
+    if (proj) {
+      const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
+      if (fx >= 1) rotDeg = -Math.atan((proj[0] - img.width / 2) / fx) * (180 / Math.PI);
+    }
+  }
+  currentRotDeg   = rotDeg;
+  currentContentW = contentW;
+  currentContentH = contentH;
+  updateAutoRotateLabel(rotDeg);
+
+  // In pin-centre mode padding is irrelevant (translate does all positioning).
+  // In normal mode centre the image, with extra room for rotated corners.
+  if (pinMarkerCenter) {
+    viewPadX = 0;
+    viewPadY = 0;
+  } else {
+    const rotRad    = Math.abs(rotDeg) * Math.PI / 180;
+    const rotExtraW = Math.round((contentW * (1 - Math.cos(rotRad)) + contentH * Math.sin(rotRad)) / 2);
+    const rotExtraH = Math.round((contentH * (1 - Math.cos(rotRad)) + contentW * Math.sin(rotRad)) / 2);
+    viewPadX = Math.max(0, Math.floor((viewW - contentW) / 2)) + rotExtraW;
+    viewPadY = Math.max(0, Math.floor((viewH - contentH) / 2)) + rotExtraH;
+  }
 
   let tilesHtml = '';
   for (let y = rows - 1; y >= 0; y--) {
@@ -718,10 +750,17 @@ function renderTiles(img, zoom) {
     tilesHtml += '</div>';
   }
 
+  const rotStyle = rotDeg !== 0
+    ? `transform:rotate(${rotDeg}deg);transform-origin:50% 50%;`
+    : '';
+
   // Outer div provides centering padding; inner clip wrapper hides black tile borders.
+  // The rotation is applied to the clip wrapper so tiles + SVG rotate together.
+  // IDs rotPadDiv / rotClipDiv allow refreshDot() to update the rotation live
+  // without rebuilding the whole tile grid.
   area.innerHTML = `
-    <div style="padding:${viewPadY}px ${viewPadX}px;min-width:max-content;background:#080a0e;">
-      <div style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;">
+    <div id="rotPadDiv" style="padding:${viewPadY}px ${viewPadX}px;min-width:max-content;background:#080a0e;">
+      <div id="rotClipDiv" style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;${rotStyle}">
         <div style="position:absolute;top:-${topBlack}px;left:0;">
           <div class="tile-canvas-wrap">${tilesHtml}</div>
         </div>
@@ -735,6 +774,14 @@ function renderTiles(img, zoom) {
 // ═══════════════════════════════════════════════════════════════
 //  DOT OVERLAY  – called whenever height changes or image changes
 // ═══════════════════════════════════════════════════════════════
+/** Called when the ground-elevation (Z) slider/input changes.
+ *  Refreshes the dot projection AND re-evaluates the inFrame filter so the
+ *  "Hide ⚠ outside" checkbox reflects the new elevation immediately. */
+function onHeightChange() {
+  refreshDot();
+  if (searchResults.length) applySort();
+}
+
 function refreshDot() {
   const svgEl = document.getElementById('dotOverlay');
   if (!svgEl || !currentImage) return;
@@ -791,6 +838,39 @@ function refreshDot() {
     }
   }
 
+  // When autoRotate is on, update the CSS rotation live as the marker moves
+  // (no tile rebuild — just change the clip div's transform and padding).
+  if (autoRotate && currentImage.pToImage && result) {
+    const fx = Math.hypot(
+      currentImage.pToImage[0][0],
+      currentImage.pToImage[0][1],
+      currentImage.pToImage[0][2]
+    );
+    const newRot = (fx >= 1)
+      ? -Math.atan((px - currentImage.width / 2) / fx) * (180 / Math.PI)
+      : 0;
+    if (Math.abs(newRot - currentRotDeg) > 0.15) {
+      currentRotDeg = newRot;
+      updateAutoRotateLabel(newRot);
+      const clipDiv = document.getElementById('rotClipDiv');
+      if (clipDiv) clipDiv.style.transform = `rotate(${newRot}deg)`;
+      // Re-derive padding so scrollToMarker stays accurate.
+      // In pin-centre mode padding is always 0 — the translate handles positioning.
+      if (!pinMarkerCenter) {
+        const area2  = document.getElementById('viewerArea');
+        const vW2    = area2.clientWidth  || 800;
+        const vH2    = area2.clientHeight || 600;
+        const rRad   = Math.abs(newRot) * Math.PI / 180;
+        const exW    = Math.round((currentContentW * (1 - Math.cos(rRad)) + currentContentH * Math.sin(rRad)) / 2);
+        const exH    = Math.round((currentContentH * (1 - Math.cos(rRad)) + currentContentW * Math.sin(rRad)) / 2);
+        viewPadX = Math.max(0, Math.floor((vW2 - currentContentW) / 2)) + exW;
+        viewPadY = Math.max(0, Math.floor((vH2 - currentContentH) / 2)) + exH;
+        const padDiv = document.getElementById('rotPadDiv');
+        if (padDiv) padDiv.style.padding = `${viewPadY}px ${viewPadX}px`;
+      }
+    }
+  }
+
   // Scroll to marker if that option is on (independent of marker visibility).
   scrollToMarker();
 }
@@ -830,6 +910,20 @@ function toggleZoomToMarker() {
   btn.textContent  = zoomToMarker ? '⊕ Zoom to' : '⊖ Zoom to';
   btn.style.opacity = zoomToMarker ? '' : '.5';
   if (zoomToMarker) scrollToMarker();  // snap immediately if just enabled
+}
+
+function togglePinCenter() {
+  pinMarkerCenter = !pinMarkerCenter;
+  const btn = document.getElementById('pinCenterBtn');
+  btn.style.opacity = pinMarkerCenter ? '' : '.5';
+  const area = document.getElementById('viewerArea');
+  if (area) area.style.overflow = pinMarkerCenter ? 'hidden' : '';
+  if (!pinMarkerCenter) {
+    // Clear the translate so the image returns to normal centred padding.
+    const padDiv = document.getElementById('rotPadDiv');
+    if (padDiv) padDiv.style.transform = '';
+  }
+  if (currentImage) renderTiles(currentImage, currentZoom);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -906,13 +1000,37 @@ function onCacheSizeChange() {
   updateCacheInfo();
 }
 
-/** Scroll the viewer so the marker stays centred (only when zoomToMarker is on). */
+/** Position the viewer so the marker is centred (respects zoomToMarker and pinMarkerCenter). */
 function scrollToMarker() {
   if (!zoomToMarker || markerDX < 0 || markerDY < 0) return;
   const area = document.getElementById('viewerArea');
   if (!area) return;
-  area.scrollLeft = viewPadX + markerDX - area.clientWidth  / 2;
-  area.scrollTop  = viewPadY + markerDY - area.clientHeight / 2;
+
+  // When a CSS rotation is applied, the marker's visual position in the
+  // scrollable coordinate system differs from its position in content space.
+  // Rotate (markerDX, markerDY) around the content centre by the same angle.
+  let vx = markerDX, vy = markerDY;
+  if (currentRotDeg !== 0 && currentContentW > 0) {
+    const cx = currentContentW / 2, cy = currentContentH / 2;
+    const θ  = currentRotDeg * Math.PI / 180;
+    const dx = markerDX - cx, dy = markerDY - cy;
+    vx = cx + dx * Math.cos(θ) - dy * Math.sin(θ);
+    vy = cy + dx * Math.sin(θ) + dy * Math.cos(θ);
+  }
+
+  if (pinMarkerCenter) {
+    // Translate the content div so the marker lands at the exact viewport centre.
+    // (viewerArea has overflow:hidden in this mode — no scrolling involved.)
+    const tx = area.clientWidth  / 2 - vx;
+    const ty = area.clientHeight / 2 - vy;
+    const padDiv = document.getElementById('rotPadDiv');
+    if (padDiv) padDiv.style.transform = `translate(${tx}px, ${ty}px)`;
+    area.scrollLeft = 0;
+    area.scrollTop  = 0;
+  } else {
+    area.scrollLeft = viewPadX + vx - area.clientWidth  / 2;
+    area.scrollTop  = viewPadY + vy - area.clientHeight / 2;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -983,6 +1101,24 @@ function toggleLockImages() {
   btn.classList.toggle('active', lockedImages);
 }
 
+function toggleAutoRotate() {
+  autoRotate = !autoRotate;
+  const btn = document.getElementById('autoRotateBtn');
+  btn.style.opacity = autoRotate ? '' : '.5';
+  if (currentImage) renderTiles(currentImage, currentZoom);
+}
+
+/** Update the rotate button label to show the applied angle. */
+function updateAutoRotateLabel(deg) {
+  const btn = document.getElementById('autoRotateBtn');
+  if (!btn) return;
+  if (!autoRotate || deg === 0) {
+    btn.textContent = '↻ Rotate to marker';
+  } else {
+    btn.textContent = `↻ ${deg >= 0 ? '+' : ''}${deg.toFixed(1)}°`;
+  }
+}
+
 /** Debounce: after 120 ms of no keys, find the best image for the current direction. */
 function scheduleAutoSwitch() {
   if (lockedImages) return;
@@ -1045,6 +1181,24 @@ let   keyRafId   = null, lastKeyTs = null;
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
   if (e.key === 'Shift') { shiftHeld = true; return; }
+
+  // , / . — step through the result list (wraps around)
+  if (e.key === ',' || e.key === '.') {
+    const list  = document.getElementById('resultsList');
+    const items = list?._items;
+    if (!items || items.length === 0) return;
+    e.preventDefault();
+    const curIdx = currentImage ? items.findIndex(it => it.name === currentImage.name) : -1;
+    const delta  = e.key === '.' ? 1 : -1;
+    const newIdx = ((curIdx + delta) % items.length + items.length) % items.length;
+    const elems  = list.querySelectorAll('.result-item');
+    if (elems[newIdx]) {
+      selectImage(newIdx, elems[newIdx]);
+      elems[newIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+    return;
+  }
+
   if (!ARROW_KEYS.includes(e.key) || !currentImage) return;
   e.preventDefault();
   keysHeld.add(e.key);
