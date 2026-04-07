@@ -40,7 +40,11 @@
 
     .results-header { padding: 8px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; font-size: .78rem; color: var(--text-dim); }
     .results-header strong { color: var(--text); }
-    .sort-select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: .75rem; padding: 2px 6px; margin-left: auto; }
+    .sort-select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: .75rem; padding: 2px 6px; }
+    .filter-label { display: flex; align-items: center; gap: 4px; font-size: .73rem; cursor: pointer; margin-left: auto; white-space: nowrap; }
+    .cache-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding-top: 2px; }
+    .cache-select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: .73rem; padding: 2px 5px; }
+    .cache-select:disabled { opacity: .4; }
     .results-list { flex: 1; overflow-y: auto; }
     .result-item { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .12s; }
     .result-item:hover { background: var(--surface2); }
@@ -132,10 +136,30 @@
         <span style="font-size:.72rem;color:var(--text-dim)" id="indexStatus">—</span>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+      <div class="cache-row">
+        <label style="display:flex;align-items:center;gap:5px;font-size:.75rem;cursor:pointer;color:var(--text-dim)"
+               title="Hold decoded tile bitmaps in memory so previously viewed images re-display instantly. Each image at z4 ≈ 42 MB.">
+          <input type="checkbox" id="cacheEnabledCb" onchange="onCacheToggle()">
+          Keep images in memory
+        </label>
+        <select id="cacheSizeSel" class="cache-select" disabled onchange="onCacheSizeChange()"
+                title="Max number of (image × zoom) pairs kept in memory. Memory shown is worst-case (z4).">
+          <option value="3">3 images (~126 MB)</option>
+          <option value="5" selected>5 images (~210 MB)</option>
+          <option value="10">10 images (~420 MB)</option>
+          <option value="20">20 images (~840 MB)</option>
+          <option value="50">50 images (~2.1 GB)</option>
+        </select>
+        <span id="cacheInfo" style="font-size:.72rem;color:var(--text-dim)"></span>
+      </div>
     </div>
 
     <div class="results-header" id="resultsHeader" style="display:none">
       <strong id="resultCount">0</strong>&nbsp;images found
+      <label class="filter-label" title="Hide images where the marker projects outside the visible frame">
+        <input type="checkbox" id="filterOutOfFrame" onchange="applySort()">
+        Hide ⚠ outside
+      </label>
       <select class="sort-select" id="sortSelect" onchange="applySort()">
         <option value="dist">Sort: Distance</option>
         <option value="heading">Sort: Heading</option>
@@ -458,9 +482,8 @@ function doSearch() {
     });
   }
 
-  applySort();
   document.getElementById('resultsHeader').style.display = 'flex';
-  document.getElementById('resultCount').textContent = searchResults.length;
+  applySort();   // applySort sets resultCount (supports "X / Y" when filtered)
 }
 
 document.getElementById('coordsInput').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
@@ -511,14 +534,27 @@ function applySort() {
     return { ...img, horizAngle, inFrame, orbitAngle };
   });
 
-  items.sort((a, b) =>
+  // Optionally hide images where the marker projects outside the frame.
+  const hideOOF  = document.getElementById('filterOutOfFrame')?.checked;
+  const visible  = hideOOF ? items.filter(it => it.inFrame) : items;
+
+  visible.sort((a, b) =>
     key === 'heading' ? a.heading - b.heading :
     key === 'dir'     ? (a.viewDirection - b.viewDirection) || (a.distCenter - b.distCenter) :
     key === 'margin'  ? Math.abs(a.horizAngle) - Math.abs(b.horizAngle) :  // most centred first
     key === 'rotate'  ? a.orbitAngle - b.orbitAngle :
     /* dist */          a.distCenter - b.distCenter
   );
-  renderList(items);
+
+  // Update the count badge: "X / Y" when filtered, plain "Y" otherwise.
+  const countEl = document.getElementById('resultCount');
+  if (countEl) {
+    countEl.textContent = (hideOOF && visible.length !== items.length)
+      ? `${visible.length} / ${items.length}`
+      : items.length;
+  }
+
+  renderList(visible);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -636,9 +672,11 @@ function openViewer(img, zoom) {
     pills.querySelectorAll('.zoom-pill').forEach(p => p.classList.toggle('active', p===pill));
     currentZoom = z;
     renderTiles(img, z);
+    preloadToCache(img, z);
   };
 
   renderTiles(img, zoom);
+  preloadToCache(img, zoom);
 }
 
 function tileDims(width, height, zoom, tileResolution) {
@@ -792,6 +830,80 @@ function toggleZoomToMarker() {
   btn.textContent  = zoomToMarker ? '⊕ Zoom to' : '⊖ Zoom to';
   btn.style.opacity = zoomToMarker ? '' : '.5';
   if (zoomToMarker) scrollToMarker();  // snap immediately if just enabled
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TILE MEMORY CACHE
+//  Keeps decoded tile bitmaps alive by holding HTMLImageElement
+//  references in a hidden container.  LRU evicts oldest entries
+//  when the limit is reached.  Each entry = one (image × zoom).
+// ═══════════════════════════════════════════════════════════════
+let tileCacheEnabled = false;
+let tileCacheMax     = 5;
+const tileCacheMap   = new Map();   // "${name}/${zoom}" → { els: HTMLImageElement[], seq: number }
+let   tileCacheSeq   = 0;
+
+function tileCacheEvict() {
+  while (tileCacheMap.size >= tileCacheMax) {
+    let lruKey = null, lruSeq = Infinity;
+    for (const [k, v] of tileCacheMap) {
+      if (v.seq < lruSeq) { lruSeq = v.seq; lruKey = k; }
+    }
+    if (!lruKey) break;
+    tileCacheMap.get(lruKey).els.forEach(el => el.remove());
+    tileCacheMap.delete(lruKey);
+  }
+}
+
+function preloadToCache(img, zoom) {
+  if (!tileCacheEnabled) return;
+  const key = `${img.name}/${zoom}`;
+  if (tileCacheMap.has(key)) {
+    tileCacheMap.get(key).seq = ++tileCacheSeq;   // bump LRU timestamp
+    updateCacheInfo();
+    return;
+  }
+  tileCacheEvict();
+  const {cols, rows} = tileDims(img.width, img.height, zoom, img.tileResolution);
+  const container = document.getElementById('tileCache');
+  const els = [];
+  for (let y = rows - 1; y >= 0; y--) {
+    for (let x = 0; x < cols; x++) {
+      const el = new Image();
+      el.src = `${BASE_URL}/${img.name}/${zoom}/${x}/${y}.jpg`;
+      container.appendChild(el);
+      els.push(el);
+    }
+  }
+  tileCacheMap.set(key, { els, seq: ++tileCacheSeq });
+  updateCacheInfo();
+}
+
+function updateCacheInfo() {
+  const el = document.getElementById('cacheInfo');
+  if (!el) return;
+  el.textContent = tileCacheMap.size
+    ? `${tileCacheMap.size} / ${tileCacheMax} in memory`
+    : '';
+}
+
+function onCacheToggle() {
+  tileCacheEnabled = document.getElementById('cacheEnabledCb').checked;
+  document.getElementById('cacheSizeSel').disabled = !tileCacheEnabled;
+  if (!tileCacheEnabled) {
+    // Release all cached elements.
+    tileCacheMap.forEach(v => v.els.forEach(el => el.remove()));
+    tileCacheMap.clear();
+    updateCacheInfo();
+  } else if (currentImage) {
+    preloadToCache(currentImage, currentZoom);
+  }
+}
+
+function onCacheSizeChange() {
+  tileCacheMax = Number(document.getElementById('cacheSizeSel').value);
+  tileCacheEvict();
+  updateCacheInfo();
 }
 
 /** Scroll the viewer so the marker stays centred (only when zoomToMarker is on). */
@@ -1087,5 +1199,8 @@ document.getElementById('viewerArea').addEventListener('wheel', e => {
 
 loadIndex();
 </script>
+<!-- Hidden container that keeps tile <img> elements alive so their decoded bitmaps
+     remain in the browser's image cache between image switches. -->
+<div id="tileCache" style="position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;visibility:hidden;"></div>
 </body>
 </html>
