@@ -84,6 +84,10 @@
     .viewer-area { flex: 1; overflow: auto; background: #080a0e; cursor: grab; position: relative; }
     /* Dim main oblique only when ortho is the only thing behind it — if reprojected neighbors sit under #rotPadDiv, dimming looks like a double image */
     .viewer-area.has-ortho-dim-main #rotPadDiv .tile-canvas-wrap { opacity: 0.78; }
+    /* Shift+O: hide nadir ortho; restore full opacity on main oblique while hidden */
+    .viewer-area.ortho-bg-hidden #orthoUnderlay,
+    .viewer-area.ortho-bg-hidden #orthoBaseLayer { visibility: hidden !important; }
+    .viewer-area.ortho-bg-hidden #rotPadDiv .tile-canvas-wrap { opacity: 1 !important; }
     .tile-canvas-wrap { display: inline-block; line-height: 0; }
     .tile-row { display: flex; }
     .tile-row img { display: block; flex-shrink: 0; background: #111; }
@@ -773,13 +777,77 @@ function solveLinear8(A, b) {
   return M.map(row => row[n]);
 }
 
-/** Homography H with h₂₂=1 mapping src → dst (four point pairs, pixel coords). */
+function invert3x3(M) {
+  const a = M[0][0], b = M[0][1], c = M[0][2];
+  const d = M[1][0], e = M[1][1], f = M[1][2];
+  const g = M[2][0], h = M[2][1], i = M[2][2];
+  const det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+  if (Math.abs(det) < 1e-18) return null;
+  const s = 1 / det;
+  return [
+    [(e * i - f * h) * s, (c * h - b * i) * s, (b * f - c * e) * s],
+    [(f * g - d * i) * s, (a * i - c * g) * s, (c * d - a * f) * s],
+    [(d * h - e * g) * s, (b * g - a * h) * s, (a * e - b * d) * s],
+  ];
+}
+
+function multiply3x3(A, B) {
+  const C = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      C[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j];
+    }
+  }
+  return C;
+}
+
+/** Hartley normalization: centroid + scale so mean distance to centroid = √2 (stabilizes DLT). */
+function normalize2DPointsForHomography(pts) {
+  let cx = 0;
+  let cy = 0;
+  const n = pts.length;
+  for (let k = 0; k < n; k++) {
+    cx += pts[k][0];
+    cy += pts[k][1];
+  }
+  cx /= n;
+  cy /= n;
+  let meanDist = 0;
+  for (let k = 0; k < n; k++) {
+    meanDist += Math.hypot(pts[k][0] - cx, pts[k][1] - cy);
+  }
+  meanDist /= n;
+  if (meanDist < 1e-12) return null;
+  const sc = Math.SQRT2 / meanDist;
+  const T = [
+    [sc, 0, -sc * cx],
+    [0, sc, -sc * cy],
+    [0, 0, 1],
+  ];
+  const normPts = [];
+  for (let k = 0; k < n; k++) {
+    normPts.push([sc * (pts[k][0] - cx), sc * (pts[k][1] - cy)]);
+  }
+  return { T, normPts };
+}
+
+/**
+ * Homography H with h₂₂=1 mapping src → dst (four point pairs, pixel coords).
+ * Uses Hartley normalization so large coordinates (ortho union space) don’t blow up the 8×8 solve.
+ */
 function homographyFrom4Points2D(srcPts, dstPts) {
+  const ns = normalize2DPointsForHomography(srcPts);
+  const nd = normalize2DPointsForHomography(dstPts);
+  if (!ns || !nd) return null;
   const A = [];
   const b = [];
   for (let i = 0; i < 4; i++) {
-    const x = srcPts[i][0], y = srcPts[i][1];
-    const xp = dstPts[i][0], yp = dstPts[i][1];
+    const x = ns.normPts[i][0], y = ns.normPts[i][1];
+    const xp = nd.normPts[i][0], yp = nd.normPts[i][1];
     A.push([x, y, 1, 0, 0, 0, -xp * x, -xp * y]);
     b.push(xp);
     A.push([0, 0, 0, x, y, 1, -yp * x, -yp * y]);
@@ -787,11 +855,22 @@ function homographyFrom4Points2D(srcPts, dstPts) {
   }
   const h8 = solveLinear8(A, b);
   if (!h8) return null;
-  return [
+  const Hn = [
     [h8[0], h8[1], h8[2]],
     [h8[3], h8[4], h8[5]],
     [h8[6], h8[7], 1],
   ];
+  const invTd = invert3x3(nd.T);
+  if (!invTd) return null;
+  let H = multiply3x3(multiply3x3(invTd, Hn), ns.T);
+  const h22 = H[2][2];
+  if (Math.abs(h22) < 1e-14) return null;
+  H = [
+    [H[0][0] / h22, H[0][1] / h22, H[0][2] / h22],
+    [H[1][0] / h22, H[1][1] / h22, H[1][2] / h22],
+    [H[2][0] / h22, H[2][1] / h22, H[2][2] / h22],
+  ];
+  return H;
 }
 
 /**
@@ -899,6 +978,8 @@ async function onImageSetChange() {
     if (va) {
       va.classList.remove('has-ortho');
       va.classList.remove('has-ortho-dim-main');
+      va.classList.remove('ortho-bg-hidden');
+      orthoBackgroundVisible = true;
       va.innerHTML = '<div class="empty-viewer">← Select an image from the list</div>';
     }
   }
@@ -923,6 +1004,8 @@ async function loadIndex() {
       if (va) {
         va.classList.remove('has-ortho');
         va.classList.remove('has-ortho-dim-main');
+        va.classList.remove('ortho-bg-hidden');
+        orthoBackgroundVisible = true;
         va.innerHTML = '<div class="empty-viewer">Loading index…</div>';
       }
     }
@@ -952,6 +1035,8 @@ async function loadIndex() {
         if (va) {
           va.classList.remove('has-ortho');
           va.classList.remove('has-ortho-dim-main');
+          va.classList.remove('ortho-bg-hidden');
+          orthoBackgroundVisible = true;
           va.innerHTML = '<div class="empty-viewer">Manifest failed — open the full viewer or check paths.</div>';
         }
       }
@@ -1380,6 +1465,8 @@ let overlayNeighborCount = 0; // 0,4,8,… preloaded nearest images shown when r
 let overlayNeighborGen   = 0; // invalidates async neighbor rebuild
 /** When true: hide neighbor previews + older overlay history; only the top (main) image layer stays visible. Hotkey: Shift+S */
 let overlayStitchedOnlyMain = false;
+/** User toggle for nadir ortho underlay / base layer. Hotkey: Shift+O */
+let orthoBackgroundVisible = true;
 let listPlayTimer    = null;
 let listPlayActive   = false;
 
@@ -1832,6 +1919,7 @@ function computeOrthoLayout(img, rotDeg, contentW, contentH) {
   const orthoMarkerY = mPt.y - minTop;
 
   let orthoTilesHtml = '';
+  const orthoTileLayers = [];
   for (const t of orthoTilesData.tiles) {
     const pw = t.previewWidth || 1024;
     const ph = t.previewHeight || 1024;
@@ -1850,6 +1938,7 @@ function computeOrthoLayout(img, rotDeg, contentW, contentH) {
     );
     if (!H) continue;
     const mat3d = homography3x3ToMatrix3dString(H);
+    orthoTileLayers.push({ previewUrl: t.previewUrl, pw, ph, mat3d });
     orthoTilesHtml += `<img src="${t.previewUrl}" alt="" draggable="false" loading="eager" decoding="async" width="${pw}" height="${ph}"
       style="position:absolute;left:0;top:0;opacity:.88;pointer-events:none;transform-origin:0 0;transform:${mat3d};"
       onerror="this.style.opacity='.1'"/>`;
@@ -1859,6 +1948,7 @@ function computeOrthoLayout(img, rotDeg, contentW, contentH) {
 
   return {
     orthoTilesHtml,
+    orthoTileLayers,
     unionW,
     unionH,
     minLeft,
@@ -1872,6 +1962,75 @@ function computeOrthoLayout(img, rotDeg, contentW, contentH) {
   };
 }
 
+/** Update existing ortho <img> transforms without replacing innerHTML (avoids decode blink). */
+function applyOrthoTileSpecsToContainer(container, layout) {
+  if (!container || !layout.orthoTileLayers) return;
+  const specs = layout.orthoTileLayers;
+  const imgs = container.querySelectorAll(':scope > img');
+  if (imgs.length !== specs.length || specs.length === 0) {
+    container.innerHTML = layout.orthoTilesHtml;
+    return;
+  }
+  for (let i = 0; i < specs.length; i++) {
+    const imgEl = imgs[i];
+    const spec = specs[i];
+    const want = spec.previewUrl;
+    const have = imgEl.getAttribute('src') || '';
+    const tail = want.split('/').pop();
+    if (have !== want && !(tail && have.endsWith(tail))) {
+      container.innerHTML = layout.orthoTilesHtml;
+      return;
+    }
+    imgEl.width = spec.pw;
+    imgEl.height = spec.ph;
+    imgEl.style.cssText =
+      'position:absolute;left:0;top:0;opacity:.88;pointer-events:none;transform-origin:0 0;'
+      + `transform:${spec.mat3d};`;
+  }
+}
+
+function applyOrthoLayoutToUnderlay(el, layout) {
+  if (!el || !layout) return;
+  el._orthoMarkerX = layout.orthoMarkerX;
+  el._orthoMarkerY = layout.orthoMarkerY;
+  applyOrthoTileSpecsToContainer(el, layout);
+  el.style.cssText =
+    `position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;`
+    + 'z-index:0;pointer-events:none;will-change:transform;filter:saturate(0.88) brightness(0.92);';
+}
+
+/**
+ * Recompute ortho geometry after marker / auto-rotate moves without a full renderTiles (overlay mode).
+ * Must run before scrollToMarker so _orthoMarkerX/Y match the current search point.
+ */
+function refreshOrthoUnderlayLive() {
+  if (!overlayEnabled || !currentImage) return;
+  const el = document.getElementById('orthoUnderlay');
+  if (!el) return;
+  const layout = computeOrthoLayout(currentImage, currentRotDeg, currentContentW, currentContentH);
+  if (!layout) return;
+  applyOrthoLayoutToUnderlay(el, layout);
+  if (!zoomToMarker) syncOrthoUnderlayTransform();
+}
+
+/** Single-image mode: same live ortho update as overlay (marker drag without renderTiles). */
+function refreshOrthoSingleModeLive() {
+  if (overlayEnabled || !currentImage) return;
+  const base = document.getElementById('orthoBaseLayer');
+  const wrap = document.getElementById('orthoUnionWrap');
+  const slot = document.getElementById('orthoObliqueSlot');
+  if (!base || !wrap || !slot) return;
+  const layout = computeOrthoLayout(currentImage, currentRotDeg, currentContentW, currentContentH);
+  if (!layout) return;
+  applyOrthoTileSpecsToContainer(base, layout);
+  wrap.style.width = `${layout.unionW}px`;
+  wrap.style.height = `${layout.unionH}px`;
+  slot.style.left = `${layout.obliqueLeft - layout.minLeft}px`;
+  slot.style.top = `${layout.obliqueTop - layout.minTop}px`;
+  orthoContentOffsetX = layout.obliqueLeft - layout.minLeft;
+  orthoContentOffsetY = layout.obliqueTop - layout.minTop;
+}
+
 /**
  * Overlay mode (infinite-scroll default): ortho lives in #orthoUnderlay behind stack; transform matches top layer.
  */
@@ -1883,6 +2042,8 @@ function updateOrthoUnderlayForOverlay(img, rotDeg, contentW, contentH) {
   if (!layout) {
     if (el) el.remove();
     area.classList.remove('has-ortho');
+    area.classList.remove('ortho-bg-hidden');
+    orthoBackgroundVisible = true;
     syncOrthoDimMainClass();
     return;
   }
@@ -1893,13 +2054,9 @@ function updateOrthoUnderlayForOverlay(img, rotDeg, contentW, contentH) {
     el.setAttribute('aria-hidden', 'true');
     area.insertBefore(el, area.firstChild);
   }
-  el.style.cssText =
-    `position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;`
-    + 'z-index:0;pointer-events:none;will-change:transform;filter:saturate(0.88) brightness(0.92);';
-  el.innerHTML = layout.orthoTilesHtml;
-  el._orthoMarkerX = layout.orthoMarkerX;
-  el._orthoMarkerY = layout.orthoMarkerY;
+  applyOrthoLayoutToUnderlay(el, layout);
   syncOrthoDimMainClass();
+  syncOrthoBackgroundVisibilityClass();
 }
 
 function removeOrthoUnderlay() {
@@ -1909,7 +2066,27 @@ function removeOrthoUnderlay() {
   if (area) {
     area.classList.remove('has-ortho');
     area.classList.remove('has-ortho-dim-main');
+    area.classList.remove('ortho-bg-hidden');
   }
+  orthoBackgroundVisible = true;
+}
+
+/** Apply .ortho-bg-hidden from orthoBackgroundVisible (call after has-ortho is set). */
+function syncOrthoBackgroundVisibilityClass() {
+  const area = document.getElementById('viewerArea');
+  if (!area || !area.classList.contains('has-ortho')) {
+    area?.classList.remove('ortho-bg-hidden');
+    return;
+  }
+  area.classList.toggle('ortho-bg-hidden', !orthoBackgroundVisible);
+}
+
+/** Hotkey: Shift+O when viewer has ortho (single or overlay mode). */
+function toggleOrthoBackground() {
+  const area = document.getElementById('viewerArea');
+  if (!area || !area.classList.contains('has-ortho')) return;
+  orthoBackgroundVisible = !orthoBackgroundVisible;
+  syncOrthoBackgroundVisibilityClass();
 }
 
 /** When ortho is on: dim main tiles only if no reprojected neighbor stack sits under them (avoids “double” transparent main). */
@@ -1941,6 +2118,8 @@ function wrapInnerHtmlWithOrthoIfNeeded(innerHtml, img, rotDeg, contentW, conten
     if (area) {
       area.classList.remove('has-ortho');
       area.classList.remove('has-ortho-dim-main');
+      area.classList.remove('ortho-bg-hidden');
+      orthoBackgroundVisible = true;
     }
     return innerHtml;
   }
@@ -1952,7 +2131,7 @@ function wrapInnerHtmlWithOrthoIfNeeded(innerHtml, img, rotDeg, contentW, conten
   return `
     <div id="orthoUnionWrap" style="position:relative;width:${layout.unionW}px;height:${layout.unionH}px;flex-shrink:0;">
       <div id="orthoBaseLayer" style="position:absolute;left:0;top:0;width:100%;height:100%;z-index:0;pointer-events:none;overflow:visible;filter:saturate(0.88) brightness(0.92);">${layout.orthoTilesHtml}</div>
-      <div style="position:absolute;left:${layout.obliqueLeft - layout.minLeft}px;top:${layout.obliqueTop - layout.minTop}px;z-index:1;">${innerHtml}</div>
+      <div id="orthoObliqueSlot" style="position:absolute;left:${layout.obliqueLeft - layout.minLeft}px;top:${layout.obliqueTop - layout.minTop}px;z-index:1;">${innerHtml}</div>
     </div>`;
 }
 
@@ -2072,6 +2251,7 @@ function renderTiles(img, zoom) {
     applyOverlayStitchedLayerVisibility();
   }
   syncOrthoDimMainClass();
+  syncOrthoBackgroundVisibilityClass();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2172,6 +2352,12 @@ function refreshDot() {
         if (padDiv) padDiv.style.padding = `${viewPadY}px ${viewPadX}px`;
       }
     }
+  }
+
+  // Keep ortho aligned with the marker / auto-rotate before layer translate (avoids lag and innerHTML blink).
+  if (markerDX >= 0 && markerDY >= 0) {
+    if (overlayEnabled && document.getElementById('orthoUnderlay')) refreshOrthoUnderlayLive();
+    else if (document.getElementById('orthoUnionWrap')) refreshOrthoSingleModeLive();
   }
 
   // Scroll to marker if that option is on (independent of marker visibility).
@@ -2953,6 +3139,15 @@ document.addEventListener('keydown', e => {
       overlayStitchedOnlyMain = !overlayStitchedOnlyMain;
       applyOverlayStitchedLayerVisibility();
       return;
+    }
+    // Ortho aerial underlay: Shift+O — toggle visibility (when ortho data is active)
+    if (e.shiftKey && (k === 'O' || k === 'o')) {
+      const va = document.getElementById('viewerArea');
+      if (va?.classList.contains('has-ortho')) {
+        e.preventDefault();
+        toggleOrthoBackground();
+        return;
+      }
     }
   }
 

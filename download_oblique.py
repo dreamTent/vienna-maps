@@ -4,8 +4,10 @@ Download and reconstruct Vienna oblique 2023 images that contain a GPS point.
 
 The script:
 1) Converts input WGS84 lat/lon to dataset MGI coordinates.
-2) Scans local 2023 tile index JSON files for images whose footprint contains the point.
-3) Downloads all JPEG tiles for each matching image at z4 resolution.
+2) Scans local 2023 tile index JSON files and selects images where the point is
+   visible in the image frame (same as the viewer's "in frame" / out-of-frame filter),
+   using the camera `p-to-image` matrix. Optionally you can use ground footprint only.
+3) Downloads all JPEG tiles for each matching image at the chosen zoom level.
 4) Reconstructs the full image and saves it to the output folder.
 
 Requirements:
@@ -18,7 +20,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Sequence, Tuple
 
 import requests
 from PIL import Image
@@ -99,18 +101,51 @@ def iter_images_from_tile(tile_file: Path) -> Iterable[dict]:
         if req not in col:
             raise ValueError(f"{tile_file}: missing required column '{req}'")
 
+    i_pti = col.get("p-to-image")
+
     for row in rows[1:]:
         gc = row[col["groundCoordinates"]]
         if not gc or len(gc) < 3:
             continue
         footprint = order_footprint_ccw([(pt[0], pt[1]) for pt in gc])
+        p_to_image = row[i_pti] if i_pti is not None else None
         yield {
             "name": row[col["name"]],
             "width": int(row[col["width"]] or 14144),
             "height": int(row[col["height"]] or 10560),
             "tile_resolution": list(row[col["tile-resolution"]] or [16, 8, 4, 2, 1]),
             "footprint": footprint,
+            "p_to_image": p_to_image,
         }
+
+
+def project_to_pixel(
+    p_to_image: Any,
+    lon: float,
+    lat: float,
+    ground_z: float,
+    transformer: Transformer,
+) -> Tuple[float, float] | None:
+    """
+    World (MGI, metres) → image pixel; same model as oblique-viewer.html projectToPixel.
+    y=0 at top of image.
+    """
+    if not p_to_image:
+        return None
+    P = p_to_image
+    X, Y = transformer.transform(lon, lat)
+    Z = ground_z
+    u = P[0][0] * X + P[0][1] * Y + P[0][2] * Z + P[0][3]
+    v = P[1][0] * X + P[1][1] * Y + P[1][2] * Z + P[1][3]
+    w = P[2][0] * X + P[2][1] * Y + P[2][2] * Z + P[2][3]
+    if abs(w) < 1e-10:
+        return None
+    return (u / w, v / w)
+
+
+def is_in_image_frame(px: float, py: float, width: int, height: int) -> bool:
+    """Match applySort() in oblique-viewer.html (inclusive bounds)."""
+    return 0 <= px <= width and 0 <= py <= height
 
 
 def get_resolution_factor_for_zoom_level(tile_resolution: Sequence[int], zoom_level: int) -> int | None:
@@ -212,6 +247,22 @@ def main() -> None:
         default=4,
         help="Tile zoom level used in URL path (.../<image>/<zoom>/<x>/<y>.jpg).",
     )
+    parser.add_argument(
+        "--ground-z",
+        type=float,
+        default=0.0,
+        help="Ground height (metres, MGI Z) for p-to-image projection — same as viewer height field.",
+    )
+    parser.add_argument(
+        "--footprint-only",
+        action="store_true",
+        help="Select only by ground footprint polygon (old behaviour). Ignores camera projection.",
+    )
+    parser.add_argument(
+        "--require-footprint",
+        action="store_true",
+        help="With default projection filter, also require the point inside the ground footprint.",
+    )
     args = parser.parse_args()
 
     transformer = load_crs_transformer(args.image_json)
@@ -221,7 +272,11 @@ def main() -> None:
     if not tile_files:
         raise FileNotFoundError(f"No tile index JSON files found in {args.tiles_dir}")
 
-    print(f"Searching {len(tile_files)} index files for point ({args.lat}, {args.lon}) ...")
+    mode = "footprint only" if args.footprint_only else "projection in frame"
+    print(
+        f"Searching {len(tile_files)} index files for point ({args.lat}, {args.lon}), "
+        f"z={args.ground_z} m — {mode} ..."
+    )
     matches: List[dict] = []
     seen_names = set()
 
@@ -230,14 +285,34 @@ def main() -> None:
             name = img["name"]
             if name in seen_names:
                 continue
-            if point_in_polygon(qx, qy, img["footprint"]):
-                z_factor = get_resolution_factor_for_zoom_level(img["tile_resolution"], args.zoom_level)
-                if z_factor is None:
+
+            if args.footprint_only:
+                ok = point_in_polygon(qx, qy, img["footprint"])
+            else:
+                proj = project_to_pixel(
+                    img.get("p_to_image"),
+                    args.lon,
+                    args.lat,
+                    args.ground_z,
+                    transformer,
+                )
+                if proj is None:
                     continue
-                img["zoom_level"] = args.zoom_level
-                img["z_factor"] = z_factor
-                matches.append(img)
-                seen_names.add(name)
+                px, py = proj
+                ok = is_in_image_frame(px, py, img["width"], img["height"])
+                if args.require_footprint:
+                    ok = ok and point_in_polygon(qx, qy, img["footprint"])
+
+            if not ok:
+                continue
+
+            z_factor = get_resolution_factor_for_zoom_level(img["tile_resolution"], args.zoom_level)
+            if z_factor is None:
+                continue
+            img["zoom_level"] = args.zoom_level
+            img["z_factor"] = z_factor
+            matches.append(img)
+            seen_names.add(name)
 
     if not matches:
         print("No matching images found.")
