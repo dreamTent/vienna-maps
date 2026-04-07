@@ -141,34 +141,42 @@
     }
     .orbit-fab > * { pointer-events: auto; }
     .orbit-dpad {
-      display: flex;
-      flex-direction: column;
+      display: grid;
+      grid-template-columns: 36px 36px 36px;
+      grid-template-rows: 36px auto 36px;
+      grid-template-areas:
+        ". n ."
+        "w hub e"
+        ". s .";
       align-items: center;
-      gap: 4px;
+      justify-items: center;
+      column-gap: 4px;
+      row-gap: 4px;
       background: rgba(22, 27, 34, 0.92);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 8px 10px;
-      box-shadow: 0 4px 20px rgba(0,0,0,.45);
+      border-radius: 10px;
+      padding: 6px 8px;
+      box-shadow: 0 3px 14px rgba(0,0,0,.4);
     }
-    .orbit-mid {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
+    .orbit-n { grid-area: n; color: #4fc3f7; }
+    .orbit-w { grid-area: w; color: #ce93d8; }
     .orbit-hub {
-      width: 10px;
-      height: 10px;
+      grid-area: hub;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       background: var(--border);
-      opacity: 0.7;
+      opacity: 0.55;
+      box-sizing: border-box;
     }
+    .orbit-e { grid-area: e; color: #81c784; }
+    .orbit-s { grid-area: s; color: #ff8a65; }
     .orbit-btn {
-      min-width: 48px;
-      min-height: 48px;
-      padding: 0 14px;
-      border-radius: 10px;
-      font-size: 1.05rem;
+      min-width: 36px;
+      min-height: 36px;
+      padding: 0;
+      border-radius: 8px;
+      font-size: 0.88rem;
       font-weight: 700;
       background: var(--surface2);
       border: 1px solid var(--border);
@@ -178,10 +186,33 @@
       touch-action: manipulation;
     }
     .orbit-btn:active { opacity: 0.85; transform: scale(0.97); }
-    .orbit-n { color: #4fc3f7; }
-    .orbit-e { color: #81c784; }
-    .orbit-s { color: #ff8a65; }
-    .orbit-w { color: #ce93d8; }
+    .orbit-btn.orbit-btn--active {
+      font-weight: 800;
+    }
+    .orbit-btn.orbit-n.orbit-btn--active {
+      background: rgba(79, 195, 247, 0.22);
+      border-color: #4fc3f7;
+      box-shadow: 0 0 0 1px rgba(79, 195, 247, 0.5);
+      color: #7fd7ff;
+    }
+    .orbit-btn.orbit-e.orbit-btn--active {
+      background: rgba(129, 199, 132, 0.22);
+      border-color: #81c784;
+      box-shadow: 0 0 0 1px rgba(129, 199, 132, 0.5);
+      color: #a5d6a7;
+    }
+    .orbit-btn.orbit-s.orbit-btn--active {
+      background: rgba(255, 138, 101, 0.22);
+      border-color: #ff8a65;
+      box-shadow: 0 0 0 1px rgba(255, 138, 101, 0.5);
+      color: #ffab91;
+    }
+    .orbit-btn.orbit-w.orbit-btn--active {
+      background: rgba(206, 147, 216, 0.22);
+      border-color: #ce93d8;
+      box-shadow: 0 0 0 1px rgba(206, 147, 216, 0.5);
+      color: #e1bee7;
+    }
     .orbit-zoom {
       display: flex;
       align-items: center;
@@ -1394,6 +1425,7 @@ function openViewer(img, zoom) {
 
   renderTiles(img, zoom);
   preloadToCache(img, zoom);
+  updateOrbitDirectionHighlight();
 }
 
 function tileDims(width, height, zoom, tileResolution) {
@@ -2794,6 +2826,23 @@ viewerAreaEl.addEventListener('touchcancel', e => {
 
 let infiniteScrollModeInitialized = false;
 
+/** Highlight the N/E/S/W button that matches the current image’s view direction (1–4). */
+function updateOrbitDirectionHighlight() {
+  const fab = document.getElementById('orbitFab');
+  if (!fab) return;
+  fab.querySelectorAll('.orbit-btn[data-dir]').forEach((btn) => {
+    btn.classList.remove('orbit-btn--active');
+    btn.removeAttribute('aria-pressed');
+  });
+  const vd = currentImage && currentImage.viewDirection;
+  if (vd == null || vd < 1 || vd > 4) return;
+  const active = fab.querySelector(`.orbit-btn[data-dir="${vd}"]`);
+  if (active) {
+    active.classList.add('orbit-btn--active');
+    active.setAttribute('aria-pressed', 'true');
+  }
+}
+
 function orbitToDirection(dir) {
   if (![1, 2, 3, 4].includes(dir) || !searchResults.length) return;
   let best = null;
@@ -2920,14 +2969,12 @@ loadIndex();
 <div id="tileCache" style="position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;visibility:hidden;"></div>
 
 <div class="orbit-fab" id="orbitFab" aria-label="Orbit and zoom">
-  <div class="orbit-dpad">
-    <button type="button" class="orbit-btn orbit-n" onclick="orbitToDirection(1)" title="Nearest North-facing view">N</button>
-    <div class="orbit-mid">
-      <button type="button" class="orbit-btn orbit-w" onclick="orbitToDirection(4)" title="Nearest West-facing view">W</button>
-      <span class="orbit-hub" title="Centre"></span>
-      <button type="button" class="orbit-btn orbit-e" onclick="orbitToDirection(2)" title="Nearest East-facing view">E</button>
-    </div>
-    <button type="button" class="orbit-btn orbit-s" onclick="orbitToDirection(3)" title="Nearest South-facing view">S</button>
+  <div class="orbit-dpad" role="group" aria-label="View direction">
+    <button type="button" class="orbit-btn orbit-n" data-dir="1" onclick="orbitToDirection(1)" title="Nearest North-facing view">N</button>
+    <button type="button" class="orbit-btn orbit-w" data-dir="4" onclick="orbitToDirection(4)" title="Nearest West-facing view">W</button>
+    <span class="orbit-hub" title="Centre" aria-hidden="true"></span>
+    <button type="button" class="orbit-btn orbit-e" data-dir="2" onclick="orbitToDirection(2)" title="Nearest East-facing view">E</button>
+    <button type="button" class="orbit-btn orbit-s" data-dir="3" onclick="orbitToDirection(3)" title="Nearest South-facing view">S</button>
   </div>
   <div class="orbit-zoom">
     <button type="button" class="orbit-tool" onclick="changeViewZoom(-1)">−</button>
