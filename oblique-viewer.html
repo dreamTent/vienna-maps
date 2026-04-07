@@ -45,6 +45,8 @@
     .result-item { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .12s; }
     .result-item:hover { background: var(--surface2); }
     .result-item.active { background: #1a2740; border-left: 2px solid var(--accent); padding-left: 12px; }
+    .result-item.result-outside { opacity: .55; }
+    .result-item.result-outside .thumb-wrap { filter: grayscale(.6); }
     .thumb-wrap { width: 64px; height: 64px; flex-shrink: 0; background: #0a0c10; border-radius: 4px; overflow: hidden; }
     .thumb-wrap img { width: 64px; height: 64px; object-fit: cover; display: block; }
     .result-meta { flex: 1; min-width: 0; }
@@ -138,6 +140,8 @@
         <option value="dist">Sort: Distance</option>
         <option value="heading">Sort: Heading</option>
         <option value="dir">Sort: Direction</option>
+        <option value="margin">Sort: H-angle |↑| centred</option>
+        <option value="rotate">Sort: Orbit 360°</option>
       </select>
     </div>
     <div class="results-list" id="resultsList"></div>
@@ -462,14 +466,59 @@ function doSearch() {
 document.getElementById('coordsInput').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
 document.getElementById('radiusInput').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
 
+/**
+ * Signed horizontal angle of the marker from the image centre.
+ *   negative = marker is left  of centre
+ *   positive = marker is right of centre
+ *   0        = perfectly centred horizontally
+ *
+ * Uses f_x ≈ ‖P[0, 0:3]‖ (camera matrix row norm ≈ focal length in pixels).
+ */
+function computeHorizAngle(img, lat, lon, Z) {
+  if (!img.pToImage) return NaN;
+  const res = projectToPixel(img, lat, lon, Z);
+  if (!res) return NaN;
+  const [px] = res;
+  const P  = img.pToImage;
+  const fx = Math.hypot(P[0][0], P[0][1], P[0][2]);
+  if (fx < 1) return NaN;
+  return Math.atan((px - img.width / 2) / fx) * (180 / Math.PI);
+}
+
 function applySort() {
   const key = document.getElementById('sortSelect').value;
-  const sorted = [...searchResults].sort((a, b) =>
+  const Z   = Number(document.getElementById('heightNum').value) || 0;
+
+  // Pre-compute signed horizontal angle + in-frame flag for every result.
+  // One projectToPixel call per image covers both needs.
+  const items = searchResults.map(img => {
+    const res = projectToPixel(img, searchLat, searchLon, Z);
+    const inFrame = res != null
+      && res[0] >= 0 && res[0] <= img.width
+      && res[1] >= 0 && res[1] <= img.height;
+    let horizAngle = NaN;
+    if (res && img.pToImage) {
+      const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
+      if (fx >= 1) horizAngle = Math.atan((res[0] - img.width / 2) / fx) * (180 / Math.PI);
+    }
+    // Orbit angle: bearing from the marker to the camera (0-360°).
+    // Camera looks at `heading`; marker appears `horizAngle` to the right of centre,
+    // so the marker is at bearing (heading + horizAngle) from the camera, and the
+    // camera is at bearing (heading + horizAngle + 180°) from the marker.
+    const orbitAngle = isFinite(horizAngle)
+      ? ((img.heading + horizAngle + 180) % 360 + 360) % 360
+      : ((img.heading + 180) % 360);
+    return { ...img, horizAngle, inFrame, orbitAngle };
+  });
+
+  items.sort((a, b) =>
     key === 'heading' ? a.heading - b.heading :
     key === 'dir'     ? (a.viewDirection - b.viewDirection) || (a.distCenter - b.distCenter) :
+    key === 'margin'  ? Math.abs(a.horizAngle) - Math.abs(b.horizAngle) :  // most centred first
+    key === 'rotate'  ? a.orbitAngle - b.orbitAngle :
     /* dist */          a.distCenter - b.distCenter
   );
-  renderList(sorted);
+  renderList(items);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -505,7 +554,21 @@ function renderList(items) {
     const distStr = (img.distM >= 1000 ? (img.distM/1000).toFixed(2)+' km' : img.distM+' m') +
       (img.coversPoint ? ' ✓' : '');
     const tag = `<span class="tag ${DIR_TAG[img.viewDirection]||'tag-x'}">${DIR_LABELS[img.viewDirection]||'Dir'+img.viewDirection}</span>`;
-    return `<div class="result-item" data-idx="${idx}" onclick="selectImage(${idx},this)">
+    const ha  = img.horizAngle;
+    const angleStr = (ha != null && isFinite(ha))
+      ? `<span title="Horizontal angle of marker from image centre (−=left, +=right)"
+               style="color:${Math.abs(ha)<=10?'var(--success)':Math.abs(ha)<=25?'var(--warning)':'var(--error)'}">
+           ${ha>=0?'+':''}${ha.toFixed(1)}°</span>`
+      : '';
+    const orbitStr = (img.orbitAngle != null && isFinite(img.orbitAngle))
+      ? `<span title="Bearing from marker to camera (orbit position, 0°=N clockwise)"
+               style="color:var(--text-dim)">⟳ ${img.orbitAngle.toFixed(1)}°</span>`
+      : '';
+    const outsideStr = img.inFrame === false
+      ? `<span style="color:var(--error);font-weight:600;font-size:.72rem"
+               title="The marker projects outside this image's frame">⚠ outside image</span>`
+      : '';
+    return `<div class="result-item${img.inFrame===false?' result-outside':''}" data-idx="${idx}" onclick="selectImage(${idx},this)">
       <div class="thumb-wrap">
         <img src="${BASE_URL}/${img.name}/0/0/0.jpg" loading="lazy" onerror="this.style.opacity='.15'">
       </div>
@@ -515,6 +578,9 @@ function renderList(items) {
           ${tag}
           <span>${headingArrow(img.heading)} ${img.heading.toFixed(1)}°</span>
           <span>${distStr}</span>
+          ${angleStr}
+          ${orbitStr}
+          ${outsideStr}
         </div>
       </div>
       <div class="compass-wrap">${compassSVG(img.heading)}</div>
@@ -756,7 +822,7 @@ async function downloadCurrent() {
   let failed = 0;
   const BATCH = 20;
   const loadTile = (x,y) => new Promise(res => {
-    const el = new Image(); el.crossOrigin='anonymous';
+    const el = new Image(); //el.crossOrigin='anonymous';
     el.onload = () => { ctx.drawImage(el, x*TILE_SIZE, (rows-1-y)*TILE_SIZE, TILE_SIZE, TILE_SIZE); res(); };
     el.onerror = () => { failed++; res(); };
     el.src = `${BASE_URL}/${img.name}/${maxZoom}/${x}/${y}.jpg`;
@@ -773,6 +839,8 @@ async function downloadCurrent() {
     a.download = `${img.name}_z${maxZoom}.jpg`;
     a.click();
   } catch(e) {
+    alert(e);
+    console.log(e);
     const w = window.open('','_blank');
     const urls = tasks.map(([x,y]) => `${BASE_URL}/${img.name}/${maxZoom}/${x}/${y}.jpg`).join('\n');
     w.document.write(`<pre style="font:12px monospace;background:#0d1117;color:#c9d1d9;padding:16px">${urls}</pre>`);
