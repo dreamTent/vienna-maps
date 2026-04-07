@@ -536,11 +536,7 @@ function openViewer(img, zoom) {
   document.getElementById('viewerSub').textContent =
     `${DIR_LABELS[img.viewDirection]||''} · ${img.heading.toFixed(1)}° · ${distStr} · ${img.width}×${img.height}px`;
 
-  // All groundCoordinates in this dataset have Z=0 (the matrix calibration datum).
-  // Use the average groundZ (0 for all current images). Do NOT fall back to 170.
-  const defaultZ = Math.round(img.groundZ);
-  document.getElementById('heightNum').value    = defaultZ;
-  document.getElementById('heightSlider').value = defaultZ;
+  // Only initialise Z on the very first image load; preserve the user's value thereafter.
 
   // zoom pills
   const maxZoom = img.tileResolution.length - 1;
