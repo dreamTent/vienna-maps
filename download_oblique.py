@@ -4,8 +4,8 @@ Download and reconstruct Vienna oblique 2023 images for a GPS point or a ground 
 
 The script:
 1) Converts input WGS84 lat/lon to dataset MGI coordinates.
-2) Scans local 2023 tile index JSON files and selects images by area coverage and/or
-   camera projection (same as the viewer's "in frame" filter), using `p-to-image`.
+2) Scans local 2023 tile index JSON files and selects images by AOI footprint coverage and/or
+   the same centre test as point mode (projection in frame), using `p-to-image`.
 3) Downloads JPEG tiles at the chosen pyramid zoom level and reconstructs each image.
 4) Optionally writes binary masks in masks/ (white = keep, black = exclude), composited
    RGB in masked_images/, and COLMAP sparse reconstruction text.
@@ -124,6 +124,23 @@ def load_transformers(image_json_path: Path) -> Tuple[Transformer, Transformer]:
     return wgs_to_mgi, mgi_to_wgs
 
 
+def aoi_center_lon_lat(
+    aoi: AOI,
+    aoi_type: str,
+    lon: float | None,
+    lat: float | None,
+    mgi_to_wgs: Transformer,
+) -> Tuple[float, float]:
+    """WGS84 center of the AOI (square uses given lat/lon; rect uses MGI bbox centre)."""
+    if aoi_type == "square":
+        if lat is None or lon is None:
+            raise ValueError("square AOI requires lat/lon")
+        return lon, lat
+    cx_m = (aoi.min_x + aoi.max_x) / 2.0
+    cy_m = (aoi.min_y + aoi.max_y) / 2.0
+    return mgi_to_wgs.transform(cx_m, cy_m)
+
+
 def iter_images_from_tile(tile_file: Path) -> Iterable[dict]:
     with tile_file.open("r", encoding="utf-8") as f:
         tile_data = json.load(f)
@@ -229,14 +246,6 @@ def coverage_percent_aoi(aoi: AOI, footprint_ring: Sequence[Tuple[float, float]]
     if a < 1e-9:
         return 0.0
     return 100.0 * float(inter.area) / a
-
-
-def aoi_footprint_intersects(aoi: AOI, footprint_ring: Sequence[Tuple[float, float]]) -> bool:
-    fp = footprint_shapely(footprint_ring)
-    if fp.is_empty or not fp.is_valid:
-        return False
-    inter = aoi.shapely_polygon().intersection(fp)
-    return not inter.is_empty and float(inter.area) > 1e-9
 
 
 def aoi_from_rect_corners(
@@ -447,36 +456,6 @@ def colmap_export_for_image(
     return cam_line, img_line
 
 
-def aoi_projects_in_frame(
-    img: dict,
-    aoi: AOI,
-    ground_z: float,
-    wgs_to_mgi: Transformer,
-    mgi_to_wgs: Transformer,
-) -> bool:
-    """True if AOI center or any corner projects inside the image frame (full-res pixels)."""
-    pti = img.get("p_to_image")
-    if not pti:
-        return False
-    cx = (aoi.min_x + aoi.max_x) / 2.0
-    cy = (aoi.min_y + aoi.max_y) / 2.0
-    for xm, ym in (
-        (cx, cy),
-        (aoi.min_x, aoi.min_y),
-        (aoi.max_x, aoi.min_y),
-        (aoi.max_x, aoi.max_y),
-        (aoi.min_x, aoi.max_y),
-    ):
-        lon, lat = mgi_to_wgs.transform(xm, ym)
-        proj = project_to_pixel(pti, lon, lat, ground_z, wgs_to_mgi)
-        if proj is None:
-            continue
-        px, py = proj
-        if is_in_image_frame(px, py, img["width"], img["height"]):
-            return True
-    return False
-
-
 def io_bytes(content: bytes):
     from io import BytesIO
 
@@ -526,7 +505,9 @@ def parse_args() -> argparse.Namespace:
         "--min-coverage-percent",
         type=float,
         default=0.0,
-        help="For rect/square: minimum %% of AOI area that must be covered by image ground footprint (0–100).",
+        help="For rect/square: require at least this %% of AOI area under the ground footprint, "
+        "unless the AOI centre matches point mode (projection in frame or centre in footprint). "
+        "Use 0 for any footprint overlap.",
     )
     parser.add_argument(
         "--output-dir",
@@ -574,7 +555,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--footprint-only",
         action="store_true",
-        help="Select only by ground footprint polygon. Ignores camera projection.",
+        help="Point mode: select only by ground footprint (ignore p-to-image). "
+        "AOI rect/square already uses footprint ∩ AOI only.",
     )
     parser.add_argument(
         "--require-footprint",
@@ -653,7 +635,10 @@ def main() -> None:
 
     mode = "footprint only" if args.footprint_only else "projection in frame"
     if aoi is not None:
-        mode = f"AOI coverage ≥ {args.min_coverage_percent}% ({mode})"
+        mode = (
+            f"AOI: coverage ≥ {args.min_coverage_percent}% of AOI "
+            f"OR same centre test as point mode (projection / footprint)"
+        )
     print(
         f"Searching {len(tile_files)} index files — {mode} ..."
     )
@@ -667,17 +652,36 @@ def main() -> None:
                 continue
 
             if aoi is not None:
-                if not aoi_footprint_intersects(aoi, img["footprint"]):
-                    continue
                 cov = coverage_percent_aoi(aoi, img["footprint"])
-                if cov + 1e-9 < args.min_coverage_percent:
-                    continue
-                if args.footprint_only:
-                    ok = True
+                if args.min_coverage_percent <= 0:
+                    pass_cov = cov > 1e-9
                 else:
-                    ok = aoi_projects_in_frame(
-                        img, aoi, args.ground_z, wgs_to_mgi, mgi_to_wgs
+                    pass_cov = cov + 1e-9 >= args.min_coverage_percent
+
+                lon_c, lat_c = aoi_center_lon_lat(
+                    aoi, args.aoi_type, args.lon, args.lat, mgi_to_wgs
+                )
+                if args.footprint_only:
+                    cx_m = (aoi.min_x + aoi.max_x) / 2.0
+                    cy_m = (aoi.min_y + aoi.max_y) / 2.0
+                    pass_center = point_in_polygon(cx_m, cy_m, img["footprint"])
+                else:
+                    proj = project_to_pixel(
+                        img.get("p_to_image"),
+                        lon_c,
+                        lat_c,
+                        args.ground_z,
+                        wgs_to_mgi,
                     )
+                    pass_center = proj is not None and is_in_image_frame(
+                        proj[0], proj[1], img["width"], img["height"]
+                    )
+
+                # Coverage alone misses narrow E/W oblique footprints: the AOI centre can
+                # project in-frame (same as point search) while footprint∩AOI area is < 1%.
+                if not pass_cov and not pass_center:
+                    continue
+                ok = True
             else:
                 if args.footprint_only:
                     ok = point_in_polygon(qx, qy, img["footprint"])
