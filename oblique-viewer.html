@@ -1196,6 +1196,7 @@ let tileZoomAuto = true;
 let currentDispScale = 1;  // display pixels per image pixel — SAME at all zoom levels
 let currentContentW  = 0, currentContentH = 0; // content div size (after scale, before rotation)
 let currentRotDeg    = 0;  // degrees currently applied as CSS rotate() on the clip div
+let currentEdgeTrimDisp = 0; // displayed trim in px to hide source-edge black bleed
 let autoRotate       = false; // when true, rotate so the marker is horizontally centred
 let pinMarkerCenter  = false; // when true, translate the image so the marker is at the exact viewport centre
 let overlayEnabled   = false; // when true, stack images as layers aligned at the marker
@@ -1213,6 +1214,7 @@ const VZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 6,
 let viewerZoom = 1;          // current visual zoom multiplier
 let viewPadX = 0, viewPadY = 0;  // centering padding so marker-scroll math is correct
 let markerDX = -1, markerDY = -1; // last marker display position (px), -1 = no marker
+const IMAGE_EDGE_TRIM_SOURCE_PX = 6;
 
 let imageSwitchGen = 0;
 
@@ -1283,6 +1285,11 @@ function openViewer(img, zoom) {
 function tileDims(width, height, zoom, tileResolution) {
   const res = tileResolution[zoom];
   return { cols: Math.ceil(width/(tileSize*res)), rows: Math.ceil(height/(tileSize*res)) };
+}
+
+function edgeTrimDisplayPx(scale) {
+  // Conservative rounding avoids 1px border bleed at fractional zoom scales.
+  return Math.max(0, Math.ceil(IMAGE_EDGE_TRIM_SOURCE_PX * scale));
 }
 
 /** Device pixels per source image pixel (full frame fit × visual zoom × devicePixelRatio). */
@@ -1378,9 +1385,12 @@ function buildNeighborLayerDOM(img, zoom) {
   const { cols, rows } = tileDims(img.width, img.height, zoom, img.tileResolution);
   const res = img.tileResolution[zoom];
   const dispTileW = Math.max(1, Math.round(tileSize * res * scale));
-  const topBlack = Math.round((rows * tileSize * res - img.height) * scale);
-  const contentW = Math.round(img.width * scale);
-  const contentH = Math.round(img.height * scale);
+  const edgeTrimDisp = edgeTrimDisplayPx(scale);
+  const topBlack = Math.ceil((rows * tileSize * res - img.height) * scale);
+  const contentW = Math.floor(img.width * scale);
+  const contentH = Math.floor(img.height * scale);
+  const clipW = Math.max(1, contentW - edgeTrimDisp);
+  const clipH = Math.max(1, contentH - edgeTrimDisp);
   const rotDeg = computeAutoRotDegForImage(img);
   let tilesHtml = '';
   for (let y = rows - 1; y >= 0; y--) {
@@ -1397,8 +1407,8 @@ function buildNeighborLayerDOM(img, zoom) {
     ? `transform:rotate(${rotDeg}deg);transform-origin:50% 50%;`
     : '';
   const innerHtml = `
-    <div style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;${rotStyle}">
-      <div style="position:absolute;top:-${topBlack}px;left:0;">
+    <div style="position:relative;width:${clipW}px;height:${clipH}px;overflow:hidden;${rotStyle}">
+      <div style="position:absolute;top:-${topBlack + edgeTrimDisp}px;left:0;">
         <div class="tile-canvas-wrap">${tilesHtml}</div>
       </div>
     </div>`;
@@ -1530,11 +1540,15 @@ function renderTiles(img, zoom) {
   const baseScale = Math.min(viewW / img.width, viewH / img.height);
   const scale     = baseScale * viewerZoom;
   const dispTileW = Math.max(1, Math.round(tileSize * res * scale));
+  const edgeTrimDisp = edgeTrimDisplayPx(scale);
   currentDispScale = scale;
+  currentEdgeTrimDisp = edgeTrimDisp;
 
-  const topBlack = Math.round((rows * tileSize * res - img.height) * scale);
-  const contentW = Math.round(img.width  * scale);
-  const contentH = Math.round(img.height * scale);
+  const topBlack = Math.ceil((rows * tileSize * res - img.height) * scale);
+  const contentW = Math.floor(img.width  * scale);
+  const contentH = Math.floor(img.height * scale);
+  const clipW = Math.max(1, contentW - edgeTrimDisp);
+  const clipH = Math.max(1, contentH - edgeTrimDisp);
 
   // Compute auto-rotation: rotate so the marker is horizontally centred.
   // rotDeg = -horizAngle  (positive horizAngle → marker right of centre → rotate left).
@@ -1585,11 +1599,11 @@ function renderTiles(img, zoom) {
   // IDs rotPadDiv / rotClipDiv / dotOverlay always belong to the CURRENT (topmost) layer.
   // refreshDot() and scrollToMarker() use these IDs so they always affect the live layer.
   const innerHtml = `
-    <div id="rotClipDiv" style="position:relative;width:${contentW}px;height:${contentH}px;overflow:hidden;${rotStyle}">
-      <div style="position:absolute;top:-${topBlack}px;left:0;">
+    <div id="rotClipDiv" style="position:relative;width:${clipW}px;height:${clipH}px;overflow:hidden;${rotStyle}">
+      <div style="position:absolute;top:-${topBlack + edgeTrimDisp}px;left:0;">
         <div class="tile-canvas-wrap">${tilesHtml}</div>
       </div>
-      <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${contentW}px;height:${contentH}px;overflow:visible;pointer-events:none;"></svg>
+      <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
 
   if (overlayEnabled) {
@@ -1657,14 +1671,14 @@ function refreshDot() {
 
   const scale = currentDispScale;
   const dx = px * scale;
-  const dy = py * scale;
+  const dy = py * scale - currentEdgeTrimDisp;
   markerDX = dx;
   markerDY = dy;
 
   // Draw the marker only when visible.
   if (markerVisible) {
-    const W = Math.round(currentImage.width  * scale);
-    const H = Math.round(currentImage.height * scale);
+    const W = Math.max(1, Math.floor(currentImage.width  * scale) - currentEdgeTrimDisp);
+    const H = Math.max(1, Math.floor(currentImage.height * scale) - currentEdgeTrimDisp);
 
     const stroke = currentImage.coversPoint ? '#ff3333' : '#ffaa00';
     const warn = currentImage.coversPoint ? '' : `
