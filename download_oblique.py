@@ -141,6 +141,23 @@ def aoi_center_lon_lat(
     return mgi_to_wgs.transform(cx_m, cy_m)
 
 
+def selected_origin_mgi(
+    aoi: AOI | None,
+    lon: float | None,
+    lat: float | None,
+    wgs_to_mgi: Transformer,
+) -> Tuple[float, float, float]:
+    """COLMAP world origin in MGI metres, shifted so selected location becomes (0,0,0)."""
+    if aoi is not None:
+        cx_m = (aoi.min_x + aoi.max_x) / 2.0
+        cy_m = (aoi.min_y + aoi.max_y) / 2.0
+        return float(cx_m), float(cy_m), 0.0
+    if lon is None or lat is None:
+        raise ValueError("Point mode requires --lon and --lat for COLMAP origin")
+    x_m, y_m = wgs_to_mgi.transform(lon, lat)
+    return float(x_m), float(y_m), 0.0
+
+
 def iter_images_from_tile(tile_file: Path) -> Iterable[dict]:
     with tile_file.open("r", encoding="utf-8") as f:
         tile_data = json.load(f)
@@ -408,6 +425,41 @@ def projection_matrix_scaled(
     return S @ P
 
 
+def _camera_center_from_projection_matrix(P: Any) -> Any:
+    """
+    Euclidean camera centre C in world coords (MGI metres): P @ [C,1]^T = 0.
+    Right null vector of a 3×4 projection matrix (last row of Vh from SVD); avoids
+    OpenCV's translation from decomposeProjectionMatrix, which is often wrong scale.
+    """
+    import numpy as np
+
+    P = np.asarray(P, dtype=np.float64)
+    _, _, vh = np.linalg.svd(P, full_matrices=True)
+    X = vh[-1, :]
+    if abs(X[3]) < 1e-30:
+        raise ValueError("Degenerate projection: camera centre at infinity")
+    return X[:3] / X[3]
+
+
+def colmap_ground_transform_matrix() -> Any:
+    """
+    World transform for easier top-down inspection:
+    - Input world:  X=east, Y=north, Z=up
+    - COLMAP world: X=west, Y=up,    Z=north
+    This keeps the ground plane flat at Y=0.
+    """
+    import numpy as np
+
+    return np.array(
+        [
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+
 def colmap_export_for_image(
     image_id: int,
     camera_id: int,
@@ -417,6 +469,7 @@ def colmap_export_for_image(
     p_to_image: Sequence[Sequence[float]],
     width: int,
     height: int,
+    world_origin_xyz: Tuple[float, float, float],
 ) -> Tuple[str, str]:
     """Return (cameras_line, images_line) for COLMAP text format."""
     import numpy as np
@@ -425,16 +478,24 @@ def colmap_export_for_image(
         raise ImportError("COLMAP export requires opencv-python-headless: pip install opencv-python-headless")
 
     P = projection_matrix_scaled(p_to_image, width, height, out_w, out_h)
-    # Returns: cameraMatrix, rotMatrix, transVect, rotMatrixX, Y, Z, eulerAngles (no leading retval).
-    K, R, t, *_ = cv2.decomposeProjectionMatrix(np.asarray(P, dtype=np.float64))
+    P = np.asarray(P, dtype=np.float64)
+    # K, R from decomposition; ignore OpenCV t (often wrong scale vs COLMAP).
+    K, R, _, *_ = cv2.decomposeProjectionMatrix(P)
     K = K / K[2, 2]
     R = R[:, :3]
-    # transVect is 4x1 homogeneous in OpenCV docs; normalize w if present.
-    t = np.asarray(t).reshape(-1)
-    if t.size >= 4:
-        t = t[:3] / max(float(t[3]), 1e-12)
-    else:
-        t = t[:3]
+    if np.linalg.det(R) < 0:
+        R[:, 2] *= -1.0
+        K[:, 2] *= -1.0
+
+    C = _camera_center_from_projection_matrix(P)
+    # Shift world origin so selected location becomes (0, 0, 0) in COLMAP world.
+    C = C - np.asarray(world_origin_xyz, dtype=np.float64)
+    # Rotate world so ground is flat for top-down viewing (Y-up frame).
+    T = colmap_ground_transform_matrix()
+    C = T @ C
+    R = R @ T.T
+    # COLMAP: world point X_w to camera X_c = R * X_w + t, and C = -R^T * t  →  t = -R * C
+    t = -R @ C
 
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
@@ -454,6 +515,43 @@ def colmap_export_for_image(
     cam_line = f"{camera_id} PINHOLE {out_w} {out_h} {fx} {fy} {cx} {cy}"
     img_line = f"{image_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} {camera_id} {image_name}"
     return cam_line, img_line
+
+
+def colmap_flat_grid_points3d_lines(
+    aoi: AOI,
+    world_origin_xyz: Tuple[float, float, float],
+    target_points: int = 100000,
+) -> List[str]:
+    """
+    Generate a flat Z=0 grid in AOI, approximately target_points samples.
+    Coordinates are shifted into the COLMAP world frame (selected origin at 0,0,0).
+    """
+    target_points = max(1, int(target_points))
+    dx = max(1e-9, aoi.max_x - aoi.min_x)
+    dy = max(1e-9, aoi.max_y - aoi.min_y)
+    ratio = dx / dy
+
+    nx = max(1, int(math.ceil(math.sqrt(target_points * ratio))))
+    ny = max(1, int(math.ceil(target_points / nx)))
+
+    ox, oy, oz = world_origin_xyz
+    import numpy as np
+
+    T = colmap_ground_transform_matrix()
+    lines: List[str] = []
+    pid = 1
+
+    # Uniform grid over AOI bounds; use sample positions (including edges).
+    for iy in range(ny):
+        y = aoi.min_y if ny == 1 else aoi.min_y + (dy * iy) / (ny - 1)
+        for ix in range(nx):
+            x = aoi.min_x if nx == 1 else aoi.min_x + (dx * ix) / (nx - 1)
+            p = np.array([x - ox, y - oy, 0.0 - oz], dtype=np.float64)
+            xw, yw, zw = (T @ p).tolist()
+            # Empty track is valid in text format: just omit IMAGE_ID/POINT2D_IDX pairs.
+            lines.append(f"{pid} {xw} {yw} {zw} 255 255 255 0.0")
+            pid += 1
+    return lines
 
 
 def io_bytes(content: bytes):
@@ -556,7 +654,7 @@ def parse_args() -> argparse.Namespace:
         "--footprint-only",
         action="store_true",
         help="Point mode: select only by ground footprint (ignore p-to-image). "
-        "AOI rect/square already uses footprint ∩ AOI only.",
+        "AOI rect/square already uses footprint intersection with AOI only.",
     )
     parser.add_argument(
         "--require-footprint",
@@ -578,6 +676,12 @@ def parse_args() -> argparse.Namespace:
         "--colmap",
         action="store_true",
         help="Write COLMAP sparse text (cameras.txt, images.txt, points3D.txt) under colmap/sparse/0/.",
+    )
+    parser.add_argument(
+        "--colmap-grid-points",
+        type=int,
+        default=100000,
+        help="Approximate number of flat AOI grid points to write into points3D.txt.",
     )
     return parser.parse_args()
 
@@ -628,6 +732,7 @@ def main() -> None:
 
     if args.masks and aoi is None:
         raise SystemExit("--masks requires --aoi-type rect or square (a defined ground area).")
+    colmap_origin_xyz = selected_origin_mgi(aoi, args.lon, args.lat, wgs_to_mgi)
 
     tile_files = sorted(args.tiles_dir.glob("*.json"))
     if not tile_files:
@@ -737,6 +842,19 @@ def main() -> None:
         "colmap": args.colmap,
         "image_count": len(matches),
     }
+    if args.colmap:
+        manifest["colmap_origin_mgi_xyz"] = {
+            "x": colmap_origin_xyz[0],
+            "y": colmap_origin_xyz[1],
+            "z": colmap_origin_xyz[2],
+        }
+        manifest["colmap_world_axes"] = {
+            "x": "west",
+            "y": "up",
+            "z": "north",
+            "ground_plane": "y=0",
+        }
+        manifest["colmap_grid_points_target"] = int(args.colmap_grid_points)
     if aoi is not None:
         manifest["aoi_mgi"] = {
             "min_x": aoi.min_x,
@@ -822,6 +940,7 @@ def main() -> None:
                         img["p_to_image"],
                         img["width"],
                         img["height"],
+                        colmap_origin_xyz,
                     )
                     camera_lines.append(cl)
                     image_lines.append(il)
@@ -850,9 +969,25 @@ def main() -> None:
             img_parts.append(il)
             img_parts.append("")
         (colmap_dir / "images.txt").write_text("\n".join(img_parts) + "\n", encoding="utf-8")
-        (colmap_dir / "points3D.txt").write_text(
-            "# 3D point list (empty — no sparse points exported)\n", encoding="utf-8"
-        )
+        if aoi is not None:
+            pts_lines = colmap_flat_grid_points3d_lines(
+                aoi=aoi,
+                world_origin_xyz=colmap_origin_xyz,
+                target_points=args.colmap_grid_points,
+            )
+            pts_body = "\n".join(
+                [
+                    "# 3D point list with one line of data per point:",
+                    "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)",
+                    f"# Number of points: {len(pts_lines)}, mean track length: 0",
+                ]
+                + pts_lines
+            )
+            (colmap_dir / "points3D.txt").write_text(pts_body + "\n", encoding="utf-8")
+        else:
+            (colmap_dir / "points3D.txt").write_text(
+                "# 3D point list (empty — no AOI selected, grid not generated)\n", encoding="utf-8"
+            )
 
     if projection_records:
         (run_dir / "projection_matrices.json").write_text(
