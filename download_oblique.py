@@ -460,6 +460,20 @@ def colmap_ground_transform_matrix() -> Any:
     )
 
 
+def colmap_world_y_reflect_matrix() -> Any:
+    """
+    Reflect COLMAP world Y (multiply y by -1). Composed with poses as S @ R @ S and S @ t
+    keeps a proper rotation (valid COLMAP quaternion); focal length fy is negated so
+    pinhole reprojection matches the unchanged images.
+    """
+    import numpy as np
+
+    return np.array(
+        [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
 def colmap_export_for_image(
     image_id: int,
     camera_id: int,
@@ -496,8 +510,12 @@ def colmap_export_for_image(
     R = R @ T.T
     # COLMAP: world point X_w to camera X_c = R * X_w + t, and C = -R^T * t  →  t = -R * C
     t = -R @ C
+    S_y = colmap_world_y_reflect_matrix()
+    R = S_y @ R @ S_y
+    t = S_y @ t
 
     fx, fy = float(K[0, 0]), float(K[1, 1])
+    fy = -fy
     cx, cy = float(K[0, 2]), float(K[1, 2])
 
     r00, r01, r02 = float(R[0, 0]), float(R[0, 1]), float(R[0, 2])
@@ -538,6 +556,8 @@ def colmap_flat_grid_points3d_lines(
     import numpy as np
 
     T = colmap_ground_transform_matrix()
+    S_y = colmap_world_y_reflect_matrix()
+    TS = S_y @ T
     lines: List[str] = []
     pid = 1
 
@@ -547,7 +567,7 @@ def colmap_flat_grid_points3d_lines(
         for ix in range(nx):
             x = aoi.min_x if nx == 1 else aoi.min_x + (dx * ix) / (nx - 1)
             p = np.array([x - ox, y - oy, 0.0 - oz], dtype=np.float64)
-            xw, yw, zw = (T @ p).tolist()
+            xw, yw, zw = (TS @ p).tolist()
             # Empty track is valid in text format: just omit IMAGE_ID/POINT2D_IDX pairs.
             lines.append(f"{pid} {xw} {yw} {zw} 255 255 255 0.0")
             pid += 1
@@ -850,9 +870,10 @@ def main() -> None:
         }
         manifest["colmap_world_axes"] = {
             "x": "west",
-            "y": "up",
+            "y": "down",
             "z": "north",
             "ground_plane": "y=0",
+            "note": "COLMAP Y is reflected vs geodetic up; PINHOLE fy is negated to match images.",
         }
         manifest["colmap_grid_points_target"] = int(args.colmap_grid_points)
     if aoi is not None:
