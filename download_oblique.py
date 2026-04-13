@@ -4,11 +4,11 @@ Download and reconstruct Vienna oblique 2023 images for a GPS point or a ground 
 
 The script:
 1) Converts input WGS84 lat/lon to dataset MGI coordinates.
-2) Scans local 2023 tile index JSON files and selects images by AOI footprint coverage and/or
+2) Scans local 2023 tile index JSON files and selects images by AOI–footprint intersection and/or
    the same centre test as point mode (projection in frame), using `p-to-image`.
 3) Downloads JPEG tiles at the chosen pyramid zoom level and reconstructs each image.
 4) Optionally writes binary masks in masks/ (white = keep, black = exclude), composited
-   RGB in masked_images/, and COLMAP sparse reconstruction text.
+   RGB in masked_images/, and COLMAP sparse reconstruction text (optional 3D grid in points3D.txt).
 
 Requirements:
     pip install pyproj requests pillow shapely
@@ -250,19 +250,39 @@ def footprint_shapely(footprint: Sequence[Tuple[float, float]]) -> ShapelyPolygo
     return ShapelyPolygon(footprint)
 
 
-def coverage_percent_aoi(aoi: AOI, footprint_ring: Sequence[Tuple[float, float]]) -> float:
-    """Percentage of AOI area covered by image ground footprint (intersection / AOI area)."""
+def footprint_polygon_valid(footprint_ring: Sequence[Tuple[float, float]]) -> ShapelyPolygon | None:
+    """Ground footprint as a valid Shapely polygon (buffer(0) if self-intersecting)."""
     fp = footprint_shapely(footprint_ring)
-    if fp.is_empty or not fp.is_valid:
+    if fp.is_empty:
+        return None
+    if not fp.is_valid:
+        fp = fp.buffer(0)
+    return None if fp.is_empty else fp
+
+
+def footprint_intersects_aoi(aoi: AOI, footprint_ring: Sequence[Tuple[float, float]]) -> bool:
+    """True if the AOI and ground footprint share any area (or touch on an edge)."""
+    fp = footprint_polygon_valid(footprint_ring)
+    if fp is None:
+        return False
+    return aoi.shapely_polygon().intersects(fp)
+
+
+def coverage_percent_footprint_in_aoi(
+    aoi: AOI, footprint_ring: Sequence[Tuple[float, float]]
+) -> float:
+    """Percentage of image ground footprint area that lies inside the AOI (intersection / footprint)."""
+    fp = footprint_polygon_valid(footprint_ring)
+    if fp is None:
+        return 0.0
+    fa = float(fp.area)
+    if fa < 1e-9:
         return 0.0
     aoi_poly = aoi.shapely_polygon()
     inter = aoi_poly.intersection(fp)
     if inter.is_empty:
         return 0.0
-    a = float(aoi_poly.area)
-    if a < 1e-9:
-        return 0.0
-    return 100.0 * float(inter.area) / a
+    return 100.0 * float(inter.area) / fa
 
 
 def aoi_from_rect_corners(
@@ -484,6 +504,7 @@ def colmap_export_for_image(
     width: int,
     height: int,
     world_origin_xyz: Tuple[float, float, float],
+    colmap_scale: float = 1.0,
 ) -> Tuple[str, str]:
     """Return (cameras_line, images_line) for COLMAP text format."""
     import numpy as np
@@ -518,6 +539,8 @@ def colmap_export_for_image(
     fy = -fy
     cx, cy = float(K[0, 2]), float(K[1, 2])
 
+    t = t * float(colmap_scale)
+
     r00, r01, r02 = float(R[0, 0]), float(R[0, 1]), float(R[0, 2])
     r10, r11, r12 = float(R[1, 0]), float(R[1, 1]), float(R[1, 2])
     r20, r21, r22 = float(R[2, 0]), float(R[2, 1]), float(R[2, 2])
@@ -539,18 +562,39 @@ def colmap_flat_grid_points3d_lines(
     aoi: AOI,
     world_origin_xyz: Tuple[float, float, float],
     target_points: int = 100000,
+    colmap_scale: float = 1.0,
+    ground_z: float = 0.0,
+    height_m: float = 0.0,
+    height_vs_area: float = 0.5,
 ) -> List[str]:
     """
-    Generate a flat Z=0 grid in AOI, approximately target_points samples.
-    Coordinates are shifted into the COLMAP world frame (selected origin at 0,0,0).
+    Generate a uniform grid in the AOI footprint and (optionally) vertically in MGI Z.
+
+    When height_m <= 0: one horizontal layer at ``ground_z`` (same as a flat slab).
+    When height_m > 0: samples span Z in [ground_z, ground_z + height_m] (endpoints included).
+
+    The total count is at least ``target_points`` (the grid may contain more cells; emission stops
+    once ``target_points`` samples are written). Vertical vs horizontal resolution uses
+    ``height_vs_area`` in [0, 1]: near 0 favours a dense ground footprint (few Z layers); near 1
+    favours many Z layers and a sparser XY grid (nz ~= N**height_vs_area, then nx*ny ~= N/nz).
     """
     target_points = max(1, int(target_points))
     dx = max(1e-9, aoi.max_x - aoi.min_x)
     dy = max(1e-9, aoi.max_y - aoi.min_y)
-    ratio = dx / dy
+    hva = min(1.0, max(0.0, float(height_vs_area)))
 
-    nx = max(1, int(math.ceil(math.sqrt(target_points * ratio))))
-    ny = max(1, int(math.ceil(target_points / nx)))
+    if height_m <= 0.0:
+        nz = 1
+        n_xy_budget = target_points
+    else:
+        nz = max(1, min(target_points, int(round(target_points**hva))))
+        if target_points >= 2:
+            nz = max(nz, 2)
+        n_xy_budget = max(1, int(math.ceil(target_points / nz)))
+
+    ratio = dx / dy
+    nx = max(1, int(math.ceil(math.sqrt(n_xy_budget * ratio))))
+    ny = max(1, int(math.ceil(n_xy_budget / nx)))
 
     ox, oy, oz = world_origin_xyz
     import numpy as np
@@ -560,17 +604,25 @@ def colmap_flat_grid_points3d_lines(
     TS = S_y @ T
     lines: List[str] = []
     pid = 1
+    z0 = float(ground_z)
 
-    # Uniform grid over AOI bounds; use sample positions (including edges).
-    for iy in range(ny):
-        y = aoi.min_y if ny == 1 else aoi.min_y + (dy * iy) / (ny - 1)
-        for ix in range(nx):
-            x = aoi.min_x if nx == 1 else aoi.min_x + (dx * ix) / (nx - 1)
-            p = np.array([x - ox, y - oy, 0.0 - oz], dtype=np.float64)
-            xw, yw, zw = (TS @ p).tolist()
-            # Empty track is valid in text format: just omit IMAGE_ID/POINT2D_IDX pairs.
-            lines.append(f"{pid} {xw} {yw} {zw} 255 255 255 0.0")
-            pid += 1
+    # Uniform grid over AOI bounds and Z slab; include edges in each dimension.
+    for iz in range(nz):
+        if nz == 1:
+            z_mgi = z0
+        else:
+            z_mgi = z0 + (height_m * iz) / (nz - 1)
+        for iy in range(ny):
+            y = aoi.min_y if ny == 1 else aoi.min_y + (dy * iy) / (ny - 1)
+            for ix in range(nx):
+                if pid > target_points:
+                    return lines
+                x = aoi.min_x if nx == 1 else aoi.min_x + (dx * ix) / (nx - 1)
+                p = np.array([x - ox, y - oy, z_mgi - oz], dtype=np.float64)
+                w = float(colmap_scale) * (TS @ p)
+                xw, yw, zw = float(w[0]), float(w[1]), float(w[2])
+                lines.append(f"{pid} {xw} {yw} {zw} 255 255 255 0.0")
+                pid += 1
     return lines
 
 
@@ -623,9 +675,10 @@ def parse_args() -> argparse.Namespace:
         "--min-coverage-percent",
         type=float,
         default=0.0,
-        help="For rect/square: require at least this %% of AOI area under the ground footprint, "
-        "unless the AOI centre matches point mode (projection in frame or centre in footprint). "
-        "Use 0 for any footprint overlap.",
+        help="For rect/square: keep images whose ground footprint intersects the AOI, or that pass "
+        "the AOI-centre test (projection in frame / centre in footprint). "
+        "If > 0, also keep images with at least this %% of footprint area inside the AOI (covers odd "
+        "geometry without a clean intersects). Use 0 for intersection-or-centre only.",
     )
     parser.add_argument(
         "--output-dir",
@@ -701,7 +754,29 @@ def parse_args() -> argparse.Namespace:
         "--colmap-grid-points",
         type=int,
         default=100000,
-        help="Approximate number of flat AOI grid points to write into points3D.txt.",
+        help="Target number of 3D grid samples in points3D.txt (emission stops once reached).",
+    )
+    parser.add_argument(
+        "--colmap-grid-height-m",
+        type=float,
+        default=0.0,
+        help="MGI vertical thickness (metres) above --ground-z for the COLMAP point grid. "
+        "0 = single horizontal layer at ground-z. Ignored without --colmap and AOI.",
+    )
+    parser.add_argument(
+        "--colmap-grid-height-vs-area",
+        type=float,
+        default=0.2,
+        help="With --colmap-grid-height-m > 0: balance vertical vs horizontal resolution, 0…1. "
+        "0 = favour dense XY sampling (few Z layers, but at least floor/ceiling of the slab). "
+        "1 = favour many Z layers and sparser XY. Clamped to [0, 1].",
+    )
+    parser.add_argument(
+        "--colmap-scale",
+        type=float,
+        default=1.0,
+        help="Uniform scale for COLMAP world units: multiplies 3D points and image translations (tx,ty,tz). "
+        "1.0 leaves coordinates in metres; e.g. 0.001 converts to millimetres.",
     )
     return parser.parse_args()
 
@@ -723,6 +798,11 @@ def main() -> None:
     else:
         if args.lat is None or args.lon is None or args.half_side_m is None:
             raise SystemExit("--aoi-type square requires --lat, --lon, and --half-side-m")
+
+    if args.colmap and args.colmap_scale <= 0:
+        raise SystemExit("--colmap-scale must be positive")
+    if args.colmap and args.colmap_grid_height_m < 0:
+        raise SystemExit("--colmap-grid-height-m must be non-negative")
 
     started = datetime.now()
     stamp = started.strftime("%Y%m%d_%H%M%S")
@@ -760,10 +840,12 @@ def main() -> None:
 
     mode = "footprint only" if args.footprint_only else "projection in frame"
     if aoi is not None:
-        mode = (
-            f"AOI: coverage ≥ {args.min_coverage_percent}% of AOI "
-            f"OR same centre test as point mode (projection / footprint)"
+        extra = (
+            f" OR ≥{args.min_coverage_percent}% of footprint in AOI"
+            if args.min_coverage_percent > 0
+            else ""
         )
+        mode = f"AOI: footprint intersects AOI OR centre test{extra}"
     print(
         f"Searching {len(tile_files)} index files — {mode} ..."
     )
@@ -777,11 +859,15 @@ def main() -> None:
                 continue
 
             if aoi is not None:
-                cov = coverage_percent_aoi(aoi, img["footprint"])
+                cov = coverage_percent_footprint_in_aoi(aoi, img["footprint"])
+                pass_overlap = footprint_intersects_aoi(aoi, img["footprint"])
                 if args.min_coverage_percent <= 0:
-                    pass_cov = cov > 1e-9
+                    pass_cov = pass_overlap or cov > 1e-9
                 else:
-                    pass_cov = cov + 1e-9 >= args.min_coverage_percent
+                    pass_cov = (
+                        pass_overlap
+                        or cov + 1e-9 >= args.min_coverage_percent
+                    )
 
                 lon_c, lat_c = aoi_center_lon_lat(
                     aoi, args.aoi_type, args.lon, args.lat, mgi_to_wgs
@@ -802,8 +888,8 @@ def main() -> None:
                         proj[0], proj[1], img["width"], img["height"]
                     )
 
-                # Coverage alone misses narrow E/W oblique footprints: the AOI centre can
-                # project in-frame (same as point search) while footprint∩AOI area is < 1%.
+                # Centre test catches shots where the AOI centre is in frame but footprint∩AOI is tiny
+                # or numerically awkward; coverage threshold catches rare cases without clean intersects.
                 if not pass_cov and not pass_center:
                     continue
                 ok = True
@@ -876,6 +962,9 @@ def main() -> None:
             "note": "COLMAP Y is reflected vs geodetic up; PINHOLE fy is negated to match images.",
         }
         manifest["colmap_grid_points_target"] = int(args.colmap_grid_points)
+        manifest["colmap_grid_height_m"] = float(args.colmap_grid_height_m)
+        manifest["colmap_grid_height_vs_area"] = float(args.colmap_grid_height_vs_area)
+        manifest["colmap_scale"] = float(args.colmap_scale)
     if aoi is not None:
         manifest["aoi_mgi"] = {
             "min_x": aoi.min_x,
@@ -962,6 +1051,7 @@ def main() -> None:
                         img["width"],
                         img["height"],
                         colmap_origin_xyz,
+                        colmap_scale=args.colmap_scale,
                     )
                     camera_lines.append(cl)
                     image_lines.append(il)
@@ -995,6 +1085,10 @@ def main() -> None:
                 aoi=aoi,
                 world_origin_xyz=colmap_origin_xyz,
                 target_points=args.colmap_grid_points,
+                colmap_scale=args.colmap_scale,
+                ground_z=args.ground_z,
+                height_m=args.colmap_grid_height_m,
+                height_vs_area=args.colmap_grid_height_vs_area,
             )
             pts_body = "\n".join(
                 [
