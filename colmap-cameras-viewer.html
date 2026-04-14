@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>COLMAP cameras &amp; images (top-down)</title>
+  <style>
+    :root {
+      font-family: system-ui, Segoe UI, Roboto, sans-serif;
+      color: #e8e8e8;
+      background: #1a1b1e;
+    }
+    body {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    header {
+      padding: 10px 14px;
+      background: #25262b;
+      border-bottom: 1px solid #373a40;
+      flex-shrink: 0;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 20px;
+      align-items: center;
+    }
+    label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9rem;
+    }
+    input[type="file"] {
+      max-width: 220px;
+    }
+    input[type="range"] {
+      width: 140px;
+      vertical-align: middle;
+    }
+    .val {
+      min-width: 3.5em;
+      font-variant-numeric: tabular-nums;
+      color: #adb5bd;
+    }
+    #canvas-wrap {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+    canvas.dragging {
+      cursor: grabbing;
+    }
+    .legend {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      font-size: 0.85rem;
+    }
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+    .hint {
+      margin-top: 6px;
+      font-size: 0.8rem;
+      color: #868e96;
+    }
+    .grid-spacing-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .step-btn {
+      min-width: 1.75em;
+      padding: 2px 6px;
+      font-size: 1rem;
+      line-height: 1.2;
+      cursor: pointer;
+      background: #373a40;
+      border: 1px solid #495057;
+      color: #e9ecef;
+      border-radius: 4px;
+    }
+    .step-btn:hover {
+      background: #495057;
+    }
+    .step-btn:active {
+      background: #343a40;
+    }
+    #tooltip {
+      position: fixed;
+      display: none;
+      pointer-events: none;
+      z-index: 10;
+      max-width: 360px;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.45;
+      background: rgba(37, 38, 43, 0.95);
+      border: 1px solid #495057;
+      border-radius: 6px;
+      color: #e9ecef;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>COLMAP camera directions (top-down)</h1>
+    <div class="row">
+      <label>cameras.txt <input id="cameras-file" type="file" accept=".txt,text/plain" /></label>
+      <label>images.txt <input id="images-file" type="file" accept=".txt,text/plain" /></label>
+      <label>points3D.txt <input id="points3d-file" type="file" accept=".txt,text/plain" /></label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label>Zoom <input id="zoom" type="range" min="0.01" max="40" step="0.01" value="1" /><span class="val" id="zoom-val">1.00</span></label>
+      <label>Arrow scale <input id="arrow-scale" type="range" min="0.001" max="3" step="0.001" value="0.35" /><span class="val" id="arrow-val">0.35</span></label>
+      <label>Up axis
+        <select id="up-axis">
+          <option value="y" selected>Y up (plot X–Z, look from +Y)</option>
+          <option value="z">Z up (plot X–Y, look from +Z)</option>
+        </select>
+      </label>
+      <label>North
+        <select id="north-axis">
+          <option value="+z" selected>+Z</option>
+          <option value="-z">−Z</option>
+          <option value="+x">+X</option>
+          <option value="-x">−X</option>
+        </select>
+      </label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label><input id="points3d-show" type="checkbox" checked disabled /> Show 3D points</label>
+      <label>Point budget
+        <input id="points3d-budget" type="range" min="5000" max="1000000" step="5000" value="200000" disabled />
+        <span class="val" id="points3d-budget-val">200000</span>
+      </label>
+      <label><input id="grid-show" type="checkbox" /> Show grid</label>
+      <label>Grid spacing (world)
+        <span class="grid-spacing-wrap">
+          <button type="button" class="step-btn" id="grid-spacing-down" title="Subtract 1 from spacing" aria-label="Decrease grid spacing">−</button>
+          <input id="grid-spacing" type="text" value="1" inputmode="decimal" autocomplete="off" spellcheck="false" style="width:7.5em" />
+          <button type="button" class="step-btn" id="grid-spacing-up" title="Add 1 to spacing" aria-label="Increase grid spacing">+</button>
+        </span>
+      </label>
+      <label>Grid density <input id="grid-density" type="range" min="1" max="32" step="1" value="4" /><span class="val" id="grid-density-val">4</span></label>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:#4dabf7"></i> North</span>
+      <span><i class="dot" style="background:#51cf66"></i> East</span>
+      <span><i class="dot" style="background:#ff6b6b"></i> South</span>
+      <span><i class="dot" style="background:#9775fa"></i> West</span>
+    </div>
+    <p class="hint">
+      Drag to pan. Uses COLMAP pose: camera center <code>C = −R<sup>T</sup>t</code>, optical axis in world <code>R<sup>T</sup>[0,0,1]</code>.
+      Cardinal colors use the horizontal projection of that axis (90° sectors). If colors look rotated, change North.
+      Grid spacing uses the same world units as the plot axes; +/− adjust by 1, or type a value (scientific notation allowed). Density sets minor intervals per spacing.
+      Load <code>points3D.txt</code> to overlay sparse points (same world frame as images). Large files are subsampled to the draw budget for performance.
+      Hover a camera for file name, IDs, pose, and intrinsics (if <code>cameras.txt</code> is loaded).
+    </p>
+  </header>
+  <div id="canvas-wrap">
+    <canvas id="view"></canvas>
+  </div>
+  <div id="tooltip"></div>
+  <script>
+(function () {
+  const canvas = document.getElementById("view");
+  const ctx = canvas.getContext("2d");
+  const tooltip = document.getElementById("tooltip");
+
+  /** Hamilton quaternion [w,x,y,z], COLMAP world → camera */
+  function quatToRotMat(qw, qx, qy, qz) {
+    const n = qw * qw + qx * qx + qy * qy + qz * qz;
+    if (n < 1e-20) return null;
+    const s = 2 / n;
+    const wx = s * qw * qx, wy = s * qw * qy, wz = s * qw * qz;
+    const xx = s * qx * qx, xy = s * qx * qy, xz = s * qx * qz;
+    const yy = s * qy * qy, yz = s * qy * qz, zz = s * qz * qz;
+    return [
+      [1 - (yy + zz), xy - wz, xz + wy],
+      [xy + wz, 1 - (xx + zz), yz - wx],
+      [xz - wy, yz + wx, 1 - (xx + yy)],
+    ];
+  }
+
+  function matTranspose3(R) {
+    return [
+      [R[0][0], R[1][0], R[2][0]],
+      [R[0][1], R[1][1], R[2][1]],
+      [R[0][2], R[1][2], R[2][2]],
+    ];
+  }
+
+  function matVec3(R, v) {
+    return [
+      R[0][0] * v[0] + R[0][1] * v[1] + R[0][2] * v[2],
+      R[1][0] * v[0] + R[1][1] * v[1] + R[1][2] * v[2],
+      R[2][0] * v[0] + R[2][1] * v[1] + R[2][2] * v[2],
+    ];
+  }
+
+  /** Camera center C = -R^T * t */
+  function cameraCenter(R, t) {
+    const Rt = matTranspose3(R);
+    const c = matVec3(Rt, t);
+    return [-c[0], -c[1], -c[2]];
+  }
+
+  /** Optical axis in world: R^T * [0,0,1] */
+  function forwardWorld(R) {
+    const Rt = matTranspose3(R);
+    return [Rt[0][2], Rt[1][2], Rt[2][2]];
+  }
+
+  function parseCamerasTxt(text) {
+    const cameras = new Map();
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      const p = t.split(/\s+/);
+      const id = parseInt(p[0], 10);
+      if (Number.isNaN(id)) continue;
+      cameras.set(id, { id, model: p[1], width: parseInt(p[2], 10), height: parseInt(p[3], 10) });
+    }
+    return cameras;
+  }
+
+  function parseImagesTxt(text) {
+    const lines = text.split(/\r?\n/);
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (!t || t.startsWith("#")) continue;
+      const parts = t.split(/\s+/);
+      const imageId = parseInt(parts[0], 10);
+      if (parts.length < 10 || Number.isNaN(imageId)) continue;
+      const qw = parseFloat(parts[1]);
+      const qx = parseFloat(parts[2]);
+      const qy = parseFloat(parts[3]);
+      const qz = parseFloat(parts[4]);
+      const tx = parseFloat(parts[5]);
+      const ty = parseFloat(parts[6]);
+      const tz = parseFloat(parts[7]);
+      const cameraId = parseInt(parts[8], 10);
+      const name = parts.slice(9).join(" ");
+      out.push({ imageId, qw, qx, qy, qz, tx, ty, tz, cameraId, name });
+      i++;
+    }
+    return out;
+  }
+
+  /**
+   * COLMAP points3D.txt: POINT3D_ID X Y Z R G B ERROR [TRACK ...]
+   * Allocates typed arrays; skips malformed lines.
+   */
+  function parsePoints3DTxt(text) {
+    const lines = text.split(/\r?\n/);
+    let n = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (t && !t.startsWith("#")) n++;
+    }
+    if (n === 0) {
+      return {
+        n: 0,
+        x: new Float32Array(0),
+        y: new Float32Array(0),
+        z: new Float32Array(0),
+        r: new Uint8Array(0),
+        g: new Uint8Array(0),
+        b: new Uint8Array(0),
+        id: new Uint32Array(0),
+      };
+    }
+    const x = new Float32Array(n);
+    const y = new Float32Array(n);
+    const z = new Float32Array(n);
+    const r = new Uint8Array(n);
+    const g = new Uint8Array(n);
+    const b = new Uint8Array(n);
+    const id = new Uint32Array(n);
+    let j = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (!t || t.startsWith("#")) continue;
+      const p = t.split(/\s+/);
+      if (p.length < 8) continue;
+      const pid = parseInt(p[0], 10);
+      const fx = parseFloat(p[1]);
+      const fy = parseFloat(p[2]);
+      const fz = parseFloat(p[3]);
+      if (Number.isNaN(pid) || !Number.isFinite(fx) || !Number.isFinite(fy) || !Number.isFinite(fz)) continue;
+      id[j] = pid >>> 0;
+      x[j] = fx;
+      y[j] = fy;
+      z[j] = fz;
+      r[j] = parseInt(p[4], 10) & 255;
+      g[j] = parseInt(p[5], 10) & 255;
+      b[j] = parseInt(p[6], 10) & 255;
+      j++;
+    }
+    if (j === 0) {
+      return {
+        n: 0,
+        x: new Float32Array(0),
+        y: new Float32Array(0),
+        z: new Float32Array(0),
+        r: new Uint8Array(0),
+        g: new Uint8Array(0),
+        b: new Uint8Array(0),
+        id: new Uint32Array(0),
+      };
+    }
+    if (j < n) {
+      return {
+        n: j,
+        x: x.subarray(0, j),
+        y: y.subarray(0, j),
+        z: z.subarray(0, j),
+        r: r.subarray(0, j),
+        g: g.subarray(0, j),
+        b: b.subarray(0, j),
+        id: id.subarray(0, j),
+      };
+    }
+    return { n: j, x, y, z, r, g, b, id };
+  }
+
+  /**
+   * Project optical axis onto ground plane; east/north match the 2D plot axes.
+   * Y-up: plot (X,Z). Z-up: plot (X,Y). atan2(east, north): 0° = north, 90° = east.
+   */
+  function horizontalEastNorth(upAxis, northKey, f) {
+    const fx = f[0],
+      fy = f[1],
+      fz = f[2];
+    let east, north;
+    if (upAxis === "y") {
+      switch (northKey) {
+        case "+z":
+          east = fx;
+          north = fz;
+          break;
+        case "-z":
+          east = -fx;
+          north = -fz;
+          break;
+        case "+x":
+          east = fz;
+          north = fx;
+          break;
+        case "-x":
+          east = -fz;
+          north = -fx;
+          break;
+        default:
+          east = fx;
+          north = fz;
+      }
+    } else {
+      switch (northKey) {
+        case "+y":
+          east = fx;
+          north = fy;
+          break;
+        case "-y":
+          east = -fx;
+          north = -fy;
+          break;
+        case "+x":
+          east = fy;
+          north = fx;
+          break;
+        case "-x":
+          east = -fy;
+          north = -fx;
+          break;
+        default:
+          east = fx;
+          north = fy;
+      }
+    }
+    return { east, north };
+  }
+
+  function colorFromEastNorth(east, north) {
+    const len = Math.hypot(east, north);
+    if (len < 1e-12) return "#888";
+    let deg = (Math.atan2(east, north) * 180) / Math.PI;
+    if (deg < 0) deg += 360;
+    if (deg >= 315 || deg < 45) return "#4dabf7";
+    if (deg < 135) return "#51cf66";
+    if (deg < 225) return "#ff6b6b";
+    return "#9775fa";
+  }
+
+  let images = [];
+  /** Parsed points3D (typed arrays) or null */
+  let points3d = null;
+  let cameras = new Map();
+  let panX = 0;
+  let panY = 0;
+  let drag = null;
+  let lastDrawMetrics = null;
+  let hoverIm = null;
+
+  const GRID_SPACING_STEP = 1;
+
+  function parseGridSpacingValue() {
+    const t = String(document.getElementById("grid-spacing").value).trim().replace(",", ".");
+    const v = parseFloat(t);
+    return Number.isFinite(v) && v > 0 ? v : 1;
+  }
+
+  function formatGridSpacingDisplay(v) {
+    v = Math.max(1e-15, Math.min(1e20, v));
+    const ax = Math.abs(v);
+    if (ax >= 1e7 || ax < 1e-4) return v.toExponential(4);
+    const r = Number.parseFloat(String(v.toPrecision(12)));
+    return String(r);
+  }
+
+  function bumpGridSpacing(delta) {
+    const el = document.getElementById("grid-spacing");
+    let v = parseGridSpacingValue();
+    if (!Number.isFinite(v) || v <= 0) v = 1;
+    v = v + delta;
+    el.value = formatGridSpacingDisplay(v);
+    draw();
+  }
+
+  function getSettings() {
+    return {
+      zoom: parseFloat(document.getElementById("zoom").value),
+      arrowScale: parseFloat(document.getElementById("arrow-scale").value),
+      upAxis: document.getElementById("up-axis").value,
+      northKey: document.getElementById("north-axis").value,
+      gridShow: document.getElementById("grid-show").checked,
+      gridSpacing: parseGridSpacingValue(),
+      gridDensity: Math.max(1, parseInt(document.getElementById("grid-density").value, 10) || 1),
+      points3dShow: document.getElementById("points3d-show").checked,
+      points3dBudget: Math.max(1000, parseInt(document.getElementById("points3d-budget").value, 10) || 200000),
+    };
+  }
+
+  function mergeBounds(b1, b2) {
+    if (!b1) return b2;
+    if (!b2) return b1;
+    return {
+      minA: Math.min(b1.minA, b2.minA),
+      maxA: Math.max(b1.maxA, b2.maxA),
+      minB: Math.min(b1.minB, b2.minB),
+      maxB: Math.max(b1.maxB, b2.maxB),
+    };
+  }
+
+  function boundsFromPoints3d(P, upAxis) {
+    if (!P || P.n === 0) return null;
+    const { n, x, y, z } = P;
+    let minA = Infinity,
+      maxA = -Infinity,
+      minB = Infinity,
+      maxB = -Infinity;
+    for (let i = 0; i < n; i++) {
+      if (upAxis === "y") {
+        minA = Math.min(minA, x[i]);
+        maxA = Math.max(maxA, x[i]);
+        minB = Math.min(minB, z[i]);
+        maxB = Math.max(maxB, z[i]);
+      } else {
+        minA = Math.min(minA, x[i]);
+        maxA = Math.max(maxA, x[i]);
+        minB = Math.min(minB, y[i]);
+        maxB = Math.max(maxB, y[i]);
+      }
+    }
+    return { minA, maxA, minB, maxB };
+  }
+
+  function boundsFromImages(upAxis) {
+    let minA = Infinity,
+      maxA = -Infinity,
+      minB = Infinity,
+      maxB = -Infinity;
+    let any = false;
+    for (let i = 0; i < images.length; i++) {
+      const im = images[i];
+      const R = quatToRotMat(im.qw, im.qx, im.qy, im.qz);
+      if (!R) continue;
+      const C = cameraCenter(R, [im.tx, im.ty, im.tz]);
+      const p = project2d(C, upAxis);
+      any = true;
+      minA = Math.min(minA, p.a);
+      maxA = Math.max(maxA, p.a);
+      minB = Math.min(minB, p.b);
+      maxB = Math.max(maxB, p.b);
+    }
+    if (!any) return null;
+    return { minA, maxA, minB, maxB };
+  }
+
+  function syncPoints3dControls() {
+    const has = points3d && points3d.n > 0;
+    const showEl = document.getElementById("points3d-show");
+    const budgetEl = document.getElementById("points3d-budget");
+    showEl.disabled = !has;
+    budgetEl.disabled = !has;
+  }
+
+  function computeSceneSpanForPan() {
+    const upAxis = document.getElementById("up-axis").value;
+    const bImg = boundsFromImages(upAxis);
+    const bPt = points3d && points3d.n > 0 ? boundsFromPoints3d(points3d, upAxis) : null;
+    const b = mergeBounds(bImg, bPt);
+    if (!b) return 1;
+    return Math.max(b.maxA - b.minA, b.maxB - b.minB, 1e-6);
+  }
+
+  /** Grid in plot (a,b) world plane; minor lines every spacing/density, major every spacing. */
+  function drawGridWorld(ctx, gMinA, gMaxA, gMinB, gMaxB, spacing, density, zoom, baseScale) {
+    const major = Math.max(spacing, 1e-20);
+    const d = Math.max(1, density);
+    const minor = major / d;
+    const extA = gMaxA - gMinA;
+    const extB = gMaxB - gMinB;
+    const maxLinesPerAxis = 550;
+    if (!isFinite(minor) || minor <= 0 || extA / minor > maxLinesPerAxis || extB / minor > maxLinesPerAxis) {
+      return false;
+    }
+    const px = 1 / (zoom * baseScale);
+    const pad = minor * 2;
+
+    const iStart = Math.floor((gMinA - pad) / minor);
+    const iEnd = Math.ceil((gMaxA + pad) / minor);
+    const jStart = Math.floor((gMinB - pad) / minor);
+    const jEnd = Math.ceil((gMaxB + pad) / minor);
+
+    const mod = (n, m) => ((n % m) + m) % m;
+    for (let i = iStart; i <= iEnd; i++) {
+      const x = i * minor;
+      const isMajor = mod(i, d) === 0;
+      ctx.beginPath();
+      ctx.moveTo(x, gMinB - pad);
+      ctx.lineTo(x, gMaxB + pad);
+      ctx.strokeStyle = isMajor ? "#3d4149" : "#2c2e33";
+      ctx.lineWidth = isMajor ? px * 1.1 : px * 0.65;
+      ctx.stroke();
+    }
+    for (let j = jStart; j <= jEnd; j++) {
+      const y = j * minor;
+      const isMajor = mod(j, d) === 0;
+      ctx.beginPath();
+      ctx.moveTo(gMinA - pad, y);
+      ctx.lineTo(gMaxA + pad, y);
+      ctx.strokeStyle = isMajor ? "#3d4149" : "#2c2e33";
+      ctx.lineWidth = isMajor ? px * 1.1 : px * 0.65;
+      ctx.stroke();
+    }
+    return true;
+  }
+
+  function project2d(C, upAxis) {
+    if (upAxis === "y") return { a: C[0], b: C[2] };
+    return { a: C[0], b: C[1] };
+  }
+
+  function screenToWorld(sx, sy) {
+    if (!lastDrawMetrics) return null;
+    if (images.length === 0 && (!points3d || points3d.n === 0)) return null;
+    const m = lastDrawMetrics;
+    const wx = (sx - m.w / 2) / (m.zoom * m.baseScale) + m.cx;
+    const wy = -(sy - m.h / 2) / (m.zoom * m.baseScale) + m.cy;
+    return { wx, wy };
+  }
+
+  function findNearestImage(wx, wy, maxDist, upAxis) {
+    let best = null;
+    let bestD = maxDist * maxDist;
+    for (let i = 0; i < images.length; i++) {
+      const im = images[i];
+      const R = quatToRotMat(im.qw, im.qx, im.qy, im.qz);
+      if (!R) continue;
+      const C = cameraCenter(R, [im.tx, im.ty, im.tz]);
+      const p = project2d(C, upAxis);
+      const ddx = p.a - wx;
+      const ddy = p.b - wy;
+      const d2 = ddx * ddx + ddy * ddy;
+      if (d2 < bestD) {
+        bestD = d2;
+        best = im;
+      }
+    }
+    return best;
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function fmt(v) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return String(v);
+    const ax = Math.abs(v);
+    if (ax >= 1e6 || (ax > 0 && ax < 1e-3)) return v.toExponential(5);
+    return v.toFixed(5);
+  }
+
+  function buildTooltipHtml(im) {
+    let camLine = "— (load cameras.txt)";
+    const cam = cameras.get(im.cameraId);
+    if (cam) camLine = cam.model + " " + cam.width + "×" + cam.height;
+    let cLine = "—";
+    const R = quatToRotMat(im.qw, im.qx, im.qy, im.qz);
+    if (R) {
+      const C = cameraCenter(R, [im.tx, im.ty, im.tz]);
+      cLine = fmt(C[0]) + ", " + fmt(C[1]) + ", " + fmt(C[2]);
+    }
+    return (
+      "<strong>" +
+      escapeHtml(im.name) +
+      "</strong><br/>" +
+      "IMAGE_ID " +
+      im.imageId +
+      " · CAMERA_ID " +
+      im.cameraId +
+      "<br/>" +
+      "intrinsics: " +
+      escapeHtml(camLine) +
+      "<br/>" +
+      "C (camera center): " +
+      cLine +
+      "<br/>" +
+      "t (COLMAP): " +
+      fmt(im.tx) +
+      ", " +
+      fmt(im.ty) +
+      ", " +
+      fmt(im.tz) +
+      "<br/>" +
+      "q (w,x,y,z): " +
+      fmt(im.qw) +
+      ", " +
+      fmt(im.qx) +
+      ", " +
+      fmt(im.qy) +
+      ", " +
+      fmt(im.qz)
+    );
+  }
+
+  function resize() {
+    const wrap = document.getElementById("canvas-wrap");
+    const dpr = window.devicePixelRatio || 1;
+    const w = wrap.clientWidth;
+    const h = wrap.clientHeight;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+
+  function draw() {
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    const {
+      zoom,
+      arrowScale,
+      upAxis,
+      northKey,
+      gridShow,
+      gridSpacing,
+      gridDensity,
+      points3dShow,
+      points3dBudget,
+    } = getSettings();
+
+    ctx.fillStyle = "#1a1b1e";
+    ctx.fillRect(0, 0, w, h);
+
+    const bImg = boundsFromImages(upAxis);
+    const hasPts = points3d && points3d.n > 0;
+    const bPt = hasPts ? boundsFromPoints3d(points3d, upAxis) : null;
+    const b = mergeBounds(bImg, bPt);
+
+    if (!b) {
+      lastDrawMetrics = null;
+      ctx.fillStyle = "#868e96";
+      ctx.font = "14px system-ui";
+      ctx.fillText("Load images.txt (poses) and/or points3D.txt. cameras.txt is optional.", 20, 40);
+      return;
+    }
+
+    const pts = [];
+    for (const im of images) {
+      const R = quatToRotMat(im.qw, im.qx, im.qy, im.qz);
+      if (!R) continue;
+      const C = cameraCenter(R, [im.tx, im.ty, im.tz]);
+      const f = forwardWorld(R);
+      pts.push({ C, f, im });
+    }
+
+    const cx = (b.minA + b.maxA) / 2 + panX;
+    const cy = (b.minB + b.maxB) / 2 + panY;
+    const span = Math.max(b.maxA - b.minA, b.maxB - b.minB, 1e-6);
+    const baseScale = (0.45 * Math.min(w, h)) / span;
+
+    lastDrawMetrics = { w, h, zoom, baseScale, cx, cy, span, upAxis };
+
+    ctx.save();
+    ctx.translate(w / 2, h / 2);
+    ctx.scale(zoom, zoom);
+    ctx.scale(baseScale, -baseScale);
+    ctx.translate(-cx, -cy);
+
+    const halfW = w / (2 * zoom * baseScale);
+    const halfH = h / (2 * zoom * baseScale);
+    const visMinA = cx - halfW;
+    const visMaxA = cx + halfW;
+    const visMinB = cy - halfH;
+    const visMaxB = cy + halfH;
+
+    let gridOk = true;
+    if (gridShow) {
+      gridOk = drawGridWorld(ctx, visMinA, visMaxA, visMinB, visMaxB, gridSpacing, gridDensity, zoom, baseScale);
+    }
+
+    ctx.strokeStyle = "#373a40";
+    ctx.lineWidth = Math.max(1 / (zoom * baseScale), 0.5);
+    const pad = span * 0.5;
+    ctx.beginPath();
+    ctx.moveTo(b.minA - pad, b.minB - pad);
+    ctx.lineTo(b.maxA + pad, b.minB - pad);
+    ctx.moveTo(b.minA - pad, b.minB - pad);
+    ctx.lineTo(b.minA - pad, b.maxB + pad);
+    ctx.stroke();
+
+    const showPtsDraw = points3dShow && hasPts;
+    if (showPtsDraw) {
+      const P = points3d;
+      const budget = points3dBudget;
+      const step = Math.max(1, Math.ceil(P.n / budget));
+      const half = Math.max(0.35 / (zoom * baseScale), span * 1e-6);
+      for (let i = 0; i < P.n; i += step) {
+        ctx.fillStyle = "rgb(" + P.r[i] + "," + P.g[i] + "," + P.b[i] + ")";
+        if (upAxis === "y") {
+          ctx.fillRect(P.x[i] - half, P.z[i] - half, 2 * half, 2 * half);
+        } else {
+          ctx.fillRect(P.x[i] - half, P.y[i] - half, 2 * half, 2 * half);
+        }
+      }
+    }
+
+    const arrowLen = span * arrowScale;
+
+    for (const { C, f, im } of pts) {
+      const en = horizontalEastNorth(upAxis, northKey, f);
+      const col = colorFromEastNorth(en.east, en.north);
+      const horiz = Math.hypot(en.east, en.north);
+      let dx = 0,
+        dy = 0;
+      if (horiz > 1e-12) {
+        dx = (en.east / horiz) * arrowLen;
+        dy = (en.north / horiz) * arrowLen;
+      }
+      const isHover = hoverIm === im;
+      const dotR = arrowLen * (isHover ? 0.1 : 0.08);
+      const lw = Math.max((isHover ? 0.85 : 0.5) / (zoom * baseScale), 0.15);
+      if (upAxis === "y") {
+        ctx.strokeStyle = col;
+        ctx.fillStyle = col;
+        ctx.lineWidth = lw;
+        ctx.beginPath();
+        ctx.arc(C[0], C[2], dotR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(C[0], C[2]);
+        ctx.lineTo(C[0] + dx, C[2] + dy);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = col;
+        ctx.fillStyle = col;
+        ctx.lineWidth = lw;
+        ctx.beginPath();
+        ctx.arc(C[0], C[1], dotR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(C[0], C[1]);
+        ctx.lineTo(C[0] + dx, C[1] + dy);
+        ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+
+    ctx.fillStyle = "#adb5bd";
+    ctx.font = "12px system-ui";
+    ctx.textAlign = "left";
+    const foot = [];
+    if (images.length > 0) foot.push(images.length + " images");
+    if (hasPts) {
+      const budget = points3dBudget;
+      const step = Math.max(1, Math.ceil(points3d.n / budget));
+      const drawn = Math.ceil(points3d.n / step);
+      if (points3dShow) {
+        foot.push(drawn + " / " + points3d.n + " points drawn");
+      } else {
+        foot.push(points3d.n + " points (hidden)");
+      }
+    }
+    ctx.fillText(foot.join(" · ") + " · drag to pan", 10, h - 10);
+    if (gridShow && !gridOk) {
+      ctx.fillStyle = "#ff8787";
+      ctx.fillText("Grid skipped (too many lines — increase spacing or lower density)", 10, h - 28);
+    }
+  }
+
+  function readFile(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = reject;
+      r.readAsText(file);
+    });
+  }
+
+  document.getElementById("cameras-file").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const text = await readFile(f);
+    cameras = parseCamerasTxt(text);
+    draw();
+  });
+
+  document.getElementById("images-file").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const text = await readFile(f);
+    images = parseImagesTxt(text);
+    panX = 0;
+    panY = 0;
+    hoverIm = null;
+    tooltip.style.display = "none";
+    draw();
+  });
+
+  document.getElementById("points3d-file").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const text = await readFile(f);
+    points3d = parsePoints3DTxt(text);
+    panX = 0;
+    panY = 0;
+    if (points3d.n === 0) points3d = null;
+    document.getElementById("points3d-show").checked = points3d !== null;
+    syncPoints3dControls();
+    draw();
+  });
+
+  document.getElementById("points3d-show").addEventListener("change", () => draw());
+  document.getElementById("points3d-budget").addEventListener("input", function () {
+    document.getElementById("points3d-budget-val").textContent = this.value;
+    draw();
+  });
+
+  function formatZoom(v) {
+    return v.toFixed(2);
+  }
+  function formatArrowScale(v) {
+    return v < 0.1 ? v.toFixed(3) : v.toFixed(2);
+  }
+
+  ["zoom", "arrow-scale"].forEach((id) => {
+    const el = document.getElementById(id);
+    const val = document.getElementById(id === "zoom" ? "zoom-val" : "arrow-val");
+    el.addEventListener("input", () => {
+      const v = parseFloat(el.value);
+      val.textContent = id === "zoom" ? formatZoom(v) : formatArrowScale(v);
+      draw();
+    });
+  });
+
+  document.getElementById("up-axis").addEventListener("change", () => {
+    const up = document.getElementById("up-axis").value;
+    const sel = document.getElementById("north-axis");
+    if (up === "z") {
+      sel.innerHTML =
+        '<option value="+y" selected>+Y</option><option value="-y">−Y</option><option value="+x">+X</option><option value="-x">−X</option>';
+    } else {
+      sel.innerHTML =
+        '<option value="+z" selected>+Z</option><option value="-z">−Z</option><option value="+x">+X</option><option value="-x">−X</option>';
+    }
+    draw();
+  });
+
+  document.getElementById("north-axis").addEventListener("change", () => draw());
+
+  document.getElementById("grid-show").addEventListener("change", () => draw());
+  document.getElementById("grid-spacing").addEventListener("input", () => draw());
+  document.getElementById("grid-spacing").addEventListener("change", () => draw());
+  document.getElementById("grid-spacing-up").addEventListener("click", () => bumpGridSpacing(GRID_SPACING_STEP));
+  document.getElementById("grid-spacing-down").addEventListener("click", () => bumpGridSpacing(-GRID_SPACING_STEP));
+  document.getElementById("grid-density").addEventListener("input", function () {
+    document.getElementById("grid-density-val").textContent = this.value;
+    draw();
+  });
+
+  canvas.addEventListener("mousemove", (e) => {
+    if (drag) {
+      tooltip.style.display = "none";
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const sx = e.clientX - rect.left;
+    const sy = e.clientY - rect.top;
+    const wld = screenToWorld(sx, sy);
+    if (!wld) {
+      hoverIm = null;
+      tooltip.style.display = "none";
+      draw();
+      return;
+    }
+    const span = lastDrawMetrics ? lastDrawMetrics.span : 1;
+    const pickR = span * 0.02;
+    const upAxis = getSettings().upAxis;
+    const near = findNearestImage(wld.wx, wld.wy, pickR, upAxis);
+    if (near !== hoverIm) {
+      hoverIm = near;
+      draw();
+    }
+    if (near) {
+      tooltip.style.display = "block";
+      tooltip.style.left = Math.min(e.clientX + 14, window.innerWidth - 370) + "px";
+      tooltip.style.top = Math.min(e.clientY + 14, window.innerHeight - 160) + "px";
+      tooltip.innerHTML = buildTooltipHtml(near);
+    } else {
+      tooltip.style.display = "none";
+    }
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    hoverIm = null;
+    tooltip.style.display = "none";
+    draw();
+  });
+
+  canvas.addEventListener("mousedown", (e) => {
+    hoverIm = null;
+    tooltip.style.display = "none";
+    drag = { x: e.clientX, y: e.clientY, panX, panY };
+    canvas.classList.add("dragging");
+    draw();
+  });
+  window.addEventListener("mouseup", () => {
+    drag = null;
+    canvas.classList.remove("dragging");
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!drag) return;
+    const { zoom } = getSettings();
+    const wrap = document.getElementById("canvas-wrap");
+    const spanRef = computeSceneSpanForPan();
+    const baseScale = (0.45 * Math.min(wrap.clientWidth, wrap.clientHeight)) / spanRef;
+    const dx = (e.clientX - drag.x) / (zoom * baseScale);
+    const dy = (e.clientY - drag.y) / (zoom * baseScale);
+    panX = drag.panX - dx;
+    panY = drag.panY + dy;
+    draw();
+  });
+
+  window.addEventListener("resize", resize);
+  syncPoints3dControls();
+  resize();
+})();
+  </script>
+</body>
+</html>
