@@ -463,33 +463,25 @@ def _camera_center_from_projection_matrix(P: Any) -> Any:
 
 def colmap_ground_transform_matrix() -> Any:
     """
-    World transform for easier top-down inspection:
-    - Input world:  X=east, Y=north, Z=up
-    - COLMAP world: X=west, Y=up,    Z=north
-    This keeps the ground plane flat at Y=0.
+    Single proper rotation (det +1) from MGI to COLMAP-style Y-up ground plane.
+
+    - Input world: X=east, Y=north, Z=up (MGI)
+    - COLMAP world: X=east, Y=−up (geodetic), Z=north
+
+    Previously the pipeline used a world Y reflection S_y to flip vertical sense
+    (instead of a 180° rotation); S_y has det −1 and mirrors the XZ ground plane.
+    This matrix is R_x180 ∘ T_base where T_base maps (east,north,up)→(east,up,−north):
+    the extra 180° about X makes the composite a proper rotation with the same
+    vertical sign as S_y ∘ T_base on the middle component, without mirroring.
     """
     import numpy as np
 
     return np.array(
         [
-            [-1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
             [0.0, 1.0, 0.0],
         ],
-        dtype=np.float64,
-    )
-
-
-def colmap_world_y_reflect_matrix() -> Any:
-    """
-    Reflect COLMAP world Y (multiply y by -1). Composed with poses as S @ R @ S and S @ t
-    keeps a proper rotation (valid COLMAP quaternion); focal length fy is negated so
-    pinhole reprojection matches the unchanged images.
-    """
-    import numpy as np
-
-    return np.array(
-        [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
 
@@ -531,12 +523,8 @@ def colmap_export_for_image(
     R = R @ T.T
     # COLMAP: world point X_w to camera X_c = R * X_w + t, and C = -R^T * t  →  t = -R * C
     t = -R @ C
-    S_y = colmap_world_y_reflect_matrix()
-    R = S_y @ R @ S_y
-    t = S_y @ t
 
     fx, fy = float(K[0, 0]), float(K[1, 1])
-    fy = -fy
     cx, cy = float(K[0, 2]), float(K[1, 2])
 
     t = t * float(colmap_scale)
@@ -600,8 +588,6 @@ def colmap_flat_grid_points3d_lines(
     import numpy as np
 
     T = colmap_ground_transform_matrix()
-    S_y = colmap_world_y_reflect_matrix()
-    TS = S_y @ T
     lines: List[str] = []
     pid = 1
     z0 = float(ground_z)
@@ -619,7 +605,7 @@ def colmap_flat_grid_points3d_lines(
                     return lines
                 x = aoi.min_x if nx == 1 else aoi.min_x + (dx * ix) / (nx - 1)
                 p = np.array([x - ox, y - oy, z_mgi - oz], dtype=np.float64)
-                w = float(colmap_scale) * (TS @ p)
+                w = float(colmap_scale) * (T @ p)
                 xw, yw, zw = float(w[0]), float(w[1]), float(w[2])
                 lines.append(f"{pid} {xw} {yw} {zw} 255 255 255 0.0")
                 pid += 1
@@ -955,11 +941,11 @@ def main() -> None:
             "z": colmap_origin_xyz[2],
         }
         manifest["colmap_world_axes"] = {
-            "x": "west",
-            "y": "down",
+            "x": "east",
+            "y": "negative geodetic up (COLMAP +Y is downward vs MGI Z)",
             "z": "north",
             "ground_plane": "y=0",
-            "note": "COLMAP Y is reflected vs geodetic up; PINHOLE fy is negated to match images.",
+            "note": "World transform is a proper rotation (no Y reflection); PINHOLE fy is not negated.",
         }
         manifest["colmap_grid_points_target"] = int(args.colmap_grid_points)
         manifest["colmap_grid_height_m"] = float(args.colmap_grid_height_m)
