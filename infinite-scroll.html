@@ -1459,7 +1459,7 @@ let currentEdgeTrimDisp = 0; // displayed trim in px to hide source-edge black b
 let autoRotate       = false; // when true, rotate so the marker is horizontally centred
 let pinMarkerCenter  = false; // when true, translate the image so the marker is at the exact viewport centre
 let overlayEnabled   = false; // when true, stack images as layers aligned at the marker
-let overlayMaxLayers = 3;    // max layers kept in the overlay stack
+let overlayMaxLayers = 1;    // max layers kept in the overlay stack
 let overlayBlurFixed = 0;   // px applied to every layer behind the main (top) layer
 let overlayBlurStep  = 0;    // px of blur added per layer further back (0 = no blur)
 let overlayNeighborCount = 0; // 0,4,8,… preloaded nearest images shown when reproject is on
@@ -3293,12 +3293,57 @@ let isPinching     = false;
 let pinchStartDist = 0;
 let pinchStartZoom = 1;
 let pinchLastRatio = 1;
+/** Overlay mode: { el, transform, transformOrigin }[] captured at pinch start so all stack layers zoom together. */
+let pinchOverlaySnapshots = null;
 
 function pinchDist(t) { return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
 
-/** Top tile stack layer (overlay stacks neighbors under #rotPadDiv — must not pinch the first child). */
+/** Top tile stack layer (single mode, or fallback when overlay stack has nothing to snapshot). */
 function getPinchLayerEl() {
   return document.getElementById('rotPadDiv');
+}
+
+function capturePinchOverlaySnapshots() {
+  pinchOverlaySnapshots = null;
+  if (!overlayEnabled || !viewerAreaEl) return;
+  const snaps = [];
+  for (const el of Array.from(viewerAreaEl.children)) {
+    if (!el._overlayImage) continue;
+    snaps.push({
+      el,
+      transform: el.style.transform || '',
+      transformOrigin: el.style.transformOrigin || '',
+    });
+  }
+  pinchOverlaySnapshots = snaps.length ? snaps : null;
+}
+
+/**
+ * Pinch preview for every oblique overlay layer (main, history, neighbor previews) plus the same
+ * viewport-centred scale so reprojected secondaries stay aligned with the top image.
+ * transform-origin must be 0 0 here: the main layer’s snapshot origin is often empty (→ 50% 50%),
+ * which would wrap our explicit translate/scale chain and make the top image drift during pinch.
+ */
+function applyPinchOverlayStackPreview(pinchRatio) {
+  if (!pinchOverlaySnapshots || !viewerAreaEl) return;
+  const cx = (viewerAreaEl.clientWidth || 800) / 2;
+  const cy = (viewerAreaEl.clientHeight || 600) / 2;
+  const pre = `translate(${cx}px, ${cy}px) scale(${pinchRatio}) translate(${-cx}px, ${-cy}px)`;
+  for (const s of pinchOverlaySnapshots) {
+    if (!s.el.isConnected) continue;
+    s.el.style.transformOrigin = '0 0';
+    s.el.style.transform = s.transform ? `${pre} ${s.transform}` : pre;
+  }
+}
+
+function restorePinchOverlaySnapshots() {
+  if (!pinchOverlaySnapshots) return;
+  for (const s of pinchOverlaySnapshots) {
+    if (!s.el.isConnected) continue;
+    s.el.style.transform = s.transform;
+    s.el.style.transformOrigin = s.transformOrigin;
+  }
+  pinchOverlaySnapshots = null;
 }
 
 /**
@@ -3331,6 +3376,22 @@ function clearOrthoUnderlayPinchPreview() {
   ortho.style.transform = '';
 }
 
+/** Match legacy pinch: ortho scale origin before the first touchmove (overlay only). */
+function primeOrthoUnderlayForPinchStart() {
+  const ortho = document.getElementById('orthoUnderlay');
+  if (!ortho || !overlayEnabled) return;
+  const pan = getPinchPanParts();
+  if (pan || markerVisualInPadPx()) {
+    const ox = ortho._orthoMarkerX;
+    const oy = ortho._orthoMarkerY;
+    if (typeof ox === 'number' && typeof oy === 'number' && Number.isFinite(ox) && Number.isFinite(oy)) {
+      ortho.style.transformOrigin = `${ox}px ${oy}px`;
+    }
+  } else {
+    ortho.style.transformOrigin = `${ortho.clientWidth / 2}px ${ortho.clientHeight / 2}px`;
+  }
+}
+
 function setViewerZoomTo(z) {
   viewerZoom = Math.max(VZOOM_STEPS[0], Math.min(VZOOM_STEPS[VZOOM_STEPS.length-1], z));
   const v = viewerZoom;
@@ -3355,23 +3416,16 @@ viewerAreaEl.addEventListener('touchstart', e => {
     pinchStartDist = Math.max(pinchDist(e.touches), 1e-6);
     pinchStartZoom = viewerZoom;
     pinchLastRatio = 1;
-    const el = getPinchLayerEl();
-    const ortho = document.getElementById('orthoUnderlay');
-    if (el) {
-      const pan = getPinchPanParts();
-      if (pan) {
-        el.style.transformOrigin = `${pan.vx}px ${pan.vy}px`;
-        if (ortho && overlayEnabled) {
-          const ox = ortho._orthoMarkerX;
-          const oy = ortho._orthoMarkerY;
-          if (typeof ox === 'number' && typeof oy === 'number' && Number.isFinite(ox) && Number.isFinite(oy)) {
-            ortho.style.transformOrigin = `${ox}px ${oy}px`;
-          }
-        }
-      } else {
-        const m = markerVisualInPadPx();
-        if (m) {
-          el.style.transformOrigin = `${m.vx}px ${m.vy}px`;
+    capturePinchOverlaySnapshots();
+    if (pinchOverlaySnapshots && pinchOverlaySnapshots.length) {
+      primeOrthoUnderlayForPinchStart();
+    } else {
+      const el = getPinchLayerEl();
+      const ortho = document.getElementById('orthoUnderlay');
+      if (el) {
+        const pan = getPinchPanParts();
+        if (pan) {
+          el.style.transformOrigin = `${pan.vx}px ${pan.vy}px`;
           if (ortho && overlayEnabled) {
             const ox = ortho._orthoMarkerX;
             const oy = ortho._orthoMarkerY;
@@ -3380,9 +3434,21 @@ viewerAreaEl.addEventListener('touchstart', e => {
             }
           }
         } else {
-          el.style.transformOrigin = `${viewerAreaEl.scrollLeft + viewerAreaEl.clientWidth / 2}px ${viewerAreaEl.scrollTop + viewerAreaEl.clientHeight / 2}px`;
-          if (ortho && overlayEnabled) {
-            ortho.style.transformOrigin = `${ortho.clientWidth / 2}px ${ortho.clientHeight / 2}px`;
+          const m = markerVisualInPadPx();
+          if (m) {
+            el.style.transformOrigin = `${m.vx}px ${m.vy}px`;
+            if (ortho && overlayEnabled) {
+              const ox = ortho._orthoMarkerX;
+              const oy = ortho._orthoMarkerY;
+              if (typeof ox === 'number' && typeof oy === 'number' && Number.isFinite(ox) && Number.isFinite(oy)) {
+                ortho.style.transformOrigin = `${ox}px ${oy}px`;
+              }
+            }
+          } else {
+            el.style.transformOrigin = `${viewerAreaEl.scrollLeft + viewerAreaEl.clientWidth / 2}px ${viewerAreaEl.scrollTop + viewerAreaEl.clientHeight / 2}px`;
+            if (ortho && overlayEnabled) {
+              ortho.style.transformOrigin = `${ortho.clientWidth / 2}px ${ortho.clientHeight / 2}px`;
+            }
           }
         }
       }
@@ -3397,13 +3463,17 @@ viewerAreaEl.addEventListener('touchmove', e => {
     applyDrag(e.touches[0].clientX, e.touches[0].clientY);
   } else if (e.touches.length === 2 && isPinching) {
     pinchLastRatio = pinchDist(e.touches) / pinchStartDist;
-    const el = getPinchLayerEl();
-    if (!el) return;
-    const pan = getPinchPanParts();
-    if (pan) {
-      el.style.transform = `translate(${pan.tx}px, ${pan.ty}px) scale(${pinchLastRatio})`;
+    if (overlayEnabled && pinchOverlaySnapshots) {
+      applyPinchOverlayStackPreview(pinchLastRatio);
     } else {
-      el.style.transform = `scale(${pinchLastRatio})`;
+      const el = getPinchLayerEl();
+      if (!el) return;
+      const pan = getPinchPanParts();
+      if (pan) {
+        el.style.transform = `translate(${pan.tx}px, ${pan.ty}px) scale(${pinchLastRatio})`;
+      } else {
+        el.style.transform = `scale(${pinchLastRatio})`;
+      }
     }
     setOrthoUnderlayPinchPreview(pinchLastRatio);
   }
@@ -3411,10 +3481,14 @@ viewerAreaEl.addEventListener('touchmove', e => {
 
 function commitPinchPreview() {
   if (!isPinching) return;
-  const el = getPinchLayerEl();
-  if (el) {
-    el.style.transform = '';
-    el.style.transformOrigin = '';
+  if (pinchOverlaySnapshots) {
+    restorePinchOverlaySnapshots();
+  } else {
+    const el = getPinchLayerEl();
+    if (el) {
+      el.style.transform = '';
+      el.style.transformOrigin = '';
+    }
   }
   clearOrthoUnderlayPinchPreview();
   setViewerZoomTo(pinchStartZoom * pinchLastRatio);
