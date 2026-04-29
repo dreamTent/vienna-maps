@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sources 2020 — camera positions (MGI)</title>
+  <!-- Serve repo root: python -m http.server 8081 then open /sources-2020-cameras-viewer.html -->
+  <style>
+    :root {
+      font-family: system-ui, Segoe UI, Roboto, sans-serif;
+      color: #e8e8e8;
+      background: #1a1b1e;
+    }
+    body {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    header {
+      padding: 10px 14px;
+      background: #25262b;
+      border-bottom: 1px solid #373a40;
+      flex-shrink: 0;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 20px;
+      align-items: center;
+    }
+    label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9rem;
+    }
+    input[type="range"] {
+      width: 140px;
+      vertical-align: middle;
+    }
+    .val {
+      min-width: 3.5em;
+      font-variant-numeric: tabular-nums;
+      color: #adb5bd;
+    }
+    #canvas-wrap {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+    canvas.dragging {
+      cursor: grabbing;
+    }
+    .legend {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      font-size: 0.85rem;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+    .hint {
+      margin-top: 6px;
+      font-size: 0.8rem;
+      color: #868e96;
+    }
+    #status {
+      font-size: 0.85rem;
+      color: #adb5bd;
+      margin-top: 6px;
+    }
+    #status.err {
+      color: #ff8787;
+    }
+    .grid-spacing-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .step-btn {
+      min-width: 1.75em;
+      padding: 2px 6px;
+      font-size: 1rem;
+      line-height: 1.2;
+      cursor: pointer;
+      background: #373a40;
+      border: 1px solid #495057;
+      color: #e9ecef;
+      border-radius: 4px;
+    }
+    .step-btn:hover {
+      background: #495057;
+    }
+    #tooltip {
+      position: fixed;
+      display: none;
+      pointer-events: none;
+      z-index: 10;
+      max-width: 320px;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.45;
+      background: rgba(37, 38, 43, 0.95);
+      border: 1px solid #495057;
+      border-radius: 6px;
+      color: #e9ecef;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Sources 2020 — oblique cameras</h1>
+    <p id="status">Loading…</p>
+    <div class="row">
+      <label>Zoom <input id="zoom" type="range" min="0.01" max="40" step="0.01" value="1" /><span class="val" id="zoom-val">1.00</span></label>
+      <label>Arrow scale <input id="arrow-scale" type="range" min="0.001" max="3" step="0.001" value="0.35" /><span class="val" id="arrow-val">0.35</span></label>
+      <label>Position / plot
+        <select id="position-mode" title="What to use for X/Y on the canvas">
+          <option value="proj_plan" selected>3D projection center — plan (E×N, m)</option>
+          <option value="ground">Ground footprint center (2D, m)</option>
+          <option value="proj_xz">3D projection center — east × height (m)</option>
+          <option value="proj_yz">3D projection center — north × height (m)</option>
+        </select>
+      </label>
+      <label title="Ground footprint mode: white line from footprint to projection-center (plan) for the hovered camera only">
+        <input id="link-footprint-proj" type="checkbox" disabled /> Footprint → camera (plan line)
+      </label>
+      <label><input id="grid-show" type="checkbox" /> Show grid</label>
+      <label>Grid spacing (world)
+        <span class="grid-spacing-wrap">
+          <button type="button" class="step-btn" id="grid-spacing-down" title="Subtract 1" aria-label="Decrease">−</button>
+          <input id="grid-spacing" type="text" value="100" inputmode="decimal" autocomplete="off" spellcheck="false" style="width:7.5em" />
+          <button type="button" class="step-btn" id="grid-spacing-up" title="Add 1" aria-label="Increase">+</button>
+        </span>
+      </label>
+      <label>Grid density <input id="grid-density" type="range" min="1" max="32" step="1" value="4" /><span class="val" id="grid-density-val">4</span></label>
+      <label>view-direction-angle
+        <select id="angle-sense" title="How the source measures the horizontal angle">
+          <option value="ccw" selected>CCW from north (−sin, cos)</option>
+          <option value="cw">CW from north (sin, cos)</option>
+        </select>
+      </label>
+      <label title="Fix systematic 90° mismatch in the dataset"><input id="dir-rotate-90cw" type="checkbox" checked /> +90° CW to headings</label>
+      <button type="button" class="step-btn" id="reload" title="Reload JSON from server">Reload</button>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:#4dabf7"></i> North</span>
+      <span><i class="dot" style="background:#51cf66"></i> East</span>
+      <span><i class="dot" style="background:#ff6b6b"></i> South</span>
+      <span><i class="dot" style="background:#9775fa"></i> West</span>
+    </div>
+    <p class="hint">
+      Loads <code>sources/2020/image.json</code> and tile JSON under <code>sources/2020/tiles/</code>.
+      <strong>3D mode (default):</strong> plot position from <code>projection-center</code> [E, N, Z] — the oblique camera station in MGI metres (plan view uses E×N).
+      <strong>Ground mode:</strong> <code>centerPointOnGround</code> only (footprint centre; can look more “grid-like” than real stations).
+      Headings use <code>view-direction-angle</code> in the horizontal plane, then optional <strong>+90° CW</strong>. Arrows are hidden in east×height / north×height plots (position only).
+      Serve the repo root: <code>python -m http.server 8081</code>. Drag to pan; hover for details.
+    </p>
+  </header>
+  <div id="canvas-wrap">
+    <canvas id="view"></canvas>
+  </div>
+  <div id="tooltip"></div>
+  <script>
+(function () {
+  const DATA_PREFIX = "sources/2020";
+  const canvas = document.getElementById("view");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const tooltip = document.getElementById("tooltip");
+
+  let cameras = [];
+  let panX = 0;
+  let panY = 0;
+  let drag = null;
+  let hoverCam = null;
+  let lastDrawMetrics = null;
+
+  /** θ in radians on the ground plane; ENU with east = +x, north = +y. */
+  function eastNorthFromAngle(thetaRad, sense) {
+    if (sense === "cw") {
+      return { east: Math.sin(thetaRad), north: Math.cos(thetaRad) };
+    }
+    return { east: -Math.sin(thetaRad), north: Math.cos(thetaRad) };
+  }
+
+  /** Rotate horizontal direction 90° clockwise in the E–N plane: (e,n) → (n, −e). */
+  function rotateHeading90CW(en) {
+    return { east: en.north, north: -en.east };
+  }
+
+  function colorFromEastNorth(east, north) {
+    const len = Math.hypot(east, north);
+    if (len < 1e-12) return "#888";
+    let deg = (Math.atan2(east, north) * 180) / Math.PI;
+    if (deg < 0) deg += 360;
+    if (deg >= 315 || deg < 45) return "#4dabf7";
+    if (deg < 135) return "#51cf66";
+    if (deg < 225) return "#ff6b6b";
+    return "#9775fa";
+  }
+
+  function parseTileJSON(data) {
+    const rows = data.images;
+    if (!rows || rows.length < 2) return [];
+    const header = rows[0];
+    const col = {};
+    header.forEach(function (name, i) {
+      col[name] = i;
+    });
+    if (col["name"] === undefined || col["view-direction-angle"] === undefined) return [];
+    const ci = col["camera-index"];
+    const vd = col["view-direction"];
+    const iGround = col["centerPointOnGround"];
+    const iProj = col["projection-center"];
+    const out = [];
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      const angRaw = row[col["view-direction-angle"]];
+      const a = typeof angRaw === "number" ? angRaw : parseFloat(angRaw);
+      if (!Number.isFinite(a)) continue;
+
+      let gx = NaN,
+        gy = NaN;
+      if (iGround !== undefined) {
+        const center = row[iGround];
+        if (center && center.length >= 2) {
+          gx = parseFloat(center[0]);
+          gy = parseFloat(center[1]);
+        }
+      }
+
+      let px = NaN,
+        py = NaN,
+        pz = NaN,
+        hasProj = false;
+      if (iProj !== undefined) {
+        const pc = row[iProj];
+        if (pc && pc.length >= 3) {
+          px = parseFloat(pc[0]);
+          py = parseFloat(pc[1]);
+          pz = parseFloat(pc[2]);
+          if (Number.isFinite(px) && Number.isFinite(py) && Number.isFinite(pz)) hasProj = true;
+        }
+      }
+
+      if (!hasProj && (!Number.isFinite(gx) || !Number.isFinite(gy))) continue;
+
+      out.push({
+        name: String(row[col["name"]]),
+        gx: gx,
+        gy: gy,
+        px: px,
+        py: py,
+        pz: pz,
+        hasProj: hasProj,
+        angle: a,
+        cameraIndex: ci !== undefined ? row[ci] : null,
+        viewDirection: vd !== undefined ? row[vd] : null,
+      });
+    }
+    return out;
+  }
+
+  function getPlot(c, positionMode) {
+    if (positionMode === "ground") {
+      if (!Number.isFinite(c.gx) || !Number.isFinite(c.gy)) return null;
+      return { a: c.gx, b: c.gy };
+    }
+    if (!c.hasProj) return null;
+    if (positionMode === "proj_plan") return { a: c.px, b: c.py };
+    if (positionMode === "proj_xz") return { a: c.px, b: c.pz };
+    if (positionMode === "proj_yz") return { a: c.py, b: c.pz };
+    return null;
+  }
+
+  function mergeCameraRecord(existing, incoming) {
+    if (!existing.hasProj && incoming.hasProj) return incoming;
+    return existing;
+  }
+
+  function tileUrl(tileId) {
+    const file = String(tileId).replace(/\//g, "_") + ".json";
+    return DATA_PREFIX + "/tiles/" + file;
+  }
+
+  async function loadAllCameras() {
+    statusEl.classList.remove("err");
+    statusEl.textContent = "Loading manifest…";
+    let manifest;
+    try {
+      const res = await fetch(DATA_PREFIX + "/image.json");
+      if (!res.ok) throw new Error(res.status + " " + res.statusText);
+      manifest = await res.json();
+    } catch (e) {
+      statusEl.classList.add("err");
+      statusEl.textContent =
+        "Failed to load " +
+        DATA_PREFIX +
+        "/image.json — use a local HTTP server from the repo root (python -m http.server 8081). " +
+        String(e.message || e);
+      cameras = [];
+      draw();
+      return;
+    }
+
+    const ids = manifest.availableTiles || [];
+    if (ids.length === 0) {
+      statusEl.textContent = "No tiles in manifest.";
+      cameras = [];
+      draw();
+      return;
+    }
+
+    statusEl.textContent = "Loading " + ids.length + " tile JSON files…";
+    const settled = await Promise.allSettled(ids.map((id) => fetch(tileUrl(id)).then((r) => r.json())));
+
+    const byName = new Map();
+    let failed = 0;
+    for (let i = 0; i < settled.length; i++) {
+      const s = settled[i];
+      if (s.status !== "fulfilled") {
+        failed++;
+        continue;
+      }
+      const parsed = parseTileJSON(s.value);
+      for (let j = 0; j < parsed.length; j++) {
+        const c = parsed[j];
+        if (!byName.has(c.name)) byName.set(c.name, c);
+        else byName.set(c.name, mergeCameraRecord(byName.get(c.name), c));
+      }
+    }
+
+    cameras = Array.from(byName.values());
+    panX = 0;
+    panY = 0;
+    let msg =
+      "Loaded " +
+      cameras.length +
+      " unique cameras from " +
+      (ids.length - failed) +
+      "/" +
+      ids.length +
+      " tiles (MGI ground plane).";
+    if (failed) msg += " " + failed + " tile request(s) failed.";
+    statusEl.textContent = msg;
+    draw();
+  }
+
+  const GRID_SPACING_STEP = 1;
+
+  function parseGridSpacingValue() {
+    const t = String(document.getElementById("grid-spacing").value).trim().replace(",", ".");
+    const v = parseFloat(t);
+    return Number.isFinite(v) && v > 0 ? v : 100;
+  }
+
+  function formatGridSpacingDisplay(v) {
+    v = Math.max(1e-15, Math.min(1e20, v));
+    const ax = Math.abs(v);
+    if (ax >= 1e7 || ax < 1e-4) return v.toExponential(4);
+    return String(Number.parseFloat(String(v.toPrecision(12))));
+  }
+
+  function bumpGridSpacing(delta) {
+    const el = document.getElementById("grid-spacing");
+    let v = parseGridSpacingValue();
+    v = v + delta;
+    el.value = formatGridSpacingDisplay(v);
+    draw();
+  }
+
+  function getSettings() {
+    return {
+      zoom: parseFloat(document.getElementById("zoom").value),
+      arrowScale: parseFloat(document.getElementById("arrow-scale").value),
+      gridShow: document.getElementById("grid-show").checked,
+      gridSpacing: parseGridSpacingValue(),
+      gridDensity: Math.max(1, parseInt(document.getElementById("grid-density").value, 10) || 1),
+      angleSense: document.getElementById("angle-sense").value === "cw" ? "cw" : "ccw",
+      positionMode: document.getElementById("position-mode").value,
+      dirRotate90CW: document.getElementById("dir-rotate-90cw").checked,
+      linkFootprintProj: document.getElementById("link-footprint-proj").checked,
+    };
+  }
+
+  function drawGridWorld(ctx, gMinA, gMaxA, gMinB, gMaxB, spacing, density, zoom, baseScale) {
+    const major = Math.max(spacing, 1e-20);
+    const d = Math.max(1, density);
+    const minor = major / d;
+    const extA = gMaxA - gMinA;
+    const extB = gMaxB - gMinB;
+    const maxLinesPerAxis = 550;
+    if (!isFinite(minor) || minor <= 0 || extA / minor > maxLinesPerAxis || extB / minor > maxLinesPerAxis) {
+      return false;
+    }
+    const px = 1 / (zoom * baseScale);
+    const pad = minor * 2;
+    const iStart = Math.floor((gMinA - pad) / minor);
+    const iEnd = Math.ceil((gMaxA + pad) / minor);
+    const jStart = Math.floor((gMinB - pad) / minor);
+    const jEnd = Math.ceil((gMaxB + pad) / minor);
+    const mod = function (n, m) {
+      return ((n % m) + m) % m;
+    };
+    for (let i = iStart; i <= iEnd; i++) {
+      const x = i * minor;
+      const isMajor = mod(i, d) === 0;
+      ctx.beginPath();
+      ctx.moveTo(x, gMinB - pad);
+      ctx.lineTo(x, gMaxB + pad);
+      ctx.strokeStyle = isMajor ? "#3d4149" : "#2c2e33";
+      ctx.lineWidth = isMajor ? px * 1.1 : px * 0.65;
+      ctx.stroke();
+    }
+    for (let j = jStart; j <= jEnd; j++) {
+      const y = j * minor;
+      const isMajor = mod(j, d) === 0;
+      ctx.beginPath();
+      ctx.moveTo(gMinA - pad, y);
+      ctx.lineTo(gMaxA + pad, y);
+      ctx.strokeStyle = isMajor ? "#3d4149" : "#2c2e33";
+      ctx.lineWidth = isMajor ? px * 1.1 : px * 0.65;
+      ctx.stroke();
+    }
+    return true;
+  }
+
+  function computeBounds(positionMode) {
+    let minA = Infinity,
+      maxA = -Infinity,
+      minB = Infinity,
+      maxB = -Infinity;
+    let any = false;
+    for (let i = 0; i < cameras.length; i++) {
+      const p = getPlot(cameras[i], positionMode);
+      if (!p) continue;
+      any = true;
+      minA = Math.min(minA, p.a);
+      maxA = Math.max(maxA, p.a);
+      minB = Math.min(minB, p.b);
+      maxB = Math.max(maxB, p.b);
+    }
+    if (!any) return null;
+    return { minA, maxA, minB, maxB };
+  }
+
+  function resize() {
+    const wrap = document.getElementById("canvas-wrap");
+    const dpr = window.devicePixelRatio || 1;
+    const w = wrap.clientWidth;
+    const h = wrap.clientHeight;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+
+  function draw() {
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    const {
+      zoom,
+      arrowScale,
+      gridShow,
+      gridSpacing,
+      gridDensity,
+      angleSense,
+      positionMode,
+      dirRotate90CW,
+      linkFootprintProj,
+    } = getSettings();
+
+    ctx.fillStyle = "#1a1b1e";
+    ctx.fillRect(0, 0, w, h);
+
+    if (cameras.length === 0) {
+      ctx.fillStyle = "#868e96";
+      ctx.font = "14px system-ui";
+      ctx.fillText("No camera data.", 20, 40);
+      lastDrawMetrics = null;
+      return;
+    }
+
+    const b = computeBounds(positionMode);
+    if (!b) {
+      ctx.fillStyle = "#868e96";
+      ctx.font = "14px system-ui";
+      ctx.fillText("No cameras have coordinates for this plot mode (e.g. missing projection-center).", 20, 40);
+      lastDrawMetrics = null;
+      return;
+    }
+    const cx = (b.minA + b.maxA) / 2 + panX;
+    const cy = (b.minB + b.maxB) / 2 + panY;
+    const span = Math.max(b.maxA - b.minA, b.maxB - b.minB, 1e-6);
+    const baseScale = (0.45 * Math.min(w, h)) / span;
+
+    const showArrows = positionMode === "ground" || positionMode === "proj_plan";
+
+    lastDrawMetrics = { w, h, zoom, baseScale, cx, cy, span, positionMode };
+
+    ctx.save();
+    ctx.translate(w / 2, h / 2);
+    ctx.scale(zoom, zoom);
+    ctx.scale(baseScale, -baseScale);
+    ctx.translate(-cx, -cy);
+
+    const halfW = w / (2 * zoom * baseScale);
+    const halfH = h / (2 * zoom * baseScale);
+    const visMinA = cx - halfW;
+    const visMaxA = cx + halfW;
+    const visMinB = cy - halfH;
+    const visMaxB = cy + halfH;
+
+    let gridOk = true;
+    if (gridShow) {
+      gridOk = drawGridWorld(ctx, visMinA, visMaxA, visMinB, visMaxB, gridSpacing, gridDensity, zoom, baseScale);
+    }
+
+    const pad = span * 0.5;
+    ctx.strokeStyle = "#373a40";
+    ctx.lineWidth = Math.max(1 / (zoom * baseScale), 0.5);
+    ctx.beginPath();
+    ctx.moveTo(b.minA - pad, b.minB - pad);
+    ctx.lineTo(b.maxA + pad, b.minB - pad);
+    ctx.moveTo(b.minA - pad, b.minB - pad);
+    ctx.lineTo(b.minA - pad, b.maxB + pad);
+    ctx.stroke();
+
+    if (positionMode === "ground" && linkFootprintProj && hoverCam) {
+      const c = hoverCam;
+      if (
+        c.hasProj &&
+        Number.isFinite(c.gx) &&
+        Number.isFinite(c.gy) &&
+        Number.isFinite(c.px) &&
+        Number.isFinite(c.py)
+      ) {
+        ctx.strokeStyle = "#ffffff";
+        ctx.globalAlpha = 0.9;
+        ctx.lineWidth = Math.max(1.1 / (zoom * baseScale), 0.18);
+        ctx.beginPath();
+        ctx.moveTo(c.gx, c.gy);
+        ctx.lineTo(c.px, c.py);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    const arrowLen = span * arrowScale;
+
+    for (let i = 0; i < cameras.length; i++) {
+      const c = cameras[i];
+      const pos = getPlot(c, positionMode);
+      if (!pos) continue;
+
+      let en = eastNorthFromAngle(c.angle, angleSense);
+      if (dirRotate90CW) en = rotateHeading90CW(en);
+      const east = en.east;
+      const north = en.north;
+      const col = colorFromEastNorth(east, north);
+      const horiz = Math.hypot(east, north);
+      let dx = 0,
+        dy = 0;
+      if (showArrows && horiz > 1e-12) {
+        dx = (east / horiz) * arrowLen;
+        dy = (north / horiz) * arrowLen;
+      }
+      const isHover = hoverCam === c;
+      ctx.strokeStyle = col;
+      ctx.fillStyle = col;
+      ctx.lineWidth = Math.max((isHover ? 1.2 : 0.65) / (zoom * baseScale), 0.12);
+      ctx.beginPath();
+      ctx.arc(pos.a, pos.b, arrowLen * (isHover ? 0.1 : 0.08), 0, Math.PI * 2);
+      ctx.fill();
+      if (showArrows) {
+        ctx.beginPath();
+        ctx.moveTo(pos.a, pos.b);
+        ctx.lineTo(pos.a + dx, pos.b + dy);
+        ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+
+    ctx.fillStyle = "#adb5bd";
+    ctx.font = "12px system-ui";
+    ctx.textAlign = "left";
+    let foot =
+      cameras.length +
+      " cameras · " +
+      (showArrows ? "arrows on map plane" : "positions only") +
+      " · drag to pan";
+    ctx.fillText(foot, 10, h - 10);
+    if (gridShow && !gridOk) {
+      ctx.fillStyle = "#ff8787";
+      ctx.fillText("Grid skipped (too many lines — increase spacing or lower density)", 10, h - 28);
+    }
+  }
+
+  function screenToWorld(sx, sy) {
+    if (!lastDrawMetrics || cameras.length === 0) return null;
+    const m = lastDrawMetrics;
+    const wx = (sx - m.w / 2) / (m.zoom * m.baseScale) + m.cx;
+    const wy = -(sy - m.h / 2) / (m.zoom * m.baseScale) + m.cy;
+    return { wx, wy };
+  }
+
+  function findNearest(wx, wy, maxDist, positionMode) {
+    let best = null;
+    let bestD = maxDist * maxDist;
+    for (let i = 0; i < cameras.length; i++) {
+      const c = cameras[i];
+      const p = getPlot(c, positionMode);
+      if (!p) continue;
+      const ddx = p.a - wx;
+      const ddy = p.b - wy;
+      const d2 = ddx * ddx + ddy * ddy;
+      if (d2 < bestD) {
+        bestD = d2;
+        best = c;
+      }
+    }
+    return best;
+  }
+
+  canvas.addEventListener("mousemove", function (e) {
+    if (drag) {
+      tooltip.style.display = "none";
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const sx = e.clientX - rect.left;
+    const sy = e.clientY - rect.top;
+    const wld = screenToWorld(sx, sy);
+    if (!wld) {
+      hoverCam = null;
+      tooltip.style.display = "none";
+      draw();
+      return;
+    }
+    const span = lastDrawMetrics ? lastDrawMetrics.span : 1;
+    const pickR = span * 0.02;
+    const positionMode = getSettings().positionMode;
+    const near = findNearest(wld.wx, wld.wy, pickR, positionMode);
+    if (near !== hoverCam) {
+      hoverCam = near;
+      draw();
+    }
+    if (near) {
+      const deg = (near.angle * 180) / Math.PI;
+      tooltip.style.display = "block";
+      tooltip.style.left = Math.min(e.clientX + 14, window.innerWidth - 330) + "px";
+      tooltip.style.top = Math.min(e.clientY + 14, window.innerHeight - 120) + "px";
+      tooltip.innerHTML =
+        "<strong>" +
+        escapeHtml(near.name) +
+        "</strong><br/>" +
+        "ground E,N: " +
+        (Number.isFinite(near.gx) && Number.isFinite(near.gy) ? fmt(near.gx) + ", " + fmt(near.gy) : "—") +
+        "<br/>" +
+        "projection-center E,N,Z: " +
+        (near.hasProj ? fmt(near.px) + ", " + fmt(near.py) + ", " + fmt(near.pz) : "—") +
+        "<br/>" +
+        "view-direction-angle: " +
+        fmt(near.angle) +
+        " rad (" +
+        deg.toFixed(1) +
+        "°)<br/>" +
+        "camera-index: " +
+        escapeHtml(String(near.cameraIndex)) +
+        " &nbsp; view-direction: " +
+        escapeHtml(String(near.viewDirection));
+    } else {
+      tooltip.style.display = "none";
+    }
+  });
+
+  canvas.addEventListener("mouseleave", function () {
+    hoverCam = null;
+    tooltip.style.display = "none";
+    draw();
+  });
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function fmt(v) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return String(v);
+    const ax = Math.abs(v);
+    if (ax >= 1e6 || (ax > 0 && ax < 1e-3)) return v.toExponential(5);
+    return v.toFixed(3);
+  }
+
+  canvas.addEventListener(
+    "wheel",
+    function (e) {
+      e.preventDefault();
+      if (!lastDrawMetrics || cameras.length === 0) return;
+      const rect = canvas.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const wld = screenToWorld(sx, sy);
+      if (!wld) return;
+
+      const el = document.getElementById("zoom");
+      const minZ = parseFloat(el.min);
+      const maxZ = parseFloat(el.max);
+      let z = parseFloat(el.value);
+      z *= Math.exp(-e.deltaY * 0.002);
+      if (z < minZ) z = minZ;
+      if (z > maxZ) z = maxZ;
+      if (Math.abs(z - parseFloat(el.value)) < 1e-8) return;
+
+      const m = lastDrawMetrics;
+      const w = m.w;
+      const h = m.h;
+      const bs = m.baseScale;
+      const cxNew = wld.wx - (sx - w / 2) / (z * bs);
+      const cyNew = wld.wy + (sy - h / 2) / (z * bs);
+
+      const positionMode = getSettings().positionMode;
+      const b = computeBounds(positionMode);
+      if (!b) return;
+      panX = cxNew - (b.minA + b.maxA) / 2;
+      panY = cyNew - (b.minB + b.maxB) / 2;
+
+      el.value = String(z);
+      document.getElementById("zoom-val").textContent = formatZoom(z);
+      draw();
+    },
+    { passive: false }
+  );
+
+  canvas.addEventListener("mousedown", function (e) {
+    hoverCam = null;
+    tooltip.style.display = "none";
+    drag = { x: e.clientX, y: e.clientY, panX: panX, panY: panY };
+    canvas.classList.add("dragging");
+    draw();
+  });
+  window.addEventListener("mouseup", function () {
+    drag = null;
+    canvas.classList.remove("dragging");
+  });
+  window.addEventListener("mousemove", function (e) {
+    if (!drag) return;
+    const { zoom, positionMode } = getSettings();
+    const wrap = document.getElementById("canvas-wrap");
+    if (cameras.length === 0) return;
+    const b = computeBounds(positionMode);
+    if (!b) return;
+    const spanRef = Math.max(b.maxA - b.minA, b.maxB - b.minB, 1e-6);
+    const baseScale = (0.45 * Math.min(wrap.clientWidth, wrap.clientHeight)) / spanRef;
+    const dx = (e.clientX - drag.x) / (zoom * baseScale);
+    const dy = (e.clientY - drag.y) / (zoom * baseScale);
+    panX = drag.panX - dx;
+    panY = drag.panY + dy;
+    draw();
+  });
+
+  function formatZoom(v) {
+    return v.toFixed(2);
+  }
+  function formatArrowScale(v) {
+    return v < 0.1 ? v.toFixed(3) : v.toFixed(2);
+  }
+
+  ["zoom", "arrow-scale"].forEach(function (id) {
+    const el = document.getElementById(id);
+    const val = document.getElementById(id === "zoom" ? "zoom-val" : "arrow-val");
+    el.addEventListener("input", function () {
+      const v = parseFloat(el.value);
+      val.textContent = id === "zoom" ? formatZoom(v) : formatArrowScale(v);
+      draw();
+    });
+  });
+
+  document.getElementById("grid-show").addEventListener("change", function () {
+    draw();
+  });
+  document.getElementById("grid-spacing").addEventListener("input", function () {
+    draw();
+  });
+  document.getElementById("grid-spacing").addEventListener("change", function () {
+    draw();
+  });
+  document.getElementById("grid-spacing-up").addEventListener("click", function () {
+    bumpGridSpacing(GRID_SPACING_STEP);
+  });
+  document.getElementById("grid-spacing-down").addEventListener("click", function () {
+    bumpGridSpacing(-GRID_SPACING_STEP);
+  });
+  document.getElementById("grid-density").addEventListener("input", function () {
+    document.getElementById("grid-density-val").textContent = this.value;
+    draw();
+  });
+  document.getElementById("reload").addEventListener("click", function () {
+    loadAllCameras();
+  });
+  document.getElementById("angle-sense").addEventListener("change", function () {
+    draw();
+  });
+  document.getElementById("position-mode").addEventListener("change", function () {
+    const ground = document.getElementById("position-mode").value === "ground";
+    const cb = document.getElementById("link-footprint-proj");
+    cb.disabled = !ground;
+    if (!ground) cb.checked = false;
+    panX = 0;
+    panY = 0;
+    draw();
+  });
+  document.getElementById("link-footprint-proj").addEventListener("change", function () {
+    draw();
+  });
+  document.getElementById("dir-rotate-90cw").addEventListener("change", function () {
+    draw();
+  });
+
+  window.addEventListener("resize", resize);
+  resize();
+  (function syncFootprintLinkUI() {
+    const ground = document.getElementById("position-mode").value === "ground";
+    document.getElementById("link-footprint-proj").disabled = !ground;
+  })();
+  loadAllCameras();
+})();
+  </script>
+</body>
+</html>
