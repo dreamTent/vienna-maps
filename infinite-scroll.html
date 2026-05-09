@@ -82,8 +82,6 @@
     .height-ctrl input[type=number] { width: 58px; padding: 2px 6px; font-size: .75rem; }
 
     .viewer-area { flex: 1; overflow: auto; background: #080a0e; cursor: grab; position: relative; }
-    /* Dim main oblique only when ortho is the only thing behind it — if reprojected neighbors sit under #rotPadDiv, dimming looks like a double image */
-    .viewer-area.has-ortho-dim-main #rotPadDiv .tile-canvas-wrap { opacity: 0.78; }
     /* Shift+O: hide nadir ortho; restore full opacity on main oblique while hidden */
     .viewer-area.ortho-bg-hidden #orthoUnderlay,
     .viewer-area.ortho-bg-hidden #orthoBaseLayer { visibility: hidden !important; }
@@ -92,7 +90,25 @@
     .tile-row { display: flex; }
     .tile-row img { display: block; flex-shrink: 0; /*background: #111;*/ }
 
-    /* visual zoom controls */
+    /* Ortho union main warp: avoid stacking filters with matrix3d + rotate (extra softening). */
+    .ortho-union-main-warp {
+      filter: none !important;
+      isolation: isolate;
+      /* Hint GPU layer for the warp itself (Firefox + Chrome composite differently vs flat stacking). */
+      will-change: transform;
+    }
+    /* Rasterize tile JPEGs + rotate once before the homography unevenly scales them (helps upper-field softness). */
+    .viewer-area.has-ortho .ortho-union-tile-stack {
+      transform: translate3d(0, 0, 0);
+      isolation: isolate;
+    }
+    .ortho-union-tile-warp {
+      contain: paint;
+      overflow: hidden;
+      pointer-events: none;
+      transform-origin: 0 0;
+      will-change: transform;
+    }
     .vzoom-ctrl { display: flex; align-items: center; gap: 3px; }
     .vzoom-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 4px; width: 22px; height: 22px; font-size: 1rem; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
     .vzoom-btn:hover { border-color: var(--accent); color: var(--accent2); }
@@ -1510,6 +1526,7 @@ const IMAGE_EDGE_TRIM_SOURCE_PX = 6;
 let orthoTilesData = null;
 /** Offset from ortho union wrapper origin to rotClip top-left (single mode with ortho only). */
 let orthoContentOffsetX = 0, orthoContentOffsetY = 0;
+let orthoUnionMarkerX = null, orthoUnionMarkerY = null;
 
 let imageSwitchGen = 0;
 
@@ -1523,15 +1540,15 @@ function selectImage(idx, el) {
   currentZoom = Math.min(currentZoom, maxZoom);
 
   const img = currentImage;
-  const z = getTileZoomIndex(img);
+  const zUi = getTileZoomIndex(img);
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForAllTilesDecoded(img, z).then(() => {
+    waitForAllTilesDecoded(img, zUi).then(() => {
       if (gen !== imageSwitchGen) return;
-      openViewer(img, z);
+      openViewer(img, zUi);
     });
     return;
   }
-  openViewer(img, z);
+  openViewer(img, zUi);
 }
 
 function openViewer(img, zoom) {
@@ -1842,6 +1859,9 @@ function onOverlayReprojectChange() {
 function markerScrollContentPx() {
   const o = markerVisualInPadPx();
   if (!o) return null;
+  if (document.getElementById('orthoUnionWrap') && orthoUnionMarkerX != null && orthoUnionMarkerY != null) {
+    return { vx: orthoUnionMarkerX, vy: orthoUnionMarkerY };
+  }
   const warpEl = document.getElementById('orthoUnionMainWarp');
   if (warpEl && warpEl._clipToUnionH) {
     const u = applyHomography2D(warpEl._clipToUnionH, o.vx, o.vy);
@@ -2208,6 +2228,7 @@ function syncOrthoDimMainClass() {
 function wrapInnerHtmlWithOrthoIfNeeded(innerHtml, img, rotDeg, contentW, contentH) {
   orthoContentOffsetX = 0;
   orthoContentOffsetY = 0;
+  orthoUnionMarkerX = orthoUnionMarkerY = null;
   const layout = computeOrthoLayout(img, rotDeg, contentW, contentH);
   const area = document.getElementById('viewerArea');
   if (!layout) {
@@ -2244,101 +2265,107 @@ function orthoUnionNeighborImagesForComposite(mainImg) {
  * One neighbor camera warped into the main-view ortho union (ground plane Z),
  * same homography idea as overlay “Reproject to main” but with destination quads in union space.
  */
-function buildOrthoUnionNeighborSlot(neighborImg, zoom, layout, zIndex) {
+function cssPx(n) {
+  return Number.isFinite(n) ? Number(n).toFixed(3).replace(/\.?0+$/, '') : '0';
+}
+
+function buildOrthoUnionWarpedTileLayer(img, zoom, layout, zIndex, className) {
+  const maxZ = Math.max(0, (img.tileResolution?.length || 1) - 1);
+  const zTiles = Math.min(Math.max(0, zoom), maxZ);
   const area = document.getElementById('viewerArea');
   const viewW = area.clientWidth || 800;
   const viewH = area.clientHeight || 600;
   const hVal = document.getElementById('heightNum').value;
   const Z = hVal === '' ? 0 : Number(hVal);
 
-  const baseFit = Math.min(viewW / neighborImg.width, viewH / neighborImg.height);
+  const baseFit = Math.min(viewW / img.width, viewH / img.height);
   const scale = baseFit * viewerZoom;
-  const { cols, rows } = tileDims(neighborImg.width, neighborImg.height, zoom, neighborImg.tileResolution);
-  const res = neighborImg.tileResolution[zoom];
-  const dispTileW = Math.max(1, Math.round(tileSize * res * scale));
-  const edgeTrimDisp = edgeTrimDisplayPx(scale);
-  const topBlack = Math.ceil((rows * tileSize * res - neighborImg.height) * scale);
-  const contentW = Math.floor(neighborImg.width * scale);
-  const contentH = Math.floor(neighborImg.height * scale);
-  const clipW = Math.max(1, contentW - edgeTrimDisp);
-  const clipH = Math.max(1, contentH - edgeTrimDisp);
-  const rotDeg = computeAutoRotDegForImage(neighborImg);
-  const cw = Math.round(neighborImg.width * scale);
-  const ch = Math.round(neighborImg.height * scale);
-
-  const Wn = neighborImg.width, Hn = neighborImg.height;
-  const nc = [[0, 0], [Wn, 0], [Wn, Hn], [0, Hn]];
-  const srcPad = [];
-  const dstUnion = [];
-  for (let k = 0; k < 4; k++) {
-    const g = pixelToGroundMgi(neighborImg, nc[k][0], nc[k][1], Z);
-    if (!g) return '';
-    const u = layout.unionPxFromMgi(g[0], g[1]);
-    if (!u) return '';
-    srcPad.push(overlayNativeToPadXY(nc[k][0], nc[k][1], scale, rotDeg, cw, ch));
-    dstUnion.push([u.x, u.y]);
-  }
-  const H = homographyFrom4Points2D(srcPad, dstUnion);
-  if (!H) return '';
-  const mat3d = homography3x3ToMatrix3dString(H);
+  const { cols, rows } = tileDims(img.width, img.height, zTiles, img.tileResolution);
+  const res = img.tileResolution[zTiles];
+  const tileSpanSrc = tileSize * res;
+  const tileCssW = tileSpanSrc * scale;
+  const extraTopSrc = rows * tileSpanSrc - img.height;
+  const trim = IMAGE_EDGE_TRIM_SOURCE_PX;
+  const visibleMaxX = Math.max(0, img.width - trim);
+  const visibleMinY = Math.min(img.height, trim);
 
   let tilesHtml = '';
   for (let y = rows - 1; y >= 0; y--) {
-    tilesHtml += '<div class="tile-row">';
     for (let x = 0; x < cols; x++) {
-      tilesHtml += `<img src="${neighborImg.remoteBaseUrl}/${neighborImg.name}/${zoom}/${x}/${y}.jpg"
-                        width="${dispTileW}" height="${dispTileW}"
-                        loading="lazy" onerror="this.style.opacity='.1'"
-                        title="z${zoom}/${x}/${y}">`;
-    }
-    tilesHtml += '</div>';
-  }
-  const rotStyle = rotDeg !== 0
-    ? `transform:rotate(${rotDeg}deg);transform-origin:50% 50%;`
-    : '';
+      const tileX0 = x * tileSpanSrc;
+      const tileY0 = (rows - 1 - y) * tileSpanSrc - extraTopSrc;
+      const x0 = Math.max(0, tileX0);
+      const y0 = Math.max(visibleMinY, tileY0);
+      const x1 = Math.min(visibleMaxX, tileX0 + tileSpanSrc);
+      const y1 = Math.min(img.height, tileY0 + tileSpanSrc);
+      if (x1 <= x0 || y1 <= y0) continue;
 
-  return `<div class="ortho-union-neighbor" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;z-index:${zIndex};pointer-events:none;opacity:0.94;">
-    <div style="transform-origin:0 0;transform:${mat3d};">
-      <div style="position:relative;width:${clipW}px;height:${clipH}px;overflow:hidden;${rotStyle}">
-        <div style="position:absolute;top:-${topBlack + edgeTrimDisp}px;left:0;">
-          <div class="tile-canvas-wrap">${tilesHtml}</div>
-        </div>
-      </div>
-    </div>
-  </div>`;
+      const dst = [];
+      const corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+      let ok = true;
+      for (const [px, py] of corners) {
+        const g = pixelToGroundMgi(img, px, py, Z);
+        const u = g ? layout.unionPxFromMgi(g[0], g[1]) : null;
+        if (!u) { ok = false; break; }
+        dst.push([u.x, u.y]);
+      }
+      if (!ok) continue;
+
+      const cropX = (x0 - tileX0) * scale;
+      const cropY = (y0 - tileY0) * scale;
+      const cropW = (x1 - x0) * scale;
+      const cropH = (y1 - y0) * scale;
+      const H = homographyFrom4Points2D(
+        [[0, 0], [cropW, 0], [cropW, cropH], [0, cropH]],
+        dst,
+      );
+      if (!H) continue;
+      const mat3d = homography3x3ToMatrix3dString(H);
+
+      tilesHtml += `<div class="ortho-union-tile-warp" style="position:absolute;left:0;top:0;width:${cssPx(cropW)}px;height:${cssPx(cropH)}px;transform:${mat3d};">
+        <img src="${img.remoteBaseUrl}/${img.name}/${zTiles}/${x}/${y}.jpg"
+             width="${cssPx(tileCssW)}" height="${cssPx(tileCssW)}"
+             draggable="false" loading="lazy" decoding="async" onerror="this.style.opacity='.1'"
+             title="z${zTiles}/${x}/${y}"
+             style="position:absolute;left:-${cssPx(cropX)}px;top:-${cssPx(cropY)}px;display:block;width:${cssPx(tileCssW)}px;height:${cssPx(tileCssW)}px;max-width:none;">`;
+      tilesHtml += '</div>';
+    }
+  }
+  if (!tilesHtml) return '';
+  return `<div class="${className}" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;z-index:${zIndex};pointer-events:none;">${tilesHtml}</div>`;
+}
+
+function buildOrthoUnionNeighborSlot(neighborImg, zoom, layout, zIndex) {
+  return buildOrthoUnionWarpedTileLayer(neighborImg, zoom, layout, zIndex, 'ortho-union-neighbor');
 }
 
 /** Homography-warp main oblique tiles into affine-ground union (removes perspective vs union depth). */
-function buildOrthoUnionMainHomographyWarp(innerHtml, img, rotDeg, layout, clipW, clipH, scale) {
+function buildOrthoUnionMainHomographyWarp(img, zoom, layout) {
   const hVal = document.getElementById('heightNum').value;
   const Z = hVal === '' ? 0 : Number(hVal);
-  const cw = Math.round(img.width * scale);
-  const ch = Math.round(img.height * scale);
   const W = img.width;
   const H = img.height;
   const nc = [[0, 0], [W, 0], [W, H], [0, H]];
-  const srcPad = [];
   const dstUnion = [];
   for (let k = 0; k < 4; k++) {
     const g = pixelToGroundMgi(img, nc[k][0], nc[k][1], Z);
-    if (!g) return { html: innerHtml, H: null };
+    if (!g) return { html: '', H: null };
     const u = layout.unionPxFromMgi(g[0], g[1]);
-    if (!u) return { html: innerHtml, H: null };
-    srcPad.push(overlayNativeToPadXY(nc[k][0], nc[k][1], scale, rotDeg, cw, ch));
+    if (!u) return { html: '', H: null };
     dstUnion.push([u.x, u.y]);
   }
-  const Hmat = homographyFrom4Points2D(srcPad, dstUnion);
-  if (!Hmat) return { html: innerHtml, H: null };
-  const mat3d = homography3x3ToMatrix3dString(Hmat);
+  const Hmat = homographyFrom4Points2D(nc, dstUnion);
+  if (!Hmat) return { html: '', H: null };
+  const tiles = buildOrthoUnionWarpedTileLayer(img, zoom, layout, 1, 'ortho-union-main-tiles');
   const html =
-    `<div id="orthoUnionMainWarp" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;transform-origin:0 0;transform:${mat3d};">${innerHtml}</div>`;
+    `${tiles}<svg id="dotOverlay" data-ortho-union="1" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;overflow:visible;pointer-events:none;z-index:2;"></svg>`;
   return { html, H: Hmat };
 }
 
 /**
  * Scrollable union: nadir ortho previews + optional reprojected neighbors + main oblique (marker-aligned).
  */
-function renderOrthoUnionCompositeView(area, img, zoom, rotDeg, contentW, contentH, clipW, clipH, innerHtml, padX, padY, scale) {
+function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, contentH, clipW, clipH, innerHtml, padX, padY, scale, tileZoomIdx) {
   removeOrthoUnderlay();
   orthoContentOffsetX = orthoContentOffsetY = 0;
 
@@ -2352,31 +2379,38 @@ function renderOrthoUnionCompositeView(area, img, zoom, rotDeg, contentW, conten
 
   const layout = computeOrthoLayout(img, rotDeg, contentW, contentH, sorted, true);
   if (!layout) {
+    orthoUnionMarkerX = orthoUnionMarkerY = null;
     orthographicUnionViewEnabled = false;
     const btn = document.getElementById('orthoUnionViewBtn');
     if (btn) btn.style.opacity = '.5';
-    renderTiles(img, zoom);
+    renderTiles(img, zoomUi);
     return;
   }
 
   area.classList.add('has-ortho');
 
   const warp = layout.affineGroundUnion
-    ? buildOrthoUnionMainHomographyWarp(innerHtml, img, rotDeg, layout, clipW, clipH, scale)
+    ? buildOrthoUnionMainHomographyWarp(img, tileZoomIdx, layout)
     : { html: innerHtml, H: null };
+  if (layout.affineGroundUnion && !warp.H) {
+    warp.html = innerHtml;
+  }
 
   if (warp.H) {
     orthoContentOffsetX = orthoContentOffsetY = 0;
+    orthoUnionMarkerX = layout.orthoMarkerX;
+    orthoUnionMarkerY = layout.orthoMarkerY;
   } else {
     orthoContentOffsetX = layout.obliqueLeft - layout.minLeft;
     orthoContentOffsetY = layout.obliqueTop - layout.minTop;
+    orthoUnionMarkerX = null;
+    orthoUnionMarkerY = null;
   }
 
   let neighborSlotsHtml = '';
   let zi = 1;
-  const neighborZoom = 0;
   for (const nimg of sorted) {
-    neighborSlotsHtml += buildOrthoUnionNeighborSlot(nimg, neighborZoom, layout, zi++);
+    neighborSlotsHtml += buildOrthoUnionNeighborSlot(nimg, tileZoomIdx, layout, zi++);
   }
   const slotZ = zi;
 
@@ -2402,9 +2436,12 @@ function renderOrthoUnionCompositeView(area, img, zoom, rotDeg, contentW, conten
 
 function renderTiles(img, zoom) {
   if (overlayEnabled && !orthographicUnionViewEnabled) orthoContentOffsetX = orthoContentOffsetY = 0;
+  if (!orthographicUnionViewEnabled) orthoUnionMarkerX = orthoUnionMarkerY = null;
   const area = document.getElementById('viewerArea');
-  const {cols, rows} = tileDims(img.width, img.height, zoom, img.tileResolution);
-  const res = img.tileResolution[zoom];
+  const maxTileZ = img.tileResolution.length - 1;
+  const zoomIdx = Math.max(0, Math.min(maxTileZ, zoom));
+  const {cols, rows} = tileDims(img.width, img.height, zoomIdx, img.tileResolution);
+  const res = img.tileResolution[zoomIdx];
 
   // Base scale fits image to viewer; viewerZoom multiplies on top of that.
   const viewW = area.clientWidth  || 800;
@@ -2456,10 +2493,10 @@ function renderTiles(img, zoom) {
   for (let y = rows - 1; y >= 0; y--) {
     tilesHtml += '<div class="tile-row">';
     for (let x = 0; x < cols; x++) {
-      tilesHtml += `<img src="${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg"
+      tilesHtml += `<img src="${img.remoteBaseUrl}/${img.name}/${zoomIdx}/${x}/${y}.jpg"
                         width="${dispTileW}" height="${dispTileW}"
                         loading="lazy" onerror="this.style.opacity='.1'"
-                        title="z${zoom}/${x}/${y}">`;
+                        title="z${zoomIdx}/${x}/${y}">`;
     }
     tilesHtml += '</div>';
   }
@@ -2470,10 +2507,14 @@ function renderTiles(img, zoom) {
 
   // IDs rotPadDiv / rotClipDiv / dotOverlay always belong to the CURRENT (topmost) layer.
   // refreshDot() and scrollToMarker() use these IDs so they always affect the live layer.
+  const tileStackClass =
+    orthographicUnionViewEnabled && orthoTilesData?.tiles?.length
+      ? 'tile-canvas-wrap ortho-union-tile-stack'
+      : 'tile-canvas-wrap';
   const innerHtml = `
     <div id="rotClipDiv" style="position:relative;width:${clipW}px;height:${clipH}px;overflow:hidden;${rotStyle}">
       <div style="position:absolute;top:-${topBlack + edgeTrimDisp}px;left:0;">
-        <div class="tile-canvas-wrap">${tilesHtml}</div>
+        <div class="${tileStackClass}">${tilesHtml}</div>
       </div>
       <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
@@ -2484,7 +2525,7 @@ function renderTiles(img, zoom) {
       const ouBtn = document.getElementById('orthoUnionViewBtn');
       if (ouBtn) ouBtn.style.opacity = '.5';
     } else {
-      renderOrthoUnionCompositeView(area, img, zoom, rotDeg, contentW, contentH, clipW, clipH, innerHtml, viewPadX, viewPadY, scale);
+      renderOrthoUnionCompositeView(area, img, zoom, rotDeg, contentW, contentH, clipW, clipH, innerHtml, viewPadX, viewPadY, scale, zoomIdx);
       refreshDot();
       updateCacheSizeDropdownLabels();
       updateZoomPillClasses();
@@ -2575,7 +2616,35 @@ function refreshDot() {
   markerDY = dy;
 
   // Draw the marker only when visible.
-  if (markerVisible) {
+  if (markerVisible && svgEl.dataset.orthoUnion === '1' && orthoUnionMarkerX != null && orthoUnionMarkerY != null) {
+    const wrap = document.getElementById('orthoUnionWrap');
+    const W = wrap?.clientWidth || 1;
+    const H = wrap?.clientHeight || 1;
+    const ux = orthoUnionMarkerX;
+    const uy = orthoUnionMarkerY;
+    const stroke = currentImage.coversPoint ? '#ff3333' : '#ffaa00';
+    const warn = currentImage.coversPoint ? '' : `
+      <rect x="0" y="0" width="${W}" height="22" fill="#000" fill-opacity=".55"/>
+      <text x="6" y="15" fill="#ffaa00" font-size="11" font-family="sans-serif">
+        Point outside ground footprint — marker is extrapolated, not reliable
+      </text>`;
+    if (ux >= 0 && ux <= W && uy >= 0 && uy <= H) {
+      svgEl.innerHTML = warn + `
+        <line x1="${ux-24}" y1="${uy}" x2="${ux+24}" y2="${uy}" stroke="${stroke}" stroke-width="1.5" opacity=".85"/>
+        <line x1="${ux}" y1="${uy-24}" x2="${ux}" y2="${uy+24}" stroke="${stroke}" stroke-width="1.5" opacity=".85"/>
+        <circle cx="${ux}" cy="${uy}" r="14" fill="none" stroke="${stroke}" stroke-width="2" opacity=".85"/>
+        <circle cx="${ux}" cy="${uy}" r="3" fill="${stroke}" opacity=".95"/>`;
+    } else {
+      const cx = W/2, cy = H/2;
+      const angle = Math.atan2(uy - cy, ux - cx);
+      const ex = cx + Math.cos(angle) * Math.min(cx, cy) * 0.85;
+      const ey = cy + Math.sin(angle) * Math.min(cx, cy) * 0.85;
+      svgEl.innerHTML = warn + `
+        <circle cx="${ex}" cy="${ey}" r="8" fill="none" stroke="${stroke}" stroke-width="2" opacity=".7"/>
+        <line x1="${cx}" y1="${cy}" x2="${ex}" y2="${ey}" stroke="${stroke}" stroke-width="1.5" stroke-dasharray="4,3" opacity=".6"/>
+        <text x="${ex}" y="${ey}" text-anchor="middle" dominant-baseline="middle" fill="${stroke}" font-size="11">→</text>`;
+    }
+  } else if (markerVisible) {
     const W = Math.max(1, Math.floor(currentImage.width  * scale) - currentEdgeTrimDisp);
     const H = Math.max(1, Math.floor(currentImage.height * scale) - currentEdgeTrimDisp);
 
@@ -2652,7 +2721,7 @@ function refreshDot() {
         orthoUnionRebuildScheduled = false;
         return;
       }
-      if (!compositeNeighbors) refreshOrthoSingleModeLive();
+      if (!orthographicUnionViewEnabled && !compositeNeighbors) refreshOrthoSingleModeLive();
     }
   }
 
@@ -3381,14 +3450,14 @@ function switchToImageBg(img, qx, qy) {
     distCenter:  Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1]),
     coversPoint: img.footprintMgi ? pointInPolygon2D(qx, qy, img.footprintMgi) : true,
   };
-  const z = getTileZoomIndex(img);
+  const zUi = getTileZoomIndex(img);
 
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForAllTilesDecoded(img, z).then(() => {
+    waitForAllTilesDecoded(img, zUi).then(() => {
       if (gen !== imageSwitchGen) return;
       currentImage = img;
-      currentZoom = z;
-      openViewer(img, z);
+      currentZoom = zUi;
+      openViewer(img, zUi);
       highlightInList(img.name);
     });
     return;
@@ -3399,8 +3468,8 @@ function switchToImageBg(img, qx, qy) {
     if (done) return; done = true;
     if (gen !== imageSwitchGen) return;
     currentImage = img;
-    currentZoom = z;
-    openViewer(img, z);
+    currentZoom = zUi;
+    openViewer(img, zUi);
     highlightInList(img.name);
   };
   const probe = new Image();
@@ -3881,14 +3950,14 @@ function orbitToDirection(dir) {
     imageSwitchGen++;
     const gen = imageSwitchGen;
     currentImage = best;
-    const z = getTileZoomIndex(best);
+    const zUi = getTileZoomIndex(best);
     if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-      waitForAllTilesDecoded(best, z).then(() => {
+      waitForAllTilesDecoded(best, zUi).then(() => {
         if (gen !== imageSwitchGen) return;
-        openViewer(best, z);
+        openViewer(best, zUi);
       });
     } else {
-      openViewer(best, z);
+      openViewer(best, zUi);
     }
     return;
   }
@@ -3952,7 +4021,7 @@ function initInfiniteScrollMode() {
   const maxZ = currentImage.tileResolution.length - 1;
   currentZoom = Math.min(currentZoom, maxZ);
   const img = currentImage;
-  const z = getTileZoomIndex(img);
+  const zUi = getTileZoomIndex(img);
 
   const finishOverlayInit = () => {
     if (!overlayEnabled) toggleOverlay();
@@ -3964,14 +4033,14 @@ function initInfiniteScrollMode() {
   };
 
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForAllTilesDecoded(img, z).then(() => {
+    waitForAllTilesDecoded(img, zUi).then(() => {
       if (gen !== imageSwitchGen) return;
-      openViewer(img, z);
+      openViewer(img, zUi);
       finishOverlayInit();
     });
     return;
   }
-  openViewer(img, z);
+  openViewer(img, zUi);
   finishOverlayInit();
 }
 
