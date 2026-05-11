@@ -724,8 +724,13 @@ function projectToPixel(img, lat, lon, groundHeight) {
  */
 function computeInvJacobian(img, lat, lon, Z) {
   if (!img || !img.pToImage) return null;
-  const P = img.pToImage;
   const [X, Y] = wgs84ToMgi.forward([lon, lat]);
+  return computeInvJacobianAtMgi(img, X, Y, Z);
+}
+
+function computeInvJacobianAtMgi(img, X, Y, Z) {
+  if (!img || !img.pToImage) return null;
+  const P = img.pToImage;
   const u = P[0][0]*X + P[0][1]*Y + P[0][2]*Z + P[0][3];
   const v = P[1][0]*X + P[1][1]*Y + P[1][2]*Z + P[1][3];
   const w = P[2][0]*X + P[2][1]*Y + P[2][2]*Z + P[2][3];
@@ -743,6 +748,15 @@ function computeInvJacobian(img, lat, lon, Z) {
 /** Inverse of computeInvJacobian’s 2×2 block: [dX,dY] → [dpx,dpy] in native image pixels (first-order ground plane). */
 function groundDeltaToPixelDelta(img, lat, lon, Z, dX, dY) {
   const invJ = computeInvJacobian(img, lat, lon, Z);
+  return groundDeltaToPixelDeltaFromInvJacobian(invJ, dX, dY);
+}
+
+function groundDeltaToPixelDeltaAtMgi(img, X, Y, Z, dX, dY) {
+  const invJ = computeInvJacobianAtMgi(img, X, Y, Z);
+  return groundDeltaToPixelDeltaFromInvJacobian(invJ, dX, dY);
+}
+
+function groundDeltaToPixelDeltaFromInvJacobian(invJ, dX, dY) {
   if (!invJ) return null;
   const a = invJ.dXdPx, b = invJ.dXdPy, c = invJ.dYdPx, d = invJ.dYdPy;
   const det = a * d - b * c;
@@ -1887,9 +1901,9 @@ function rotateAround(x, y, cx, cy, degRad) {
 /**
  * Shared MGI layout for ortho preview tiles (*_s0.jpg ~1024px or *_s1 from JSON): marker-relative CSS in
  * unrotated rotClip space, then rotClip auto-rotate; each tile warped with a CSS matrix3d.
- * When affineGroundUnion is true (Ortho union mode): union uses parallel projection on the ground plane
- * (Jacobian at marker = weak perspective at Z), so ground metres scale uniformly — distant façades match
- * nearer ones along the view better than full pinhole union coords.
+ * When affineGroundUnion is true (Ortho union mode): union uses one stable parallel projection on the
+ * ground plane (Jacobian at the main image centre), so moving the marker/centre across the current
+ * image does not change the weak-perspective warp.
  */
 function computeOrthoLayout(img, rotDeg, contentW, contentH, expandNeighborImages, affineGroundUnion) {
   if (!orthoTilesData || !orthoTilesData.tiles || !orthoTilesData.tiles.length) return null;
@@ -1908,11 +1922,15 @@ function computeOrthoLayout(img, rotDeg, contentW, contentH, expandNeighborImage
   let usedAffineGroundUnion = false;
   let unionUnrotFromMgi;
   if (affineGroundUnion) {
-    const dpTest = groundDeltaToPixelDelta(img, searchLat, searchLon, Z, 1, 0);
+    const affineRefMgi =
+      pixelToGroundMgi(img, img.width / 2, img.height / 2, Z)
+      || img.lookAtMgi
+      || [mx, my];
+    const dpTest = groundDeltaToPixelDeltaAtMgi(img, affineRefMgi[0], affineRefMgi[1], Z, 1, 0);
     if (dpTest) {
       usedAffineGroundUnion = true;
       unionUnrotFromMgi = (X, Y) => {
-        const dpp = groundDeltaToPixelDelta(img, searchLat, searchLon, Z, X - mx, Y - my);
+        const dpp = groundDeltaToPixelDeltaAtMgi(img, affineRefMgi[0], affineRefMgi[1], Z, X - mx, Y - my);
         if (!dpp) return null;
         return {
           x: dpp[0] * currentDispScale,
