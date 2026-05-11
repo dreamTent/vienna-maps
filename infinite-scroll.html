@@ -485,6 +485,14 @@
       </select>
       <button type="button" class="btn-sm" id="orthoUnionViewBtn" onclick="toggleOrthographicUnionView()" style="opacity:.5"
               title="Ortho union: parallel ground projection at marker Z (weak perspective) + nadir ortho + optional neighbors. Removes depth shrinking along the view on flat ground; vertical façades still have camera tilt. Shift+O toggles nadir layer.">⊞ Ortho union</button>
+      <label class="filter-label" title="When several oblique cameras are shown: each ground point uses only the nearest camera (2D Voronoi in MGI). Replaces distance-sorted stacking.">
+        <input type="checkbox" id="orthoUnionVoronoiCb" checked onchange="onOrthoUnionVoronoiOptionsChange()">
+        Nearest-cam
+      </label>
+      <label class="filter-label" title="Show Voronoi cell edges and camera sites in union space (ortho union only).">
+        <input type="checkbox" id="orthoUnionVoronoiDebugCb" onchange="onOrthoUnionVoronoiOptionsChange()">
+        V debug
+      </label>
       <button class="btn-sm" id="lockImagesBtn"    onclick="toggleLockImages()">🔓 Lock image</button>
       <label class="filter-label" style="margin-left:4px"
              title="Decode every tile for the next view before swapping. Current image stays until the new one is ready.">
@@ -1721,6 +1729,8 @@ let districtHighlightBezNr = null;
 /** Offset from ortho union wrapper origin to rotClip top-left (single mode with ortho only). */
 let orthoContentOffsetX = 0, orthoContentOffsetY = 0;
 let orthoUnionMarkerX = null, orthoUnionMarkerY = null;
+/** Voronoi cell rings in union px (for debug overlay); null if not computed. */
+let lastOrthoUnionVoronoiCellsUnionPx = null;
 
 let imageSwitchGen = 0;
 
@@ -2939,7 +2949,136 @@ function cssPx(n) {
   return Number.isFinite(n) ? Number(n).toFixed(3).replace(/\.?0+$/, '') : '0';
 }
 
-function buildOrthoUnionWarpedTileLayer(img, zoom, layout, zIndex, className) {
+// ── Ortho union: nearest-camera partition (Voronoi in MGI, clip in union px) ─────────────────
+
+function intersectSegWithLine(p0, p1, a, b, c) {
+  const x0 = p0[0], y0 = p0[1], x1 = p1[0], y1 = p1[1];
+  const dx = x1 - x0, dy = y1 - y0;
+  const den = a * dx + b * dy;
+  if (Math.abs(den) < 1e-18) return [(x0 + x1) / 2, (y0 + y1) / 2];
+  const t = (c - a * x0 - b * y0) / den;
+  return [x0 + t * dx, y0 + t * dy];
+}
+
+/** Convex polygon ∩ half-plane { (x,y) : a·x + b·y ≤ c } (Sutherland–Hodgman). */
+function clipConvexPolygonHalfPlane(poly, a, b, c) {
+  const EPS = 1e-8;
+  const inside = (p) => a * p[0] + b * p[1] <= c + EPS;
+  const n = poly.length;
+  if (n < 2) return [];
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const cur = poly[i];
+    const prev = poly[(i + n - 1) % n];
+    const cin = inside(cur), pin = inside(prev);
+    if (cin) {
+      if (!pin) out.push(intersectSegWithLine(prev, cur, a, b, c));
+      out.push(cur);
+    } else if (pin) {
+      out.push(intersectSegWithLine(prev, cur, a, b, c));
+    }
+  }
+  return out;
+}
+
+/**
+ * Euclidean Voronoi cell for sites[siteIdx] intersected with a large MGI bbox.
+ * sites[k] = [mx, my] (camera look-at on ground).
+ */
+function voronoiCellMgi(siteIdx, sites, padM = 50000) {
+  if (!sites.length) return null;
+  let bx0 = Infinity, bx1 = -Infinity, by0 = Infinity, by1 = -Infinity;
+  for (const s of sites) {
+    bx0 = Math.min(bx0, s[0]);
+    bx1 = Math.max(bx1, s[0]);
+    by0 = Math.min(by0, s[1]);
+    by1 = Math.max(by1, s[1]);
+  }
+  bx0 -= padM;
+  bx1 += padM;
+  by0 -= padM;
+  by1 += padM;
+  let poly = [[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]];
+  const Si = sites[siteIdx];
+  for (let j = 0; j < sites.length; j++) {
+    if (j === siteIdx) continue;
+    const Sj = sites[j];
+    const a = 2 * (Sj[0] - Si[0]);
+    const b = 2 * (Sj[1] - Si[1]);
+    const c = Sj[0] * Sj[0] + Sj[1] * Sj[1] - Si[0] * Si[0] - Si[1] * Si[1];
+    if (Math.abs(a) < 1e-12 && Math.abs(b) < 1e-12) continue;
+    poly = clipConvexPolygonHalfPlane(poly, a, b, c);
+    if (poly.length < 3) return null;
+  }
+  return poly;
+}
+
+function mgiPolygonToUnionPx(polyMgi, layout) {
+  if (!polyMgi || !layout?.unionPxFromMgi) return [];
+  const out = [];
+  for (const [mx, my] of polyMgi) {
+    const u = layout.unionPxFromMgi(mx, my);
+    if (u) out.push([u.x, u.y]);
+  }
+  return out;
+}
+
+function unionPolygonToClipPathCss(pts) {
+  if (!pts || pts.length < 3) return '';
+  const s = pts.map(([x, y]) => `${cssPx(x)}px ${cssPx(y)}px`).join(',');
+  return `clip-path:polygon(${s});-webkit-clip-path:polygon(${s});`;
+}
+
+function scalePolyFromRoi(pts, roi, scaleOut) {
+  if (!pts) return [];
+  return pts.map(([x, y]) => [(x - roi.minX) * scaleOut, (y - roi.minY) * scaleOut]);
+}
+
+function orthoUnionUseVoronoiPartition() {
+  return document.getElementById('orthoUnionVoronoiCb')?.checked !== false;
+}
+
+function orthoUnionVoronoiDebugOn() {
+  return document.getElementById('orthoUnionVoronoiDebugCb')?.checked === true;
+}
+
+function onOrthoUnionVoronoiOptionsChange() {
+  lastOrthoUnionVoronoiCellsUnionPx = null;
+  if (currentImage && orthographicUnionViewEnabled) {
+    renderTiles(currentImage, getTileZoomIndex(currentImage));
+  }
+}
+
+/** Debug SVG: cell outlines + sites (union px). */
+function buildOrthoUnionVoronoiDebugSvg(layout, sitesMgi, cellsUnionPx, cameraLabels) {
+  const W = layout.unionW;
+  const H = layout.unionH;
+  let paths = '';
+  for (const poly of cellsUnionPx) {
+    if (!poly || poly.length < 3) continue;
+    paths += `M${poly[0][0].toFixed(1)},${poly[0][1].toFixed(1)}`;
+    for (let k = 1; k < poly.length; k++) {
+      paths += `L${poly[k][0].toFixed(1)},${poly[k][1].toFixed(1)}`;
+    }
+    paths += 'Z ';
+  }
+  const marks = [];
+  for (let i = 0; i < sitesMgi.length; i++) {
+    const s = sitesMgi[i];
+    const u = layout.unionPxFromMgi(s[0], s[1]);
+    if (!u) continue;
+    const lab = (cameraLabels[i] || `cam${i}`).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    marks.push(
+      `<circle cx="${u.x.toFixed(2)}" cy="${u.y.toFixed(2)}" r="5" fill="none" stroke="#5cf" stroke-width="1.6"/>` +
+      `<text x="${(u.x + 7).toFixed(1)}" y="${(u.y + 4).toFixed(1)}" fill="#9dd" font-size="11" font-family="system-ui,sans-serif">${lab}</text>`,
+    );
+  }
+  return `<svg id="orthoUnionVoronoiDebug" xmlns="http://www.w3.org/2000/svg" style="position:absolute;left:0;top:0;width:${W}px;height:${H}px;z-index:48;pointer-events:none;overflow:visible;">` +
+    `<path d="${paths}" fill="none" stroke="rgba(0,220,255,.75)" stroke-width="1.75"/>` +
+    marks.join('') + '</svg>';
+}
+
+function buildOrthoUnionWarpedTileLayer(img, zoom, layout, zIndex, className, clipUnionPx) {
   const maxZ = Math.max(0, (img.tileResolution?.length || 1) - 1);
   const zTiles = Math.min(Math.max(0, zoom), maxZ);
   const area = document.getElementById('viewerArea');
@@ -3002,7 +3141,8 @@ function buildOrthoUnionWarpedTileLayer(img, zoom, layout, zIndex, className) {
     }
   }
   if (!tilesHtml) return '';
-  return `<div class="${className}" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;z-index:${zIndex};pointer-events:none;">${tilesHtml}</div>`;
+  const clip = clipUnionPx?.length >= 3 ? unionPolygonToClipPathCss(clipUnionPx) : '';
+  return `<div class="${className}" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;z-index:${zIndex};pointer-events:none;${clip}">${tilesHtml}</div>`;
 }
 
 /**
@@ -3058,12 +3198,12 @@ function collectOrthoUnionWarpedPiecesForImage(img, z, layout, roiUnion, feature
   return out;
 }
 
-function buildOrthoUnionNeighborSlot(neighborImg, zoom, layout, zIndex) {
-  return buildOrthoUnionWarpedTileLayer(neighborImg, zoom, layout, zIndex, 'ortho-union-neighbor');
+function buildOrthoUnionNeighborSlot(neighborImg, zoom, layout, zIndex, clipUnionPx) {
+  return buildOrthoUnionWarpedTileLayer(neighborImg, zoom, layout, zIndex, 'ortho-union-neighbor', clipUnionPx);
 }
 
 /** Homography-warp main oblique tiles into affine-ground union (removes perspective vs union depth). */
-function buildOrthoUnionMainHomographyWarp(img, zoom, layout) {
+function buildOrthoUnionMainHomographyWarp(img, zoom, layout, clipUnionPx) {
   const hVal = document.getElementById('heightNum').value;
   const Z = hVal === '' ? 0 : Number(hVal);
   const W = img.width;
@@ -3079,7 +3219,7 @@ function buildOrthoUnionMainHomographyWarp(img, zoom, layout) {
   }
   const Hmat = homographyFrom4Points2D(nc, dstUnion);
   if (!Hmat) return { html: '', H: null };
-  const tiles = buildOrthoUnionWarpedTileLayer(img, zoom, layout, 1, 'ortho-union-main-tiles');
+  const tiles = buildOrthoUnionWarpedTileLayer(img, zoom, layout, 1, 'ortho-union-main-tiles', clipUnionPx);
   const html =
     `${tiles}<svg id="dotOverlay" data-ortho-union="1" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;overflow:visible;pointer-events:none;z-index:2;"></svg>`;
   return { html, H: Hmat };
@@ -3115,8 +3255,23 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
 
   area.classList.add('has-ortho');
 
+  const cameras = [img, ...sorted];
+  const sites = cameras.map(c => c.lookAtMgi);
+  const useVor = sorted.length > 0 && orthoUnionUseVoronoiPartition();
+  let cellsUnionPx = null;
+  if (useVor) {
+    cellsUnionPx = [];
+    for (let i = 0; i < cameras.length; i++) {
+      const cellMgi = voronoiCellMgi(i, sites);
+      cellsUnionPx.push(cellMgi ? mgiPolygonToUnionPx(cellMgi, layout) : null);
+    }
+    lastOrthoUnionVoronoiCellsUnionPx = cellsUnionPx;
+  } else {
+    lastOrthoUnionVoronoiCellsUnionPx = null;
+  }
+
   const warp = layout.affineGroundUnion
-    ? buildOrthoUnionMainHomographyWarp(img, tileZoomIdx, layout)
+    ? buildOrthoUnionMainHomographyWarp(img, tileZoomIdx, layout, useVor && cellsUnionPx ? cellsUnionPx[0] : null)
     : { html: innerHtml, H: null };
   if (layout.affineGroundUnion && !warp.H) {
     warp.html = innerHtml;
@@ -3133,12 +3288,13 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
     orthoUnionMarkerY = null;
   }
 
+  const obliqueZi = 4;
   let neighborSlotsHtml = '';
-  let zi = 1;
-  for (const nimg of sorted) {
-    neighborSlotsHtml += buildOrthoUnionNeighborSlot(nimg, tileZoomIdx, layout, zi++);
+  for (let ni = 0; ni < sorted.length; ni++) {
+    const clipPx = useVor && cellsUnionPx ? cellsUnionPx[ni + 1] : null;
+    neighborSlotsHtml += buildOrthoUnionNeighborSlot(sorted[ni], tileZoomIdx, layout, obliqueZi, clipPx);
   }
-  const slotZ = zi;
+  const slotZ = obliqueZi + 1;
 
   const slotLeft = warp.H ? 0 : layout.obliqueLeft - layout.minLeft;
   const slotTop = warp.H ? 0 : layout.obliqueTop - layout.minTop;
@@ -3157,11 +3313,17 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
       `<svg id="dotOverlay" xmlns="http://www.w3.org/2000/svg" data-ortho-union="1" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;overflow:visible;pointer-events:none;z-index:${dz + 1};"></svg>`;
   }
 
+  const voronoiDebugSvg =
+    useVor && orthoUnionVoronoiDebugOn() && cellsUnionPx
+      ? buildOrthoUnionVoronoiDebugSvg(layout, sites, cellsUnionPx, cameras.map(c => c.name || ''))
+      : '';
+
   area.innerHTML = `
     <div id="rotPadDiv" style="padding:${padY}px ${padX}px;min-width:max-content;background:#080a0e;">
       <div id="orthoUnionWrap" style="position:relative;width:${layout.unionW}px;height:${layout.unionH}px;flex-shrink:0;">
         <div id="orthoBaseLayer" style="position:absolute;left:0;top:0;width:100%;height:100%;z-index:0;pointer-events:none;overflow:visible;filter:saturate(0.88) brightness(0.92);">${layout.orthoTilesHtml}</div>
         ${neighborSlotsHtml}
+        ${voronoiDebugSvg}
         <div id="orthoObliqueSlot" style="position:absolute;left:${slotLeft}px;top:${slotTop}px;width:${slotW};height:${slotH};z-index:${slotZ};">${obliqueInner}</div>
         ${postSlotSvgs}
       </div>
@@ -3175,7 +3337,10 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
 
 function renderTiles(img, zoom) {
   if (overlayEnabled && !orthographicUnionViewEnabled) orthoContentOffsetX = orthoContentOffsetY = 0;
-  if (!orthographicUnionViewEnabled) orthoUnionMarkerX = orthoUnionMarkerY = null;
+  if (!orthographicUnionViewEnabled) {
+    orthoUnionMarkerX = orthoUnionMarkerY = null;
+    lastOrthoUnionVoronoiCellsUnionPx = null;
+  }
   const area = document.getElementById('viewerArea');
   const maxTileZ = img.tileResolution.length - 1;
   const zoomParam = Math.max(0, Math.min(maxTileZ, zoom));
@@ -4099,19 +4264,28 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layou
     });
   }
 
-  const neighborPieces = [];
-  for (const nimg of sortedNeighbors) {
-    neighborPieces.push(...collectOrthoUnionWarpedPiecesForImage(nimg, z, layout, roi, feat));
-  }
+  const neighborPiecesByCam = sortedNeighbors.map(nimg =>
+    collectOrthoUnionWarpedPiecesForImage(nimg, z, layout, roi, feat));
   const mainPieces = collectOrthoUnionWarpedPiecesForImage(mainImg, z, layout, roi, feat);
-
-  const drawOrder = [...orthoPieces, ...neighborPieces, ...mainPieces];
+  const flatOblique = [...neighborPiecesByCam.flat(), ...mainPieces];
+  const drawOrder = [...orthoPieces, ...flatOblique];
   if (!drawOrder.length) {
     alert('Nothing to export — no tiles or ortho previews intersect this Bezirk at the chosen level.');
     return;
   }
 
-  const tileCountLabel = orthoPieces.length + neighborPieces.length + mainPieces.length;
+  const cameras = [mainImg, ...sortedNeighbors];
+  const sites = cameras.map(c => c.lookAtMgi);
+  const useVor = sortedNeighbors.length > 0 && orthoUnionUseVoronoiPartition();
+  const cellsOut = useVor
+    ? cameras.map((_, i) => {
+        const cellMgi = voronoiCellMgi(i, sites);
+        const uPoly = cellMgi ? mgiPolygonToUnionPx(cellMgi, layout) : null;
+        return uPoly && uPoly.length >= 3 ? scalePolyFromRoi(uPoly, roi, scaleOut) : null;
+      })
+    : null;
+
+  const tileCountLabel = drawOrder.length;
   if (!confirm(`Export HR Bezirk (ortho union): ${outW}×${outH} px · z${z} · ${tileCountLabel} draw layers?`)) return;
 
   const uniqueUrls = [...new Set(drawOrder.map(p => p.url))];
@@ -4158,11 +4332,11 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layou
   if (bezirkAppendClipPathUnionPx(ctx, layout, feat, roi, scaleOut)) ctx.clip();
 
   let drawMiss = 0;
-  for (const piece of drawOrder) {
+  const drawOnePiece = piece => {
     const el = imgMap.get(piece.url);
     if (!el) {
       drawMiss++;
-      continue;
+      return;
     }
     try {
       const d = scaleQuadFromRoi(piece.dstQuad, roi, scaleOut);
@@ -4171,6 +4345,30 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layou
       console.warn(e);
       drawMiss++;
     }
+  };
+
+  for (const piece of orthoPieces) drawOnePiece(piece);
+
+  if (useVor && cellsOut) {
+    for (let ci = 0; ci < cameras.length; ci++) {
+      const cell = cellsOut[ci];
+      const pieces = ci === 0 ? mainPieces : neighborPiecesByCam[ci - 1];
+      if (!pieces.length) continue;
+      if (!cell || cell.length < 3) {
+        for (const piece of pieces) drawOnePiece(piece);
+        continue;
+      }
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(cell[0][0], cell[0][1]);
+      for (let k = 1; k < cell.length; k++) ctx.lineTo(cell[k][0], cell[k][1]);
+      ctx.closePath();
+      ctx.clip();
+      for (const piece of pieces) drawOnePiece(piece);
+      ctx.restore();
+    }
+  } else {
+    for (const piece of flatOblique) drawOnePiece(piece);
   }
   ctx.restore();
 
