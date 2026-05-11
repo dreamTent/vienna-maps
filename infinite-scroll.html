@@ -485,11 +485,18 @@
       </select>
       <button type="button" class="btn-sm" id="orthoUnionViewBtn" onclick="toggleOrthographicUnionView()" style="opacity:.5"
               title="Ortho union: parallel ground projection at marker Z (weak perspective) + nadir ortho + optional neighbors. Removes depth shrinking along the view on flat ground; vertical façades still have camera tilt. Shift+O toggles nadir layer.">⊞ Ortho union</button>
-      <label class="filter-label" title="When several oblique cameras are shown: each ground point uses only the nearest camera (2D Voronoi in MGI). Replaces distance-sorted stacking.">
-        <input type="checkbox" id="orthoUnionVoronoiCb" checked onchange="onOrthoUnionVoronoiOptionsChange()">
-        Nearest-cam
+      <label class="filter-label" title="Partition / stacking of multiple oblique cameras over the nadir layer.">
+        <select id="orthoUnionStackModeSel" class="sort-select" style="padding:2px 4px;max-width:11.5rem"
+                onchange="onOrthoUnionVoronoiOptionsChange()"
+                title="Nearest-cam: Voronoi by 2D distance in MGI. Shingle: no partition — order camera ground centres by distance from that corner (corner side underneath; opposite corner on top).">
+          <option value="voronoi" selected>Nearest-cam</option>
+          <option value="stack_tl">Shingle: top-left</option>
+          <option value="stack_tr">Shingle: top-right</option>
+          <option value="stack_br">Shingle: bottom-right</option>
+          <option value="stack_bl">Shingle: bottom-left</option>
+        </select>
       </label>
-      <label class="filter-label" title="Show Voronoi cell edges and camera sites in union space (ortho union only).">
+      <label class="filter-label" title="Show Voronoi cell edges and camera sites (Nearest-cam mode only).">
         <input type="checkbox" id="orthoUnionVoronoiDebugCb" onchange="onOrthoUnionVoronoiOptionsChange()">
         V debug
       </label>
@@ -511,6 +518,7 @@
               title="Multiplier on export width/height (&lt;1 downscales, &gt;1 upscales — no extra sensor detail).">
         <option value="0.0625">1/16× out</option>
         <option value="0.125">1/8× out</option>
+        <option value="0.1666666667">1/6× out</option>
         <option value="0.25">1/4× out</option>
         <option value="0.333333">1/3× out</option>
         <option value="0.5">1/2× out</option>
@@ -732,9 +740,10 @@ function parseImageTile(data) {
     // This is a better selection metric than the footprint geographic centroid
     // because it places the query point near the middle of the chosen image.
     const px_c = (r[iW] || 14144) / 2, py_c = (r[iH] || 10560) / 2;
-    let lookAtMgi = center.slice(0, 2); // fallback to footprint centroid
+    let lookAtMgi = center.slice(0, 2); // fallback to manifest footprint centroid
     const Pm = r[iPTI];
     if (Pm) {
+      // Centre ray vs horizontal plane Z=0 (load-time only). Live Nearest-cam uses cameraVoronoiSiteMgi(heightNum).
       const a1=Pm[0][0]-px_c*Pm[2][0], b1=Pm[0][1]-px_c*Pm[2][1], c1=px_c*Pm[2][3]-Pm[0][3];
       const a2=Pm[1][0]-py_c*Pm[2][0], b2=Pm[1][1]-py_c*Pm[2][1], c2=py_c*Pm[2][3]-Pm[1][3];
       const det = a1*b2 - b1*a2;
@@ -863,6 +872,22 @@ function groundMgiToPixel(img, X, Y, Z) {
   const w = P[2][0] * X + P[2][1] * Y + P[2][2] * Z + P[2][3];
   if (Math.abs(w) < 1e-10) return null;
   return [u / w, v / w];
+}
+
+/**
+ * MGI point used as a Voronoi site for “nearest cam”: centre-pixel ray ∩ ground plane at the same Z as
+ * heightNum (ortho union / tiles). `lookAtMgi` on the image is computed at parse time for Z=0 only, so
+ * it can disagree with the viewer when elevation ≠ 0.
+ */
+function cameraVoronoiSiteMgi(img, groundZ) {
+  if (!img) return null;
+  if (img.pToImage) {
+    const g = pixelToGroundMgi(img, img.width / 2, img.height / 2, groundZ);
+    if (g && Number.isFinite(g[0]) && Number.isFinite(g[1])) return g;
+  }
+  if (img.lookAtMgi?.length >= 2) return [img.lookAtMgi[0], img.lookAtMgi[1]];
+  if (img.mgiCenter?.length >= 2) return [img.mgiCenter[0], img.mgiCenter[1]];
+  return null;
 }
 
 function applyHomography2D(H, x, y) {
@@ -3346,16 +3371,45 @@ function scalePolyFromRoi(pts, roi, scaleOut) {
   return pts.map(([x, y]) => [(x - roi.minX) * scaleOut, (y - roi.minY) * scaleOut]);
 }
 
+function orthoUnionStackMode() {
+  return document.getElementById('orthoUnionStackModeSel')?.value || 'voronoi';
+}
+
+/** Smaller key = closer to stack start corner = drawn earlier = underneath (shingle). */
+function orthoUnionShingleDepthKey(layout, cam, mode) {
+  const hVal = document.getElementById('heightNum')?.value;
+  const Z = hVal === '' || hVal == null ? 0 : Number(hVal);
+  const m = cameraVoronoiSiteMgi(cam, Z);
+  const W = Math.max(1, layout?.unionW || 1);
+  const H = Math.max(1, layout?.unionH || 1);
+  let u = null;
+  if (m && layout?.unionPxFromMgi) u = layout.unionPxFromMgi(m[0], m[1]);
+  const ux = u?.x ?? W / 2;
+  const uy = u?.y ?? H / 2;
+  switch (mode) {
+    case 'stack_tl': return ux + uy;
+    case 'stack_tr': return (W - ux) + uy;
+    case 'stack_br': return (W - ux) + (H - uy);
+    case 'stack_bl': return ux + (H - uy);
+    default: return 0;
+  }
+}
+
 function orthoUnionUseVoronoiPartition() {
-  return document.getElementById('orthoUnionVoronoiCb')?.checked !== false;
+  return orthoUnionStackMode() === 'voronoi';
 }
 
 function orthoUnionVoronoiDebugOn() {
+  if (orthoUnionStackMode() !== 'voronoi') return false;
   return document.getElementById('orthoUnionVoronoiDebugCb')?.checked === true;
 }
 
 function onOrthoUnionVoronoiOptionsChange() {
   lastOrthoUnionVoronoiCellsUnionPx = null;
+  if (orthoUnionStackMode() !== 'voronoi') {
+    const dbg = document.getElementById('orthoUnionVoronoiDebugCb');
+    if (dbg) dbg.checked = false;
+  }
   if (currentImage && orthographicUnionViewEnabled) {
     renderTiles(currentImage, getTileZoomIndex(currentImage));
   }
@@ -3568,8 +3622,11 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
   area.classList.add('has-ortho');
 
   const cameras = [img, ...sorted];
-  const sites = cameras.map(c => c.lookAtMgi);
-  const useVor = sorted.length > 0 && orthoUnionUseVoronoiPartition();
+  const hValUnion = document.getElementById('heightNum')?.value;
+  const ZUnion = hValUnion === '' || hValUnion == null ? 0 : Number(hValUnion);
+  const sites = cameras.map(c => cameraVoronoiSiteMgi(c, ZUnion) || c.lookAtMgi);
+  const stackMode = orthoUnionStackMode();
+  const useVor = sorted.length > 0 && stackMode === 'voronoi';
   let cellsUnionPx = null;
   if (useVor) {
     cellsUnionPx = [];
@@ -3602,25 +3659,58 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
 
   const obliqueZi = 4;
   let neighborSlotsHtml = '';
-  for (let ni = 0; ni < sorted.length; ni++) {
-    const clipPx = useVor && cellsUnionPx ? cellsUnionPx[ni + 1] : null;
-    neighborSlotsHtml += buildOrthoUnionNeighborSlot(sorted[ni], tileZoomIdx, layout, obliqueZi, clipPx);
-  }
-  const slotZ = obliqueZi + 1;
+  let obliqueLayersHtml = '';
 
   const slotLeft = warp.H ? 0 : layout.obliqueLeft - layout.minLeft;
   const slotTop = warp.H ? 0 : layout.obliqueTop - layout.minTop;
   const slotW = warp.H ? `${layout.unionW}px` : 'auto';
   const slotH = warp.H ? `${layout.unionH}px` : 'auto';
 
-  const dz = slotZ + 1;
   let obliqueInner = warp.html;
   if (warp.H) obliqueInner = stripDotOverlaySvg(obliqueInner);
   else obliqueInner = stripDistrictDimSvg(obliqueInner);
+
+  let topObliqueZ;
+  if (useVor) {
+    for (let ni = 0; ni < sorted.length; ni++) {
+      const clipPx = cellsUnionPx ? cellsUnionPx[ni + 1] : null;
+      neighborSlotsHtml += buildOrthoUnionNeighborSlot(sorted[ni], tileZoomIdx, layout, obliqueZi, clipPx);
+    }
+    const slotZ = obliqueZi + 1;
+    obliqueLayersHtml =
+      `<div id="orthoObliqueSlot" style="position:absolute;left:${slotLeft}px;top:${slotTop}px;width:${slotW};height:${slotH};z-index:${slotZ};">${obliqueInner}</div>`;
+    topObliqueZ = slotZ;
+  } else if (sorted.length > 0 && stackMode.startsWith('stack_')) {
+    const entries = cameras.map((cam, idx) => ({
+      cam,
+      idx,
+      k: orthoUnionShingleDepthKey(layout, cam, stackMode),
+    })).sort((a, b) => a.k - b.k || a.idx - b.idx);
+    for (let li = 0; li < entries.length; li++) {
+      const { cam, idx } = entries[li];
+      const zLev = obliqueZi + li;
+      if (idx === 0) {
+        obliqueLayersHtml +=
+          `<div id="orthoObliqueSlot" style="position:absolute;left:${slotLeft}px;top:${slotTop}px;width:${slotW};height:${slotH};z-index:${zLev};">${obliqueInner}</div>`;
+      } else {
+        obliqueLayersHtml += buildOrthoUnionNeighborSlot(cam, tileZoomIdx, layout, zLev, null);
+      }
+    }
+    topObliqueZ = obliqueZi + entries.length - 1;
+  } else {
+    for (let ni = 0; ni < sorted.length; ni++) {
+      neighborSlotsHtml += buildOrthoUnionNeighborSlot(sorted[ni], tileZoomIdx, layout, obliqueZi, null);
+    }
+    const slotZ = obliqueZi + 1;
+    obliqueLayersHtml =
+      `<div id="orthoObliqueSlot" style="position:absolute;left:${slotLeft}px;top:${slotTop}px;width:${slotW};height:${slotH};z-index:${slotZ};">${obliqueInner}</div>`;
+    topObliqueZ = slotZ;
+  }
+
+  const dz = topObliqueZ + 1;
   let postSlotSvgs =
     `<svg id="districtDimOverlay" xmlns="http://www.w3.org/2000/svg" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;z-index:${dz};pointer-events:none;"></svg>`;
   if (warp.H) {
-    obliqueInner = stripDotOverlaySvg(warp.html);
     postSlotSvgs +=
       `<svg id="dotOverlay" xmlns="http://www.w3.org/2000/svg" data-ortho-union="1" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;overflow:visible;pointer-events:none;z-index:${dz + 1};"></svg>`;
   }
@@ -3636,7 +3726,7 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
         <div id="orthoBaseLayer" style="position:absolute;left:0;top:0;width:100%;height:100%;z-index:0;pointer-events:none;overflow:visible;filter:saturate(0.88) brightness(0.92);">${layout.orthoTilesHtml}</div>
         ${neighborSlotsHtml}
         ${voronoiDebugSvg}
-        <div id="orthoObliqueSlot" style="position:absolute;left:${slotLeft}px;top:${slotTop}px;width:${slotW};height:${slotH};z-index:${slotZ};">${obliqueInner}</div>
+        ${obliqueLayersHtml}
         ${postSlotSvgs}
       </div>
     </div>`;
@@ -3818,7 +3908,11 @@ function renderTiles(img, zoom) {
 function onHeightChange() {
   refreshDot();
   if (searchResults.length) applySort();
-  if (currentImage && shouldUseBezirkHrTilesOnly()) renderTiles(currentImage, getTileZoomIndex(currentImage));
+  if (currentImage) {
+    if (orthographicUnionViewEnabled || shouldUseBezirkHrTilesOnly()) {
+      renderTiles(currentImage, getTileZoomIndex(currentImage));
+    }
+  }
 }
 
 function refreshDot() {
@@ -4585,7 +4679,9 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, sorte
   }
 
   const cameras = [mainImg, ...sortedNeighbors];
-  const sites = cameras.map(c => c.lookAtMgi);
+  const hValZ = document.getElementById('heightNum')?.value;
+  const ZgVor = hValZ === '' || hValZ == null ? 0 : Number(hValZ);
+  const sites = cameras.map(c => cameraVoronoiSiteMgi(c, ZgVor) || c.lookAtMgi);
   const useVor = sortedNeighbors.length > 0 && orthoUnionUseVoronoiPartition();
   const cellsOut = useVor
     ? cameras.map((_, i) => {
@@ -4676,6 +4772,19 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, sorte
       ctx.clip();
       for (const piece of pieces) drawOnePiece(piece);
       ctx.restore();
+    }
+  } else if (
+    sortedNeighbors.length > 0
+    && orthoUnionStackMode().startsWith('stack_')
+  ) {
+    const sm = orthoUnionStackMode();
+    const order = cameras.map((cam, idx) => ({
+      idx,
+      k: orthoUnionShingleDepthKey(layout, cam, sm),
+    })).sort((a, b) => a.k - b.k || a.idx - b.idx);
+    for (const e of order) {
+      const pieces = e.idx === 0 ? mainPieces : neighborPiecesByCam[e.idx - 1];
+      for (const piece of pieces) drawOnePiece(piece);
     }
   } else {
     for (const piece of flatOblique) drawOnePiece(piece);
