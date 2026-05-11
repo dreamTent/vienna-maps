@@ -507,22 +507,30 @@
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
       <select id="exportRegionTileZSel" class="sort-select" style="padding:2px 4px;width:6.2rem"
               title="Pyramid level for Bezirk HR export (finer = more detail, more tiles)"></select>
-      <select id="exportRegionScaleSel" class="sort-select" style="padding:2px 4px;width:4.5rem"
-              title="Scale exported pixels (upsamples stitched native — not extra sensor detail)">
+      <select id="exportRegionScaleSel" class="sort-select" style="padding:2px 4px;width:5.4rem"
+              title="Multiplier on export width/height (&lt;1 downscales, &gt;1 upscales — no extra sensor detail).">
+        <option value="0.0625">1/16× out</option>
+        <option value="0.125">1/8× out</option>
+        <option value="0.25">1/4× out</option>
+        <option value="0.333333">1/3× out</option>
+        <option value="0.5">1/2× out</option>
+        <option value="0.667">2/3× out</option>
+        <option value="0.75">3/4× out</option>
         <option value="1" selected>1× out</option>
         <option value="2">2× out</option>
         <option value="3">3× out</option>
         <option value="4">4× out</option>
         <option value="5">5× out</option>
         <option value="6">6× out</option>
-        <option value="7">7× out</option>
         <option value="8">8× out</option>
         <option value="12">12× out</option>
         <option value="16">16× out</option>
 
+
+
       </select>
       <button type="button" class="btn-sm" onclick="downloadBezirkHighRes()"
-              title="Crop export: Bezirk bounding box at chosen Z, loading only intersecting tiles">⬇ HR Bezirk</button>
+              title="Bezirk export: with ortho JSON, uses the same weak-perspective map as Ortho union (oblique foreshortening; marker + rotation like the viewer). Z controls tile resolution; output scale multiplies the crop.">⬇ HR Bezirk</button>
       <span style="display:flex;align-items:center;gap:4px;font-size:.68rem;color:var(--text-dim);white-space:nowrap"
             title="Auto-advance through the sorted list (same as . key)">
         <button type="button" class="btn-sm" id="listPlayBtn" onclick="toggleListPlay()" style="padding:2px 8px">▶</button>
@@ -2680,7 +2688,311 @@ function featureBezirkUnionBounds(layout, feature) {
   return { minX, minY, maxX, maxY };
 }
 
-/** Bezirk outer ring(s) in MGI (one simple ring per polygon part). */
+/** Padded Bezirk AABB in MGI (metres) from GeoJSON only — no camera or marker. */
+function featureBezirkMgiPaddedBounds(feature) {
+  const rings = featureOuterRingsLonLat(feature);
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let any = false;
+  for (const ring of rings) {
+    for (const [mx, my] of mgiPointsAlongRingLonLat(ring, BEZIRK_RING_SAMPLE_STEP_M)) {
+      any = true;
+      minX = Math.min(minX, mx);
+      maxX = Math.max(maxX, mx);
+      minY = Math.min(minY, my);
+      maxY = Math.max(maxY, my);
+    }
+  }
+  if (!any) return null;
+  const rw = maxX - minX;
+  const rh = maxY - minY;
+  const padM = Math.max(25, rw * 0.015, rh * 0.015);
+  return { minX: minX - padM, maxX: maxX + padM, minY: minY - padM, maxY: maxY + padM };
+}
+
+/** Mean ground metres per ortho preview pixel along MGI easting (mx) and northing (my); do not average into one scalar or aspect ratio is wrong. */
+function orthoNadirMeanMetersPerPreviewPixelXY() {
+  if (!orthoTilesData?.tiles?.length) return null;
+  let sx = 0;
+  let sy = 0;
+  let n = 0;
+  for (const t of orthoTilesData.tiles) {
+    const pw = t.previewWidth || 1024;
+    const ph = t.previewHeight || 1024;
+    const mx = Math.abs(t.xmax - t.xmin) / pw;
+    const my = Math.abs(t.ymax - t.ymin) / ph;
+    if (mx > 1e-12 && my > 1e-12) {
+      sx += mx;
+      sy += my;
+      n++;
+    }
+  }
+  return n > 0 ? { mx: sx / n, my: sy / n } : null;
+}
+
+/**
+ * Export pixels per ground metre at pyramid index z, separately for easting and northing.
+ * (1 / ortho_m_per_px_axis) × (tileResolution[maxZ] / tileResolution[z]).
+ */
+function exportPixelsPerMetreForPyramidZXY(img, z) {
+  const gsd = orthoNadirMeanMetersPerPreviewPixelXY();
+  if (!gsd || !img?.tileResolution?.length) return null;
+  const maxZi = img.tileResolution.length - 1;
+  const rz = img.tileResolution[z];
+  const rMax = img.tileResolution[maxZi];
+  if (!(rz > 0)) return null;
+  const k = rMax / rz;
+  return { ppmX: (1 / gsd.mx) * k, ppmY: (1 / gsd.my) * k };
+}
+
+/** Nadir ortho JSON only: axis-aligned MGI→union (no oblique foreshortening). Fallback when Jacobian fails. */
+function buildNadirGsdBezirkExportLayout(img, z, mgiRoi) {
+  if (!img?.pToImage || !mgiRoi || !orthoTilesData?.tiles?.length) return null;
+  const ppmXY = exportPixelsPerMetreForPyramidZXY(img, z);
+  if (!ppmXY) return null;
+  const { ppmX, ppmY } = ppmXY;
+  const Wm = mgiRoi.maxX - mgiRoi.minX;
+  const Hm = mgiRoi.maxY - mgiRoi.minY;
+  if (!(Wm > 0 && Hm > 0)) return null;
+  const unionW = Math.max(1, Math.round(Wm * ppmX));
+  const unionH = Math.max(1, Math.round(Hm * ppmY));
+
+  function unionPxFromMgi(X, Y) {
+    const x = ((X - mgiRoi.minX) / Wm) * unionW;
+    const y = ((mgiRoi.maxY - Y) / Hm) * unionH;
+    return { x, y };
+  }
+
+  const orthoTileLayers = [];
+  for (const t of orthoTilesData.tiles) {
+    const pw = t.previewWidth || 1024;
+    const ph = t.previewHeight || 1024;
+    const p0 = unionPxFromMgi(t.xmin, t.ymax);
+    const p1 = unionPxFromMgi(t.xmax, t.ymax);
+    const p2 = unionPxFromMgi(t.xmax, t.ymin);
+    const p3 = unionPxFromMgi(t.xmin, t.ymin);
+    if (!p0 || !p1 || !p2 || !p3) continue;
+    const H = homographyFrom4Points2D(
+      [[0, 0], [pw, 0], [pw, ph], [0, ph]],
+      [[p0.x, p0.y], [p1.x, p1.y], [p2.x, p2.y], [p3.x, p3.y]],
+    );
+    if (!H) continue;
+    orthoTileLayers.push({
+      previewUrl: t.previewUrl,
+      pw,
+      ph,
+      mat3d: homography3x3ToMatrix3dString(H),
+      quadUnion: [[p0.x, p0.y], [p1.x, p1.y], [p2.x, p2.y], [p3.x, p3.y]],
+      mgiBounds: { xmin: t.xmin, xmax: t.xmax, ymin: t.ymin, ymax: t.ymax },
+    });
+  }
+  if (!orthoTileLayers.length) return null;
+
+  return {
+    unionW,
+    unionH,
+    minLeft: 0,
+    minTop: 0,
+    obliqueLeft: 0,
+    obliqueTop: 0,
+    orthoMarkerX: 0,
+    orthoMarkerY: 0,
+    orthoTilesHtml: '',
+    orthoTileLayers,
+    worldW: unionW,
+    worldH: unionH,
+    unionPxFromMgi,
+    affineGroundUnion: true,
+  };
+}
+
+/**
+ * Native-pixel weak-perspective map as Ortho union (Jacobian at main-image centre, origin at Bezirk centre),
+ * optional currentRotDeg. Pyramid z affects tile choice / GSD fallback only. Nadir ortho JSON layout stays axis-aligned.
+ */
+function buildCanonicalBezirkExportLayout(img, z, mgiRoi, sortedNeighbors) {
+  const expandList = sortedNeighbors || [];
+  if (!img?.pToImage || !mgiRoi || !orthoTilesData?.tiles?.length) return null;
+
+  const hVal = document.getElementById('heightNum')?.value;
+  const Z = hVal === '' || hVal == null ? 0 : Number(hVal);
+
+  const maxZi = img.tileResolution.length - 1;
+  const zClamped = Math.min(Math.max(0, z), maxZi);
+  const rz = img.tileResolution[zClamped];
+  if (!(rz > 0)) return buildNadirGsdBezirkExportLayout(img, zClamped, mgiRoi);
+
+  const [markerMx, markerMy] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const affineRefMgi =
+    pixelToGroundMgi(img, img.width / 2, img.height / 2, Z) || img.lookAtMgi || [markerMx, markerMy];
+
+  if (!groundDeltaToPixelDeltaAtMgi(img, affineRefMgi[0], affineRefMgi[1], Z, 1, 0)) {
+    return buildNadirGsdBezirkExportLayout(img, zClamped, mgiRoi);
+  }
+
+  function unionUnrotFromMgi(X, Y) {
+    /** Same deltas as computeOrthoLayout affineGroundUnion: offset from search marker, Jacobian at image centre. */
+    const dpp = groundDeltaToPixelDeltaAtMgi(img, affineRefMgi[0], affineRefMgi[1], Z, X - markerMx, Y - markerMy);
+    if (!dpp) return null;
+    /** Native-pixel scale (viewer currentDispScale=1). */
+    return { x: dpp[0], y: dpp[1] };
+  }
+
+  const rotRad = ((typeof currentRotDeg === 'number' ? currentRotDeg : 0) * Math.PI) / 180;
+
+  function unionRotFromMgi(X, Y) {
+    const u = unionUnrotFromMgi(X, Y);
+    if (!u) return null;
+    if (rotRad === 0) return u;
+    return rotateAround(u.x, u.y, 0, 0, rotRad);
+  }
+
+  const mgiCorners = [
+    [mgiRoi.minX, mgiRoi.minY],
+    [mgiRoi.maxX, mgiRoi.minY],
+    [mgiRoi.maxX, mgiRoi.maxY],
+    [mgiRoi.minX, mgiRoi.maxY],
+  ];
+  let buMinX = Infinity;
+  let buMinY = Infinity;
+  let buMaxX = -Infinity;
+  let buMaxY = -Infinity;
+  for (const [cx, cy] of mgiCorners) {
+    const u = unionUnrotFromMgi(cx, cy);
+    if (!u) return buildNadirGsdBezirkExportLayout(img, zClamped, mgiRoi);
+    buMinX = Math.min(buMinX, u.x);
+    buMinY = Math.min(buMinY, u.y);
+    buMaxX = Math.max(buMaxX, u.x);
+    buMaxY = Math.max(buMaxY, u.y);
+  }
+  const spanU = buMaxX - buMinX;
+  const spanV = buMaxY - buMinY;
+  const rotExtraRad = Math.abs(rotRad);
+  const rotExtraW = Math.round((spanU * (1 - Math.cos(rotExtraRad)) + spanV * Math.sin(rotExtraRad)) / 2);
+  const rotExtraH = Math.round((spanV * (1 - Math.cos(rotExtraRad)) + spanU * Math.sin(rotExtraRad)) / 2);
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  function bumpMgi(X, Y) {
+    const p = unionRotFromMgi(X, Y);
+    if (!p) return;
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+
+  for (const [cx, cy] of mgiCorners) bumpMgi(cx, cy);
+
+  const otCorners = [
+    ['xmin', 'ymax'],
+    ['xmax', 'ymax'],
+    ['xmax', 'ymin'],
+    ['xmin', 'ymin'],
+  ];
+  for (const t of orthoTilesData.tiles) {
+    for (const [xk, yk] of otCorners) bumpMgi(t[xk], t[yk]);
+  }
+
+  const W = img.width;
+  const H = img.height;
+  for (const [px, py] of [[0, 0], [W, 0], [W, H], [0, H]]) {
+    const g = pixelToGroundMgi(img, px, py, Z);
+    if (g) bumpMgi(g[0], g[1]);
+  }
+  for (const oimg of expandList) {
+    if (!oimg?.width) continue;
+    const Wn = oimg.width;
+    const Hn = oimg.height;
+    for (const [px, py] of [[0, 0], [Wn, 0], [Wn, Hn], [0, Hn]]) {
+      const g = pixelToGroundMgi(oimg, px, py, Z);
+      if (g) bumpMgi(g[0], g[1]);
+    }
+  }
+
+  if (!Number.isFinite(minX) || maxX <= minX || maxY <= minY) {
+    return buildNadirGsdBezirkExportLayout(img, zClamped, mgiRoi);
+  }
+
+  const minLeft = Math.min(0, minX - rotExtraW);
+  const minTop = Math.min(0, minY - rotExtraH);
+  const maxRight = maxX + rotExtraW;
+  const maxBottom = maxY + rotExtraH;
+  const unionW = Math.max(1, Math.round(maxRight - minLeft));
+  const unionH = Math.max(1, Math.round(maxBottom - minTop));
+
+  function unionPxFromMgi(X, Y) {
+    const p = unionRotFromMgi(X, Y);
+    if (!p) return null;
+    return { x: p.x - minLeft, y: p.y - minTop };
+  }
+
+  const orthoTileLayers = [];
+  for (const t of orthoTilesData.tiles) {
+    const pw = t.previewWidth || 1024;
+    const ph = t.previewHeight || 1024;
+    const p0 = unionPxFromMgi(t.xmin, t.ymax);
+    const p1 = unionPxFromMgi(t.xmax, t.ymax);
+    const p2 = unionPxFromMgi(t.xmax, t.ymin);
+    const p3 = unionPxFromMgi(t.xmin, t.ymin);
+    if (!p0 || !p1 || !p2 || !p3) continue;
+    const H = homographyFrom4Points2D(
+      [[0, 0], [pw, 0], [pw, ph], [0, ph]],
+      [[p0.x, p0.y], [p1.x, p1.y], [p2.x, p2.y], [p3.x, p3.y]],
+    );
+    if (!H) continue;
+    orthoTileLayers.push({
+      previewUrl: t.previewUrl,
+      pw,
+      ph,
+      mat3d: homography3x3ToMatrix3dString(H),
+      quadUnion: [[p0.x, p0.y], [p1.x, p1.y], [p2.x, p2.y], [p3.x, p3.y]],
+      mgiBounds: { xmin: t.xmin, xmax: t.xmax, ymin: t.ymin, ymax: t.ymax },
+    });
+  }
+  if (!orthoTileLayers.length) return buildNadirGsdBezirkExportLayout(img, zClamped, mgiRoi);
+
+  return {
+    unionW,
+    unionH,
+    minLeft,
+    minTop,
+    obliqueLeft: 0,
+    obliqueTop: 0,
+    orthoMarkerX: 0,
+    orthoMarkerY: 0,
+    orthoTilesHtml: '',
+    orthoTileLayers,
+    worldW: maxRight - minLeft,
+    worldH: maxBottom - minTop,
+    unionPxFromMgi,
+    affineGroundUnion: true,
+  };
+}
+
+function bezirkHrCollectOrthoPieces(layout, feat, roi) {
+  const orthoPieces = [];
+  for (const layer of layout.orthoTileLayers || []) {
+    const qu = layer.quadUnion;
+    if (!qu?.length) continue;
+    if (!quadBboxIntersectsRect(qu, roi.minX, roi.minY, roi.maxX, roi.maxY)) continue;
+    const mb = layer.mgiBounds;
+    if (mb && !mgiRectIntersectsBezirk(mb.xmin, mb.xmax, mb.ymin, mb.ymax, feat)) continue;
+    const pw = layer.pw;
+    const ph = layer.ph;
+    orthoPieces.push({
+      url: layer.previewUrl,
+      srcQuad: [[0, 0], [pw, 0], [pw, ph], [0, ph]],
+      dstQuad: qu,
+    });
+  }
+  return orthoPieces;
+}
+
 function bezirkOuterRingsMgi(feature) {
   return featureOuterRingsLonLat(feature).map(ring =>
     ring.map(([lon, lat]) => wgs84ToMgi.forward([lon, lat])),
@@ -4231,12 +4543,24 @@ async function downloadCurrent() {
 }
 
 /**
- * Stitch ortho preview + warped neighbors + main oblique into one HR crop (matches on-screen ortho union).
+ * Stitch ortho preview + warped obliques into one HR crop. Union size and ortho placement follow only
+ * Bezirk bounds in MGI, pyramid z, and ortho JSON GSD — not viewer rot/pan, marker, or neighbor layout.
  */
-async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layout, sortedNeighbors) {
+async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, sortedNeighbors) {
+  const mgiRoi = featureBezirkMgiPaddedBounds(feat);
+  if (!mgiRoi) {
+    alert('Could not compute Bezirk bounds.');
+    return;
+  }
+  const layout = buildCanonicalBezirkExportLayout(mainImg, z, mgiRoi, sortedNeighbors);
+  if (!layout) {
+    alert('HR export needs nadir ortho metadata (ortho tiles JSON) and a valid pyramid level so resolution comes from z.');
+    return;
+  }
+
   const roi = featureBezirkUnionBounds(layout, feat);
   if (!roi) {
-    alert('The Bezirk does not overlap the ortho-union footprint for this view (check Z / camera).');
+    alert('The Bezirk does not overlap the export map extent.');
     return;
   }
 
@@ -4248,21 +4572,7 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layou
     if (!confirm(`Export is large (${outW}×${outH} px) — may be slow or run out of memory. Continue?`)) return;
   }
 
-  const orthoPieces = [];
-  for (const layer of layout.orthoTileLayers || []) {
-    const qu = layer.quadUnion;
-    if (!qu?.length) continue;
-    if (!quadBboxIntersectsRect(qu, roi.minX, roi.minY, roi.maxX, roi.maxY)) continue;
-    const mb = layer.mgiBounds;
-    if (mb && !mgiRectIntersectsBezirk(mb.xmin, mb.xmax, mb.ymin, mb.ymax, feat)) continue;
-    const pw = layer.pw;
-    const ph = layer.ph;
-    orthoPieces.push({
-      url: layer.previewUrl,
-      srcQuad: [[0, 0], [pw, 0], [pw, ph], [0, ph]],
-      dstQuad: qu,
-    });
-  }
+  const orthoPieces = bezirkHrCollectOrthoPieces(layout, feat, roi);
 
   const neighborPiecesByCam = sortedNeighbors.map(nimg =>
     collectOrthoUnionWarpedPiecesForImage(nimg, z, layout, roi, feat));
@@ -4286,7 +4596,7 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layou
     : null;
 
   const tileCountLabel = drawOrder.length;
-  if (!confirm(`Export HR Bezirk (ortho union): ${outW}×${outH} px · z${z} · ${tileCountLabel} draw layers?`)) return;
+  if (!confirm(`Export HR Bezirk: ${outW}×${outH} px · z${z} · ×${scaleOut} out · ${tileCountLabel} draw layers?`)) return;
 
   const uniqueUrls = [...new Set(drawOrder.map(p => p.url))];
   const imgMap = new Map();
@@ -4375,7 +4685,7 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layou
   try {
     const a = document.createElement('a');
     a.href = canvas.toDataURL('image/jpeg', 0.92);
-    a.download = `${mainImg.name}_bezirk${districtHighlightBezNr}_ortho_union_z${z}_${outW}x${outH}.jpg`;
+    a.download = `${mainImg.name}_bezirk${districtHighlightBezNr}${sortedNeighbors.length ? '_ortho_union' : ''}_z${z}_${outW}x${outH}.jpg`;
     a.click();
   } catch (err) {
     const msg = (err?.name === 'SecurityError' || /taint/i.test(err?.message || ''))
@@ -4392,8 +4702,7 @@ async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layou
 }
 
 /**
- * Crop export: Bezirk axis-aligned bounds at pyramid level z, fetching only tiles that intersect.
- * Output size = crop × export scale (2×/3× upsamples the stitched native image).
+ * HR Bezirk: with ortho JSON, export uses the oblique weak-perspective union (marker + rotation match viewer) or nadir GSD fallback; else raw tile crop.
  */
 async function downloadBezirkHighRes() {
   if (!currentImage) return;
@@ -4419,28 +4728,30 @@ async function downloadBezirkHighRes() {
   if (!Number.isFinite(z)) z = maxZ;
   z = Math.max(0, Math.min(maxZ, z));
 
-  const scaleOut = Math.max(1, Math.min(32, Number(document.getElementById('exportRegionScaleSel')?.value) || 1));
+  const scaleRaw = Number(document.getElementById('exportRegionScaleSel')?.value);
+  const scaleOut = Math.max(1 / 16, Math.min(32, Number.isFinite(scaleRaw) && scaleRaw > 0 ? scaleRaw : 1));
+
+  if (orthoTilesData?.tiles?.length) {
+    let sorted = [];
+    if (orthographicUnionViewEnabled) {
+      const neighbors = orthoUnionNeighborImagesForComposite(img);
+      const mgiRoi0 = featureBezirkMgiPaddedBounds(feat);
+      const qc = mgiRoi0
+        ? [(mgiRoi0.minX + mgiRoi0.maxX) / 2, (mgiRoi0.minY + mgiRoi0.maxY) / 2]
+        : null;
+      sorted = [...neighbors].sort((a, b) => {
+        if (!qc) return 0;
+        const da = Math.hypot(qc[0] - a.lookAtMgi[0], qc[1] - a.lookAtMgi[1]);
+        const db = Math.hypot(qc[0] - b.lookAtMgi[0], qc[1] - b.lookAtMgi[1]);
+        return db - da;
+      });
+    }
+    await downloadBezirkHighResOrthoUnion(feat, img, z, scaleOut, sorted);
+    return;
+  }
 
   const hVal = document.getElementById('heightNum').value;
   const Zg = hVal === '' ? 0 : Number(hVal);
-
-  if (
-    orthographicUnionViewEnabled
-    && orthoTilesData?.tiles?.length
-  ) {
-    const neighbors = orthoUnionNeighborImagesForComposite(img);
-    const sorted = [...neighbors].sort((a, b) => {
-      const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
-      const da = Math.hypot(qx - a.lookAtMgi[0], qy - a.lookAtMgi[1]);
-      const db = Math.hypot(qx - b.lookAtMgi[0], qy - b.lookAtMgi[1]);
-      return db - da;
-    });
-    const unionLayout = computeOrthoLayout(img, currentRotDeg, currentContentW, currentContentH, sorted, true);
-    if (unionLayout?.affineGroundUnion) {
-      await downloadBezirkHighResOrthoUnion(feat, img, z, scaleOut, unionLayout, sorted);
-      return;
-    }
-  }
 
   const roi = featureSourcePixelBounds(img, feat, Zg);
   if (!roi) {
