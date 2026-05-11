@@ -89,6 +89,7 @@
     .tile-canvas-wrap { display: inline-block; line-height: 0; }
     .tile-row { display: flex; }
     .tile-row img { display: block; flex-shrink: 0; /*background: #111;*/ }
+    .tile-row .tile-ph { display: block; flex-shrink: 0; }
 
     /* Ortho union main warp: avoid stacking filters with matrix3d + rotate (extra softening). */
     .ortho-union-main-warp {
@@ -417,6 +418,19 @@
                oninput="document.getElementById('heightSlider').value=this.value; onHeightChange()">
         <span>m</span>
       </div>
+      <select id="districtHighlightSel" class="sort-select" style="padding:2px 4px;max-width:11rem"
+              title="Outside the selected Bezirk: tint (or full black with Blackout)"
+              onchange="onDistrictHighlightChange()">
+        <option value="">Bezirk highlight: off</option>
+      </select>
+      <label class="filter-label" title="Outside the Bezirk: opaque black (cutout). Off: semi-transparent gray dim.">
+        <input type="checkbox" id="districtHighlightBlackoutCb" disabled onchange="refreshDistrictDimOverlay()">
+        Blackout
+      </label>
+      <label class="filter-label" title="Single image only (not overlay / ortho union): lock to max z and fetch only tiles whose ground footprint intersects the Bezirk polygon — not the whole bounding box.">
+        <input type="checkbox" id="bezirkHrTilesOnlyCb" disabled onchange="onBezirkHrTilesOnlyChange()">
+        Overlap Bezirk (z max)
+      </label>
       <button class="btn-sm" id="markerToggleBtn"  onclick="toggleMarker()">● Marker</button>
       <button class="btn-sm" id="zoomMarkerBtn"   onclick="toggleZoomToMarker()">⊕ Zoom to</button>
       <button class="btn-sm" id="pinCenterBtn"    onclick="togglePinCenter()" style="opacity:.5"
@@ -460,7 +474,14 @@
         <option value="32">near 32</option>
         <option value="64">near 64</option>
         <option value="128">near 128</option>
-        <option value="265">near 265</option>
+        <option value="256">near 256</option>
+        <option value="384">near 384</option>
+        <option value="512">near 512</option>
+        <option value="640">near 640</option>
+        <option value="1024">near 1024</option>
+
+
+
       </select>
       <button type="button" class="btn-sm" id="orthoUnionViewBtn" onclick="toggleOrthographicUnionView()" style="opacity:.5"
               title="Ortho union: parallel ground projection at marker Z (weak perspective) + nadir ortho + optional neighbors. Removes depth shrinking along the view on flat ground; vertical façades still have camera tilt. Shift+O toggles nadir layer.">⊞ Ortho union</button>
@@ -476,6 +497,24 @@
       </label>
       <button class="btn-sm" id="autoRotateBtn"   onclick="toggleAutoRotate()">↻ Rotate to marker</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
+      <select id="exportRegionTileZSel" class="sort-select" style="padding:2px 4px;width:6.2rem"
+              title="Pyramid level for Bezirk HR export (finer = more detail, more tiles)"></select>
+      <select id="exportRegionScaleSel" class="sort-select" style="padding:2px 4px;width:4.5rem"
+              title="Scale exported pixels (upsamples stitched native — not extra sensor detail)">
+        <option value="1" selected>1× out</option>
+        <option value="2">2× out</option>
+        <option value="3">3× out</option>
+        <option value="4">4× out</option>
+        <option value="5">5× out</option>
+        <option value="6">6× out</option>
+        <option value="7">7× out</option>
+        <option value="8">8× out</option>
+        <option value="12">12× out</option>
+        <option value="16">16× out</option>
+
+      </select>
+      <button type="button" class="btn-sm" onclick="downloadBezirkHighRes()"
+              title="Crop export: Bezirk bounding box at chosen Z, loading only intersecting tiles">⬇ HR Bezirk</button>
       <span style="display:flex;align-items:center;gap:4px;font-size:.68rem;color:var(--text-dim);white-space:nowrap"
             title="Auto-advance through the sorted list (same as . key)">
         <button type="button" class="btn-sm" id="listPlayBtn" onclick="toggleListPlay()" style="padding:2px 8px">▶</button>
@@ -511,7 +550,7 @@ const IMAGE_SETS = [
   {
     id: '2023',
     label: 'Wien 2023',
-    remoteBaseUrl: 'https://cdn.map.dreamtent.dev/data/oblique/vienna/2023/',
+    remoteBaseUrl: 'https://cdn.map.dreamtent.dev/data/oblique/vienna/2023',
     imageJsonPath: 'sources/2023/image.json',
     tilesDir: 'sources/2023/tiles',
   },
@@ -525,6 +564,19 @@ const IMAGE_SETS = [
 ];
 
 let tileSize = 1024;
+/** Full URL to one tile JPEG; avoids `…/2023//RI…` when base ends with `/`. */
+function tileRemoteJpgUrl(img, z, x, y) {
+  const base = String(img?.remoteBaseUrl ?? '').replace(/\/+$/, '');
+  const name = String(img?.name ?? '').replace(/^\/+/, '');
+  return `${base}/${name}/${z}/${x}/${y}.jpg`;
+}
+/**
+ * Call before setting `src` on `Image` used with `canvas.drawImage` / `toDataURL`.
+ * The tile host must respond with Access-Control-Allow-Origin (e.g. https://dreamtent.dev or *).
+ */
+function applyObliqueTileCors(el) {
+  if (el && 'crossOrigin' in el) el.crossOrigin = 'anonymous';
+}
 /** Set during index load; copied onto each image row as remoteBaseUrl / setId. */
 let activeRemoteBaseUrl = IMAGE_SETS[0].remoteBaseUrl;
 let activeSetId = IMAGE_SETS[0].id;
@@ -988,6 +1040,126 @@ function homography3x3ToMatrix3dString(H) {
   return `matrix3d(${m.join(',')})`;
 }
 
+/** Maps affine: x' = a·sx + c·sy + e, y' = b·sx + d·sy + f (canvas setTransform order). */
+function affineFrom3PtPairs(s0, s1, s2, d0, d1, d2) {
+  const [sx0, sy0] = s0;
+  const [sx1, sy1] = s1;
+  const [sx2, sy2] = s2;
+  const [dx0, dy0] = d0;
+  const [dx1, dy1] = d1;
+  const [dx2, dy2] = d2;
+  const det = sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1);
+  if (Math.abs(det) < 1e-12) return null;
+  const id = 1 / det;
+  const a = id * (dx0 * (sy1 - sy2) + dx1 * (sy2 - sy0) + dx2 * (sy0 - sy1));
+  const c = id * (dx0 * (sx2 - sx1) + dx1 * (sx0 - sx2) + dx2 * (sx1 - sx0));
+  const e = dx0 - a * sx0 - c * sy0;
+  const b = id * (dy0 * (sy1 - sy2) + dy1 * (sy2 - sy0) + dy2 * (sy0 - sy1));
+  const d = id * (dy0 * (sx2 - sx1) + dy1 * (sx0 - sx2) + dy2 * (sx1 - sx0));
+  const f = dy0 - b * sx0 - d * sy0;
+  return { a, b, c, d, e, f };
+}
+
+function drawAffineTriangle(ctx, img, s0, s1, s2, d0, d1, d2) {
+  const m = affineFrom3PtPairs(s0, s1, s2, d0, d1, d2);
+  if (!m) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(d0[0], d0[1]);
+  ctx.lineTo(d1[0], d1[1]);
+  ctx.lineTo(d2[0], d2[1]);
+  ctx.closePath();
+  ctx.clip();
+  ctx.setTransform(m.a, m.b, m.c, m.d, m.e, m.f);
+  ctx.drawImage(img, 0, 0);
+  ctx.restore();
+}
+
+function drawAffineQuad(ctx, img, s0, s1, s2, s3, d0, d1, d2, d3) {
+  drawAffineTriangle(ctx, img, s0, s1, s2, d0, d1, d2);
+  drawAffineTriangle(ctx, img, s0, s2, s3, d0, d2, d3);
+}
+
+/**
+ * Map a rectangular patch of `img` onto a destination quadrilateral using the true homography,
+ * approximated with an adaptive grid so export matches CSS matrix3d (two affines per full quad are skewed).
+ */
+function drawImageMappedQuad(ctx, img, srcQuad, dstQuad) {
+  const [s0, s1, s2, s3] = srcQuad;
+  const [d0, d1, d2, d3] = dstQuad;
+  const H = homographyFrom4Points2D(srcQuad, dstQuad);
+  if (!H) {
+    drawAffineQuad(ctx, img, s0, s1, s2, s3, d0, d1, d2, d3);
+    return;
+  }
+  const minU = Math.min(s0[0], s1[0], s2[0], s3[0]);
+  const maxU = Math.max(s0[0], s1[0], s2[0], s3[0]);
+  const minV = Math.min(s0[1], s1[1], s2[1], s3[1]);
+  const maxV = Math.max(s0[1], s1[1], s2[1], s3[1]);
+  const w = maxU - minU;
+  const h = maxV - minV;
+  if (w < 1e-6 || h < 1e-6) return;
+
+  const db = quadBoundingBox(dstQuad);
+  const diagOut = Math.hypot(db.maxX - db.minX, db.maxY - db.minY);
+  const seg = Math.max(4, Math.min(28, Math.ceil(diagOut / 48)));
+  const ar = w / h;
+  let nx; let ny;
+  if (ar >= 1) {
+    nx = seg;
+    ny = Math.max(2, Math.round(seg / ar));
+  } else {
+    ny = seg;
+    nx = Math.max(2, Math.round(seg * ar));
+  }
+  nx = Math.min(40, Math.max(2, nx));
+  ny = Math.min(40, Math.max(2, ny));
+
+  for (let jj = 0; jj < ny; jj++) {
+    for (let ii = 0; ii < nx; ii++) {
+      const u0 = minU + (ii / nx) * w;
+      const u1 = minU + ((ii + 1) / nx) * w;
+      const v0 = minV + (jj / ny) * h;
+      const v1 = minV + ((jj + 1) / ny) * h;
+      const p00 = applyHomography2D(H, u0, v0);
+      const p10 = applyHomography2D(H, u1, v0);
+      const p11 = applyHomography2D(H, u1, v1);
+      const p01 = applyHomography2D(H, u0, v1);
+      if (!p00 || !p10 || !p11 || !p01) continue;
+      drawAffineQuad(
+        ctx, img,
+        [u0, v0], [u1, v0], [u1, v1], [u0, v1],
+        p00, p10, p11, p01,
+      );
+    }
+  }
+}
+
+function quadBoundingBox(q) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const [x, y] of q) {
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function quadBboxIntersectsRect(q, rx0, ry0, rx1, ry1) {
+  const b = quadBoundingBox(q);
+  return b.maxX > rx0 && b.minX < rx1 && b.maxY > ry0 && b.minY < ry1;
+}
+
+function scaleQuadFromRoi(q, roi, scaleOut) {
+  const ox = roi.minX * scaleOut;
+  const oy = roi.minY * scaleOut;
+  return q.map(([x, y]) => [x * scaleOut - ox, y * scaleOut - oy]);
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  LOAD INDEX
 // ═══════════════════════════════════════════════════════════════
@@ -1137,6 +1309,7 @@ async function loadIndex() {
     document.getElementById('progressFill').style.display = 'none';
     document.getElementById('searchBtn').disabled = false;
     updateCacheSizeDropdownLabels();
+    ensureDistrictBoundariesLoaded().catch(() => {});
     if (typeof initInfiniteScrollMode === 'function') initInfiniteScrollMode();
   } finally {
     if (setSel) setSel.disabled = false;
@@ -1375,7 +1548,7 @@ function renderList(items) {
       : '';
     return `<div class="result-item${img.inFrame===false?' result-outside':''}" data-idx="${idx}" onclick="selectImage(${idx},this)">
       <div class="thumb-wrap">
-        <img src="${img.remoteBaseUrl}/${img.name}/0/0/0.jpg" loading="lazy" onerror="this.style.opacity='.15'">
+        <img src="${tileRemoteJpgUrl(img, 0, 0, 0)}" loading="lazy" onerror="this.style.opacity='.15'">
       </div>
       <div class="result-meta">
         <div class="result-name">${img.name}</div>
@@ -1530,7 +1703,7 @@ let listPlayActive   = false;
 
 // Visual zoom (multiplier on top of the fit-to-viewer base scale).
 // Kept between image switches; independent of tile quality zoom.
-const VZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 6, 8, 12, 16, 20, 24, 30];
+const VZOOM_STEPS = [0.15, 0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 6, 8, 12, 16, 20, 24, 30];
 let viewerZoom = 1;          // current visual zoom multiplier
 let viewPadX = 0, viewPadY = 0;  // centering padding so marker-scroll math is correct
 let markerDX = -1, markerDY = -1; // last marker display position (px), -1 = no marker
@@ -1538,6 +1711,13 @@ const IMAGE_EDGE_TRIM_SOURCE_PX = 6;
 
 /** Loaded from orthofotos/2023/ortho-tiles.json — nadir orthophoto previews aligned in MGI. */
 let orthoTilesData = null;
+/** Last layout from computeOrthoLayout — unionPxFromMgi for district overlay in ortho-wrapped views. */
+let lastOrthoWrapLayout = null;
+/** BEZNR → GeoJSON feature from BEZIRKSGRENZEOGD.json (loaded lazily). */
+let districtFeaturesByBezNr = null;
+let districtBoundariesLoadPromise = null;
+/** Selected district number, or null = no highlight. */
+let districtHighlightBezNr = null;
 /** Offset from ortho union wrapper origin to rotClip top-left (single mode with ortho only). */
 let orthoContentOffsetX = 0, orthoContentOffsetY = 0;
 let orthoUnionMarkerX = null, orthoUnionMarkerY = null;
@@ -1606,6 +1786,8 @@ function openViewer(img, zoom) {
 
   renderTiles(img, zoom);
   preloadToCache(img, zoom);
+  populateExportRegionControls(img);
+  syncBezirkHrOptionsDisabled();
   updateOrbitDirectionHighlight();
 }
 
@@ -1680,7 +1862,7 @@ function waitForAllTilesDecoded(img, zoom) {
         const done = () => resolve();
         el.onload = done;
         el.onerror = done;
-        el.src = `${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg`;
+        el.src = tileRemoteJpgUrl(img, zoom, x, y);
         if (el.complete && el.naturalWidth) done();
       }));
     }
@@ -1723,7 +1905,7 @@ function buildNeighborLayerDOM(img, zoom) {
   for (let y = rows - 1; y >= 0; y--) {
     tilesHtml += '<div class="tile-row">';
     for (let x = 0; x < cols; x++) {
-      tilesHtml += `<img src="${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg"
+      tilesHtml += `<img src="${tileRemoteJpgUrl(img, zoom, x, y)}"
                         width="${dispTileW}" height="${dispTileW}"
                         loading="lazy" onerror="this.style.opacity='.1'"
                         title="z${zoom}/${x}/${y}">`;
@@ -2061,7 +2243,16 @@ function computeOrthoLayout(img, rotDeg, contentW, contentH, expandNeighborImage
     );
     if (!H) continue;
     const mat3d = homography3x3ToMatrix3dString(H);
-    orthoTileLayers.push({ previewUrl: t.previewUrl, pw, ph, mat3d });
+    orthoTileLayers.push({
+      previewUrl: t.previewUrl,
+      pw,
+      ph,
+      mat3d,
+      /** Union-space quad corners matching (0,0)→TL, (pw,0)→TR, (pw,ph)→BR, (0,ph)→BL in tile px. */
+      quadUnion: [[q0.x, q0.y], [q1.x, q1.y], [q2.x, q2.y], [q3.x, q3.y]],
+      /** Nadir ortho footprint in MGI (same fields as JSON tile). */
+      mgiBounds: { xmin: t.xmin, xmax: t.xmax, ymin: t.ymin, ymax: t.ymax },
+    });
     orthoTilesHtml += `<img src="${t.previewUrl}" alt="" draggable="false" loading="eager" decoding="async" width="${pw}" height="${ph}"
       style="position:absolute;left:0;top:0;opacity:${orthoTileOpacity};pointer-events:none;transform-origin:0 0;transform:${mat3d};clip-path:inset(${orthoEdgeTrim}px ${orthoEdgeTrim}px 0 0);"
       onerror="this.style.opacity='.1'"/>`;
@@ -2159,6 +2350,8 @@ function refreshOrthoSingleModeLive() {
   slot.style.top = `${layout.obliqueTop - layout.minTop}px`;
   orthoContentOffsetX = layout.obliqueLeft - layout.minLeft;
   orthoContentOffsetY = layout.obliqueTop - layout.minTop;
+  lastOrthoWrapLayout = layout;
+  refreshDistrictDimOverlay();
 }
 
 /**
@@ -2199,6 +2392,7 @@ function removeOrthoUnderlay() {
     area.classList.remove('ortho-bg-hidden');
   }
   orthoBackgroundVisible = true;
+  lastOrthoWrapLayout = null;
 }
 
 /** Apply .ortho-bg-hidden from orthoBackgroundVisible (call after has-ortho is set). */
@@ -2240,6 +2434,456 @@ function syncOrthoDimMainClass() {
   area.classList.toggle('has-ortho-dim-main', dim);
 }
 
+function stripDotOverlaySvg(html) {
+  return html.replace(/<svg\s+id=["']dotOverlay["'][^>]*>[\s\S]*?<\/svg>\s*/gi, '');
+}
+
+function stripDistrictDimSvg(html) {
+  return html.replace(/<svg\s+id=["']districtDimOverlay["'][^>]*>[\s\S]*?<\/svg>\s*/gi, '');
+}
+
+function ensureDistrictBoundariesLoaded() {
+  if (districtFeaturesByBezNr) return Promise.resolve(districtFeaturesByBezNr);
+  if (districtBoundariesLoadPromise) return districtBoundariesLoadPromise;
+  districtBoundariesLoadPromise = fetch('BEZIRKSGRENZEOGD.json')
+    .then(r => {
+      if (!r.ok) throw new Error(String(r.status));
+      return r.json();
+    })
+    .then(gj => {
+      const map = {};
+      for (const f of gj.features || []) {
+        const b = Number(f.properties?.BEZNR);
+        if (Number.isFinite(b)) map[b] = f;
+      }
+      map._loaded = true;
+      districtFeaturesByBezNr = map;
+      fillDistrictHighlightSelect();
+      return map;
+    })
+    .catch(err => {
+      console.warn('District boundaries', err.message);
+      districtFeaturesByBezNr = { _loaded: true };
+      return districtFeaturesByBezNr;
+    });
+  return districtBoundariesLoadPromise;
+}
+
+function fillDistrictHighlightSelect() {
+  const sel = document.getElementById('districtHighlightSel');
+  if (!sel || !districtFeaturesByBezNr) return;
+  const keys = Object.keys(districtFeaturesByBezNr).filter(k => k !== '_loaded').map(Number).sort((a, b) => a - b);
+  const prev = sel.value;
+  while (sel.options.length > 1) sel.remove(1);
+  for (const b of keys) {
+    const f = districtFeaturesByBezNr[b];
+    const lab = f?.properties?.NAMEK_NUM || `${b}.`;
+    sel.add(new Option(lab, String(b)));
+  }
+  if (keys.includes(Number(prev))) sel.value = prev;
+  const bo = document.getElementById('districtHighlightBlackoutCb');
+  if (bo) bo.disabled = !sel.value;
+  syncBezirkHrOptionsDisabled();
+}
+
+function onDistrictHighlightChange() {
+  const sel = document.getElementById('districtHighlightSel');
+  const v = sel?.value;
+  districtHighlightBezNr = v === '' ? null : Number(v);
+  const bo = document.getElementById('districtHighlightBlackoutCb');
+  if (bo) bo.disabled = !v;
+  syncBezirkHrOptionsDisabled();
+  refreshDistrictDimOverlay();
+  refreshDot();
+  ensureDistrictBoundariesLoaded().then(() => {
+    refreshDistrictDimOverlay();
+    refreshDot();
+  });
+}
+
+/**
+ * One closed GeoJSON ring [lon,lat][] → path segment `M...Z` in pixel space.
+ */
+function geoJsonRingToPathD(ring, projector) {
+  if (!ring || ring.length < 3) return '';
+  const p0 = projector(ring[0]);
+  if (!p0) return null;
+  let d = `M ${p0[0].toFixed(2)},${p0[1].toFixed(2)}`;
+  for (let i = 1; i < ring.length; i++) {
+    const p = projector(ring[i]);
+    if (!p) return null;
+    d += ` L ${p[0].toFixed(2)},${p[1].toFixed(2)}`;
+  }
+  d += ' Z';
+  return d;
+}
+
+/** Outer boundary ring(s) only (first ring of each polygon part). */
+function featureOuterRingsLonLat(feature) {
+  const g = feature?.geometry;
+  if (!g) return [];
+  if (g.type === 'Polygon') {
+    const c = g.coordinates;
+    return c && c[0] ? [c[0]] : [];
+  }
+  if (g.type === 'MultiPolygon') {
+    return (g.coordinates || []).map(poly => poly && poly[0]).filter(Boolean);
+  }
+  return [];
+}
+
+/** Usable source-pixel rectangle (trims stitched JPEG edge bleed). */
+function sourceVisibleRect(img) {
+  const trim = IMAGE_EDGE_TRIM_SOURCE_PX;
+  return {
+    x0: 0,
+    y0: Math.min(img.height, trim),
+    x1: Math.max(0, img.width - trim),
+    y1: img.height,
+  };
+}
+
+function tileSpanForZ(img, z) {
+  return tileSize * img.tileResolution[z];
+}
+
+/**
+ * Tile URL indices (tx, ty): ty = 0 is the bottom row, ty = rows − 1 is the top; image y = 0 at top.
+ */
+function tileSourceRectIndices(img, z, tx, ty) {
+  const span = tileSpanForZ(img, z);
+  const { rows } = tileDims(img.width, img.height, z, img.tileResolution);
+  const x0 = tx * span;
+  const x1 = Math.min((tx + 1) * span, img.width);
+  const y0 = (rows - 1 - ty) * span;
+  const y1 = Math.min(y0 + span, img.height);
+  return { x0, y0, x1, y1 };
+}
+
+function tilesIntersectingSourceRect(img, z, rx0, ry0, rx1, ry1) {
+  const { cols, rows } = tileDims(img.width, img.height, z, img.tileResolution);
+  const out = [];
+  for (let ty = 0; ty < rows; ty++) {
+    for (let tx = 0; tx < cols; tx++) {
+      const b = tileSourceRectIndices(img, z, tx, ty);
+      if (b.x1 > rx0 && b.x0 < rx1 && b.y1 > ry0 && b.y0 < ry1) out.push([tx, ty]);
+    }
+  }
+  return out;
+}
+
+/** Sample spacing along Bezirk rings in MGI (m) for export / HR tile bounds — vertices alone miss curved outline in oblique views. */
+const BEZIRK_RING_SAMPLE_STEP_M = 22;
+
+/**
+ * Closed lon/lat ring → MGI points along perimeter (chord subdivision; good for city-scale rings).
+ */
+function mgiPointsAlongRingLonLat(ringLonLat, stepM) {
+  if (!ringLonLat || ringLonLat.length < 2) return [];
+  let ring = ringLonLat;
+  const [fLon, fLat] = ring[0];
+  const [lLon, lLat] = ring[ring.length - 1];
+  if (Math.abs(fLon - lLon) < 1e-12 && Math.abs(fLat - lLat) < 1e-12) ring = ring.slice(0, -1);
+  if (ring.length < 2) return [];
+  const mgi = ring.map(([lon, lat]) => wgs84ToMgi.forward([lon, lat]));
+  const pts = [];
+  const n = mgi.length;
+  for (let i = 0; i < n; i++) {
+    const [x0, y0] = mgi[i];
+    const [x1, y1] = mgi[(i + 1) % n];
+    const dist = Math.hypot(x1 - x0, y1 - y0);
+    const steps = Math.min(800, Math.max(1, Math.ceil(dist / stepM)));
+    for (let s = 0; s < steps; s++) {
+      const t = s / steps;
+      pts.push([x0 + t * (x1 - x0), y0 + t * (y1 - y0)]);
+    }
+  }
+  return pts;
+}
+
+/** Axis-aligned bounds of Bezirk in native image pixels, clipped to visible image. */
+function featureSourcePixelBounds(img, feature, Z) {
+  if (!img?.pToImage || !feature) return null;
+  const rings = featureOuterRingsLonLat(feature);
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let any = false;
+  for (const ring of rings) {
+    const samples = mgiPointsAlongRingLonLat(ring, BEZIRK_RING_SAMPLE_STEP_M);
+    for (const [X, Y] of samples) {
+      const pp = groundMgiToPixel(img, X, Y, Z);
+      if (!pp) continue;
+      any = true;
+      minX = Math.min(minX, pp[0]);
+      maxX = Math.max(maxX, pp[0]);
+      minY = Math.min(minY, pp[1]);
+      maxY = Math.max(maxY, pp[1]);
+    }
+  }
+  if (!any) return null;
+  const vr = sourceVisibleRect(img);
+  const rw0 = maxX - minX;
+  const rh0 = maxY - minY;
+  const padX = Math.max(12, Math.ceil(rw0 * 0.015));
+  const padY = Math.max(12, Math.ceil(rh0 * 0.015));
+  minX = Math.max(vr.x0, Math.floor(minX - padX));
+  minY = Math.max(vr.y0, Math.floor(minY - padY));
+  maxX = Math.min(vr.x1, Math.ceil(maxX + padX));
+  maxY = Math.min(vr.y1, Math.ceil(maxY + padY));
+  if (maxX <= minX || maxY <= minY) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+/** Axis-aligned bounds of Bezirk in ortho-union pixel coords (same sampling as featureSourcePixelBounds). */
+function featureBezirkUnionBounds(layout, feature) {
+  if (!layout?.unionPxFromMgi || !feature) return null;
+  const rings = featureOuterRingsLonLat(feature);
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let any = false;
+  for (const ring of rings) {
+    const samples = mgiPointsAlongRingLonLat(ring, BEZIRK_RING_SAMPLE_STEP_M);
+    for (const [X, Y] of samples) {
+      const pp = layout.unionPxFromMgi(X, Y);
+      if (!pp) continue;
+      any = true;
+      minX = Math.min(minX, pp.x);
+      maxX = Math.max(maxX, pp.x);
+      minY = Math.min(minY, pp.y);
+      maxY = Math.max(maxY, pp.y);
+    }
+  }
+  if (!any) return null;
+  const rw0 = maxX - minX;
+  const rh0 = maxY - minY;
+  const padX = Math.max(12, Math.ceil(rw0 * 0.015));
+  const padY = Math.max(12, Math.ceil(rh0 * 0.015));
+  minX = Math.max(0, Math.floor(minX - padX));
+  minY = Math.max(0, Math.floor(minY - padY));
+  maxX = Math.min(layout.unionW, Math.ceil(maxX + padX));
+  maxY = Math.min(layout.unionH, Math.ceil(maxY + padY));
+  if (maxX <= minX || maxY <= minY) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+/** Bezirk outer ring(s) in MGI (one simple ring per polygon part). */
+function bezirkOuterRingsMgi(feature) {
+  return featureOuterRingsLonLat(feature).map(ring =>
+    ring.map(([lon, lat]) => wgs84ToMgi.forward([lon, lat])),
+  );
+}
+
+function groundPointInAnyBezirkRing(mx, my, ringsMgi) {
+  for (const ring of ringsMgi) {
+    if (ring.length >= 3 && pointInPolygon2D(mx, my, ring)) return true;
+  }
+  return false;
+}
+
+/**
+ * MGI axis-aligned rect [xmin,xmax]×[ymin,ymax] (ortho tile) intersects Bezirk area on the ground.
+ */
+function mgiRectIntersectsBezirk(xmin, xmax, ymin, ymax, feature) {
+  const ringsMgi = bezirkOuterRingsMgi(feature);
+  if (!ringsMgi.length) return true;
+  const span = 6;
+  for (let i = 0; i <= span; i++) {
+    for (let j = 0; j <= span; j++) {
+      const x = xmin + ((xmax - xmin) * i) / span;
+      const y = ymin + ((ymax - ymin) * j) / span;
+      if (groundPointInAnyBezirkRing(x, y, ringsMgi)) return true;
+    }
+  }
+  for (const ringLonLat of featureOuterRingsLonLat(feature)) {
+    for (const [mx, my] of mgiPointsAlongRingLonLat(ringLonLat, BEZIRK_RING_SAMPLE_STEP_M)) {
+      if (mx >= xmin && mx <= xmax && my >= ymin && my <= ymax) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Source tile (tx,ty) at z intersects Bezirk footprint (polygon), not just the district’s image-space AABB.
+ */
+function sourceTileIntersectsBezirk(img, z, tx, ty, feature, Z) {
+  const ringsMgi = bezirkOuterRingsMgi(feature);
+  if (!ringsMgi.length) return true;
+  const b = tileSourceRectIndices(img, z, tx, ty);
+  const span = 8;
+  for (let i = 0; i <= span; i++) {
+    for (let j = 0; j <= span; j++) {
+      const px = b.x0 + ((b.x1 - b.x0) * i) / span;
+      const py = b.y0 + ((b.y1 - b.y0) * j) / span;
+      const g = pixelToGroundMgi(img, px, py, Z);
+      if (!g) continue;
+      if (groundPointInAnyBezirkRing(g[0], g[1], ringsMgi)) return true;
+    }
+  }
+  for (const ringLonLat of featureOuterRingsLonLat(feature)) {
+    for (const [mx, my] of mgiPointsAlongRingLonLat(ringLonLat, BEZIRK_RING_SAMPLE_STEP_M)) {
+      const pp = groundMgiToPixel(img, mx, my, Z);
+      if (!pp) continue;
+      if (pp[0] >= b.x0 && pp[0] <= b.x1 && pp[1] >= b.y0 && pp[1] <= b.y1) return true;
+    }
+  }
+  return false;
+}
+
+function tilesOverlappingBezirk(img, z, feature, Z) {
+  const quick = featureSourcePixelBounds(img, feature, Z);
+  const { cols, rows } = tileDims(img.width, img.height, z, img.tileResolution);
+  const out = [];
+  for (let ty = 0; ty < rows; ty++) {
+    for (let tx = 0; tx < cols; tx++) {
+      if (quick) {
+        const b = tileSourceRectIndices(img, z, tx, ty);
+        if (!(b.x1 > quick.minX && b.x0 < quick.maxX && b.y1 > quick.minY && b.y0 < quick.maxY)) continue;
+      }
+      if (sourceTileIntersectsBezirk(img, z, tx, ty, feature, Z)) out.push([tx, ty]);
+    }
+  }
+  return out;
+}
+
+function bezirkAllowedTileKeySet(img, z) {
+  if (!districtFeaturesByBezNr || districtHighlightBezNr == null) return null;
+  const feat = districtFeaturesByBezNr[districtHighlightBezNr];
+  if (!feat || !img?.pToImage) return null;
+  const hVal = document.getElementById('heightNum').value;
+  const Z = hVal === '' ? 0 : Number(hVal);
+  const quick = featureSourcePixelBounds(img, feat, Z);
+  if (!quick) return null;
+  const { cols, rows } = tileDims(img.width, img.height, z, img.tileResolution);
+  const set = new Set();
+  for (let ty = 0; ty < rows; ty++) {
+    for (let tx = 0; tx < cols; tx++) {
+      const b = tileSourceRectIndices(img, z, tx, ty);
+      if (!(b.x1 > quick.minX && b.x0 < quick.maxX && b.y1 > quick.minY && b.y0 < quick.maxY)) continue;
+      if (sourceTileIntersectsBezirk(img, z, tx, ty, feat, Z)) set.add(`${tx},${ty}`);
+    }
+  }
+  return set;
+}
+
+function shouldUseBezirkHrTilesOnly() {
+  if (!document.getElementById('bezirkHrTilesOnlyCb')?.checked) return false;
+  if (districtHighlightBezNr == null) return false;
+  if (orthographicUnionViewEnabled || overlayEnabled) return false;
+  return true;
+}
+
+function syncBezirkHrOptionsDisabled() {
+  const cb = document.getElementById('bezirkHrTilesOnlyCb');
+  if (!cb) return;
+  const sel = document.getElementById('districtHighlightSel');
+  const bez = sel?.value;
+  const bad = orthographicUnionViewEnabled || overlayEnabled;
+  if (bad && cb.checked) cb.checked = false;
+  cb.disabled = !bez || bad;
+}
+
+function onBezirkHrTilesOnlyChange() {
+  syncBezirkHrOptionsDisabled();
+  if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
+}
+
+function populateExportRegionControls(img) {
+  const zSel = document.getElementById('exportRegionTileZSel');
+  if (!zSel || !img?.tileResolution) return;
+  const maxZ = img.tileResolution.length - 1;
+  const keep = zSel.value;
+  zSel.innerHTML = '';
+  for (let z = maxZ; z >= 0; z--) {
+    zSel.add(new Option(z === maxZ ? `z${z} · max` : `z${z}`, String(z)));
+  }
+  const k = Number(keep);
+  zSel.value = Number.isFinite(k) && k >= 0 && k <= maxZ ? String(k) : String(maxZ);
+}
+
+function refreshDistrictDimOverlay() {
+  const dim =
+    document.getElementById('rotPadDiv')?.querySelector('#districtDimOverlay')
+    || document.getElementById('orthoUnionWrap')?.querySelector('#districtDimOverlay');
+  if (!dim || !currentImage) {
+    if (dim) dim.innerHTML = '';
+    return;
+  }
+  if (districtHighlightBezNr == null || !districtFeaturesByBezNr) {
+    dim.innerHTML = '';
+    return;
+  }
+  const feat = districtFeaturesByBezNr[districtHighlightBezNr];
+  if (!feat) {
+    dim.innerHTML = '';
+    return;
+  }
+
+  const hVal = document.getElementById('heightNum').value;
+  const Z = hVal === '' ? 0 : Number(hVal);
+  const img = currentImage;
+  const scale = currentDispScale;
+  const trim = currentEdgeTrimDisp;
+
+  const unionWrap = document.getElementById('orthoUnionWrap');
+  const inUnion = unionWrap && dim.parentElement === unionWrap;
+
+  let projector;
+  if (inUnion && lastOrthoWrapLayout) {
+    projector = lonlat => {
+      const [X, Y] = wgs84ToMgi.forward([lonlat[0], lonlat[1]]);
+      const u = lastOrthoWrapLayout.unionPxFromMgi(X, Y);
+      return u ? [u.x, u.y] : null;
+    };
+  } else {
+    projector = lonlat => {
+      const [X, Y] = wgs84ToMgi.forward([lonlat[0], lonlat[1]]);
+      const pp = groundMgiToPixel(img, X, Y, Z);
+      if (!pp) return null;
+      return [pp[0] * scale, pp[1] * scale - trim];
+    };
+  }
+
+  const rings = featureOuterRingsLonLat(feat);
+  let pathD = '';
+  for (const ring of rings) {
+    const seg = geoJsonRingToPathD(ring, projector);
+    if (seg === null) {
+      dim.innerHTML = '';
+      return;
+    }
+    pathD += seg;
+  }
+  if (!pathD) {
+    dim.innerHTML = '';
+    return;
+  }
+
+  let bw = dim.clientWidth;
+  let bh = dim.clientHeight;
+  if (!(bw > 0 && bh > 0) && inUnion && lastOrthoWrapLayout) {
+    bw = lastOrthoWrapLayout.unionW;
+    bh = lastOrthoWrapLayout.unionH;
+  }
+  if (!(bw > 0 && bh > 0)) {
+    bw = parseFloat(dim.style.width) || 800;
+    bh = parseFloat(dim.style.height) || 600;
+  }
+
+  const uid = 'districtDimMask' + Math.random().toString(36).slice(2, 9);
+  const blackout = document.getElementById('districtHighlightBlackoutCb')?.checked;
+  const fill = blackout ? '#000' : 'rgba(95,95,104,0.6)';
+  dim.innerHTML =
+    `<defs><mask id="${uid}">`
+    + `<rect width="${bw}" height="${bh}" fill="white"/>`
+    + `<path d="${pathD}" fill="black"/>`
+    + `</mask></defs>`
+    + `<rect width="${bw}" height="${bh}" fill="${fill}" mask="url(#${uid})"/>`;
+}
+
 /**
  * When ortho data exists, wrap the oblique stack and nadir preview tiles in a shared MGI-aligned canvas.
  */
@@ -2250,6 +2894,7 @@ function wrapInnerHtmlWithOrthoIfNeeded(innerHtml, img, rotDeg, contentW, conten
   const layout = computeOrthoLayout(img, rotDeg, contentW, contentH);
   const area = document.getElementById('viewerArea');
   if (!layout) {
+    lastOrthoWrapLayout = null;
     if (area) {
       area.classList.remove('has-ortho');
       area.classList.remove('has-ortho-dim-main');
@@ -2262,11 +2907,18 @@ function wrapInnerHtmlWithOrthoIfNeeded(innerHtml, img, rotDeg, contentW, conten
 
   orthoContentOffsetX = layout.obliqueLeft - layout.minLeft;
   orthoContentOffsetY = layout.obliqueTop - layout.minTop;
+  lastOrthoWrapLayout = layout;
+
+  const innerNoDot = stripDistrictDimSvg(stripDotOverlaySvg(innerHtml));
+  const slotLeft = layout.obliqueLeft - layout.minLeft;
+  const slotTop = layout.obliqueTop - layout.minTop;
 
   return `
     <div id="orthoUnionWrap" style="position:relative;width:${layout.unionW}px;height:${layout.unionH}px;flex-shrink:0;">
       <div id="orthoBaseLayer" style="position:absolute;left:0;top:0;width:100%;height:100%;z-index:0;pointer-events:none;overflow:visible;filter:saturate(0.88) brightness(0.92);">${layout.orthoTilesHtml}</div>
-      <div id="orthoObliqueSlot" style="position:absolute;left:${layout.obliqueLeft - layout.minLeft}px;top:${layout.obliqueTop - layout.minTop}px;z-index:1;">${innerHtml}</div>
+      <div id="orthoObliqueSlot" style="position:absolute;left:${slotLeft}px;top:${slotTop}px;z-index:1;">${innerNoDot}</div>
+      <svg id="districtDimOverlay" xmlns="http://www.w3.org/2000/svg" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;z-index:2;pointer-events:none;"></svg>
+      <svg id="dotOverlay" xmlns="http://www.w3.org/2000/svg" data-ortho-union="wrap" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;overflow:visible;pointer-events:none;z-index:3;"></svg>
     </div>`;
 }
 
@@ -2341,7 +2993,7 @@ function buildOrthoUnionWarpedTileLayer(img, zoom, layout, zIndex, className) {
       const mat3d = homography3x3ToMatrix3dString(H);
 
       tilesHtml += `<div class="ortho-union-tile-warp" style="position:absolute;left:0;top:0;width:${cssPx(cropW)}px;height:${cssPx(cropH)}px;transform:${mat3d};">
-        <img src="${img.remoteBaseUrl}/${img.name}/${zTiles}/${x}/${y}.jpg"
+        <img src="${tileRemoteJpgUrl(img, zTiles, x, y)}"
              width="${cssPx(tileCssW)}" height="${cssPx(tileCssW)}"
              draggable="false" loading="lazy" decoding="async" onerror="this.style.opacity='.1'"
              title="z${zTiles}/${x}/${y}"
@@ -2351,6 +3003,59 @@ function buildOrthoUnionWarpedTileLayer(img, zoom, layout, zIndex, className) {
   }
   if (!tilesHtml) return '';
   return `<div class="${className}" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;z-index:${zIndex};pointer-events:none;">${tilesHtml}</div>`;
+}
+
+/**
+ * Warped oblique tiles in union space for HR export (same geometry as buildOrthoUnionWarpedTileLayer, JPEG-native quads).
+ */
+function collectOrthoUnionWarpedPiecesForImage(img, z, layout, roiUnion, feature) {
+  const out = [];
+  if (!img?.pToImage || !layout?.unionPxFromMgi || !roiUnion) return out;
+  const maxZ = Math.max(0, (img.tileResolution?.length || 1) - 1);
+  const zTiles = Math.min(Math.max(0, z), maxZ);
+  const hVal = document.getElementById('heightNum').value;
+  const Z = hVal === '' ? 0 : Number(hVal);
+  const { cols, rows } = tileDims(img.width, img.height, zTiles, img.tileResolution);
+  const res = img.tileResolution[zTiles];
+  const tileSpanSrc = tileSize * res;
+  const extraTopSrc = rows * tileSpanSrc - img.height;
+  const trim = IMAGE_EDGE_TRIM_SOURCE_PX;
+  const visibleMaxX = Math.max(0, img.width - trim);
+  const visibleMinY = Math.min(img.height, trim);
+  const r = tileSize / tileSpanSrc;
+
+  for (let y = rows - 1; y >= 0; y--) {
+    for (let x = 0; x < cols; x++) {
+      const tileX0 = x * tileSpanSrc;
+      const tileY0 = (rows - 1 - y) * tileSpanSrc - extraTopSrc;
+      const x0 = Math.max(0, tileX0);
+      const y0 = Math.max(visibleMinY, tileY0);
+      const x1 = Math.min(visibleMaxX, tileX0 + tileSpanSrc);
+      const y1 = Math.min(img.height, tileY0 + tileSpanSrc);
+      if (x1 <= x0 || y1 <= y0) continue;
+
+      const corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+      const dst = [];
+      let ok = true;
+      for (const [px, py] of corners) {
+        const g = pixelToGroundMgi(img, px, py, Z);
+        const u = g ? layout.unionPxFromMgi(g[0], g[1]) : null;
+        if (!u) { ok = false; break; }
+        dst.push([u.x, u.y]);
+      }
+      if (!ok) continue;
+      if (!quadBboxIntersectsRect(dst, roiUnion.minX, roiUnion.minY, roiUnion.maxX, roiUnion.maxY)) continue;
+      if (feature && !sourceTileIntersectsBezirk(img, zTiles, x, y, feature, Z)) continue;
+
+      const srcQuad = corners.map(([sx, sy]) => [(sx - tileX0) * r, (sy - tileY0) * r]);
+      out.push({
+        url: tileRemoteJpgUrl(img, zTiles, x, y),
+        srcQuad,
+        dstQuad: dst,
+      });
+    }
+  }
+  return out;
 }
 
 function buildOrthoUnionNeighborSlot(neighborImg, zoom, layout, zIndex) {
@@ -2398,12 +3103,15 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
   const layout = computeOrthoLayout(img, rotDeg, contentW, contentH, sorted, true);
   if (!layout) {
     orthoUnionMarkerX = orthoUnionMarkerY = null;
+    lastOrthoWrapLayout = null;
     orthographicUnionViewEnabled = false;
     const btn = document.getElementById('orthoUnionViewBtn');
     if (btn) btn.style.opacity = '.5';
     renderTiles(img, zoomUi);
     return;
   }
+
+  lastOrthoWrapLayout = layout;
 
   area.classList.add('has-ortho');
 
@@ -2437,12 +3145,25 @@ function renderOrthoUnionCompositeView(area, img, zoomUi, rotDeg, contentW, cont
   const slotW = warp.H ? `${layout.unionW}px` : 'auto';
   const slotH = warp.H ? `${layout.unionH}px` : 'auto';
 
+  const dz = slotZ + 1;
+  let obliqueInner = warp.html;
+  if (warp.H) obliqueInner = stripDotOverlaySvg(obliqueInner);
+  else obliqueInner = stripDistrictDimSvg(obliqueInner);
+  let postSlotSvgs =
+    `<svg id="districtDimOverlay" xmlns="http://www.w3.org/2000/svg" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;z-index:${dz};pointer-events:none;"></svg>`;
+  if (warp.H) {
+    obliqueInner = stripDotOverlaySvg(warp.html);
+    postSlotSvgs +=
+      `<svg id="dotOverlay" xmlns="http://www.w3.org/2000/svg" data-ortho-union="1" style="position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;overflow:visible;pointer-events:none;z-index:${dz + 1};"></svg>`;
+  }
+
   area.innerHTML = `
     <div id="rotPadDiv" style="padding:${padY}px ${padX}px;min-width:max-content;background:#080a0e;">
       <div id="orthoUnionWrap" style="position:relative;width:${layout.unionW}px;height:${layout.unionH}px;flex-shrink:0;">
         <div id="orthoBaseLayer" style="position:absolute;left:0;top:0;width:100%;height:100%;z-index:0;pointer-events:none;overflow:visible;filter:saturate(0.88) brightness(0.92);">${layout.orthoTilesHtml}</div>
         ${neighborSlotsHtml}
-        <div id="orthoObliqueSlot" style="position:absolute;left:${slotLeft}px;top:${slotTop}px;width:${slotW};height:${slotH};z-index:${slotZ};">${warp.html}</div>
+        <div id="orthoObliqueSlot" style="position:absolute;left:${slotLeft}px;top:${slotTop}px;width:${slotW};height:${slotH};z-index:${slotZ};">${obliqueInner}</div>
+        ${postSlotSvgs}
       </div>
     </div>`;
 
@@ -2457,7 +3178,11 @@ function renderTiles(img, zoom) {
   if (!orthographicUnionViewEnabled) orthoUnionMarkerX = orthoUnionMarkerY = null;
   const area = document.getElementById('viewerArea');
   const maxTileZ = img.tileResolution.length - 1;
-  const zoomIdx = Math.max(0, Math.min(maxTileZ, zoom));
+  const zoomParam = Math.max(0, Math.min(maxTileZ, zoom));
+  let zoomIdx = zoomParam;
+  const hrRoiTiles = shouldUseBezirkHrTilesOnly();
+  if (hrRoiTiles) zoomIdx = maxTileZ;
+  const bezirkTileSet = hrRoiTiles ? bezirkAllowedTileKeySet(img, zoomIdx) : null;
   const {cols, rows} = tileDims(img.width, img.height, zoomIdx, img.tileResolution);
   const res = img.tileResolution[zoomIdx];
 
@@ -2511,10 +3236,15 @@ function renderTiles(img, zoom) {
   for (let y = rows - 1; y >= 0; y--) {
     tilesHtml += '<div class="tile-row">';
     for (let x = 0; x < cols; x++) {
-      tilesHtml += `<img src="${img.remoteBaseUrl}/${img.name}/${zoomIdx}/${x}/${y}.jpg"
-                        width="${dispTileW}" height="${dispTileW}"
-                        loading="lazy" onerror="this.style.opacity='.1'"
-                        title="z${zoomIdx}/${x}/${y}">`;
+      const key = `${x},${y}`;
+      if (bezirkTileSet && !bezirkTileSet.has(key)) {
+        tilesHtml += `<div class="tile-ph" style="width:${dispTileW}px;height:${dispTileW}px;background:#0a0c10;"></div>`;
+      } else {
+        tilesHtml += `<img src="${tileRemoteJpgUrl(img, zoomIdx, x, y)}"
+                          width="${dispTileW}" height="${dispTileW}"
+                          loading="lazy" onerror="this.style.opacity='.1'"
+                          title="z${zoomIdx}/${x}/${y}">`;
+      }
     }
     tilesHtml += '</div>';
   }
@@ -2534,7 +3264,8 @@ function renderTiles(img, zoom) {
       <div style="position:absolute;top:-${topBlack + edgeTrimDisp}px;left:0;">
         <div class="${tileStackClass}">${tilesHtml}</div>
       </div>
-      <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
+      <svg id="districtDimOverlay" xmlns="http://www.w3.org/2000/svg" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
+      <svg id="dotOverlay" xmlns="http://www.w3.org/2000/svg" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
 
   if (orthographicUnionViewEnabled) {
@@ -2598,6 +3329,7 @@ function renderTiles(img, zoom) {
   syncOrthoDimMainClass();
   syncOrthoBackgroundVisibilityClass();
   syncViewerAreaOverflow();
+  syncBezirkHrOptionsDisabled();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2609,6 +3341,7 @@ function renderTiles(img, zoom) {
 function onHeightChange() {
   refreshDot();
   if (searchResults.length) applySort();
+  if (currentImage && shouldUseBezirkHrTilesOnly()) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
 
 function refreshDot() {
@@ -2624,7 +3357,12 @@ function refreshDot() {
   svgEl.innerHTML = '';
 
   // Always compute display position — needed by scrollToMarker even when hidden.
-  if (!result) { markerDX = markerDY = -1; return; }
+  if (!result) {
+    markerDX = markerDY = -1;
+    refreshDistrictDimOverlay();
+    scrollToMarker();
+    return;
+  }
   const [px, py] = result;
 
   const scale = currentDispScale;
@@ -2634,12 +3372,25 @@ function refreshDot() {
   markerDY = dy;
 
   // Draw the marker only when visible.
-  if (markerVisible && svgEl.dataset.orthoUnion === '1' && orthoUnionMarkerX != null && orthoUnionMarkerY != null) {
+  let uxUnion = null;
+  let uyUnion = null;
+  if (svgEl.dataset.orthoUnion === '1' && orthoUnionMarkerX != null && orthoUnionMarkerY != null) {
+    uxUnion = orthoUnionMarkerX;
+    uyUnion = orthoUnionMarkerY;
+  } else if (svgEl.dataset.orthoUnion === 'wrap' && lastOrthoWrapLayout) {
+    const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+    const u = lastOrthoWrapLayout.unionPxFromMgi(mx, my);
+    if (u) {
+      uxUnion = u.x;
+      uyUnion = u.y;
+    }
+  }
+  if (markerVisible && uxUnion != null && uyUnion != null) {
     const wrap = document.getElementById('orthoUnionWrap');
     const W = wrap?.clientWidth || 1;
     const H = wrap?.clientHeight || 1;
-    const ux = orthoUnionMarkerX;
-    const uy = orthoUnionMarkerY;
+    const ux = uxUnion;
+    const uy = uyUnion;
     const stroke = currentImage.coversPoint ? '#ff3333' : '#ffaa00';
     const warn = currentImage.coversPoint ? '' : `
       <rect x="0" y="0" width="${W}" height="22" fill="#000" fill-opacity=".55"/>
@@ -2742,6 +3493,8 @@ function refreshDot() {
       if (!orthographicUnionViewEnabled && !compositeNeighbors) refreshOrthoSingleModeLive();
     }
   }
+
+  refreshDistrictDimOverlay();
 
   // Scroll to marker if that option is on (independent of marker visibility).
   scrollToMarker();
@@ -2884,7 +3637,7 @@ function preloadToCache(img, zoom) {
   for (let y = rows - 1; y >= 0; y--) {
     for (let x = 0; x < cols; x++) {
       const el = new Image();
-      el.src = `${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg`;
+      el.src = tileRemoteJpgUrl(img, zoom, x, y);
       container.appendChild(el);
       els.push(el);
     }
@@ -2920,7 +3673,7 @@ async function preloadToCacheWithTileProgress(img, zoom, onTile) {
           };
           el.onload = done;
           el.onerror = done;
-          el.src = `${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg`;
+          el.src = tileRemoteJpgUrl(img, zoom, x, y);
           container.appendChild(el);
           els.push(el);
         })
@@ -3216,6 +3969,54 @@ function scrollToMarker() {
   }
 }
 
+/** Bezirk rings → canvas path (union pixel space, ROI-relative output coords). */
+function bezirkAppendClipPathUnionPx(ctx, layout, feature, roi, scaleOut) {
+  let any = false;
+  for (const ringLonLat of featureOuterRingsLonLat(feature)) {
+    const pts = mgiPointsAlongRingLonLat(ringLonLat, BEZIRK_RING_SAMPLE_STEP_M);
+    let started = false;
+    for (const [mx, my] of pts) {
+      const u = layout.unionPxFromMgi(mx, my);
+      if (!u) continue;
+      const x = (u.x - roi.minX) * scaleOut;
+      const y = (u.y - roi.minY) * scaleOut;
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else ctx.lineTo(x, y);
+    }
+    if (started) {
+      ctx.closePath();
+      any = true;
+    }
+  }
+  return any;
+}
+
+/** Bezirk rings → canvas path (native source image space, ROI-relative output coords). Returns false if no geometry. */
+function bezirkAppendClipPathSourcePx(ctx, img, feature, Z, roi, scaleOut) {
+  let any = false;
+  for (const ringLonLat of featureOuterRingsLonLat(feature)) {
+    const pts = mgiPointsAlongRingLonLat(ringLonLat, BEZIRK_RING_SAMPLE_STEP_M);
+    let started = false;
+    for (const [mx, my] of pts) {
+      const pp = groundMgiToPixel(img, mx, my, Z);
+      if (!pp) continue;
+      const x = (pp[0] - roi.minX) * scaleOut;
+      const y = (pp[1] - roi.minY) * scaleOut;
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else ctx.lineTo(x, y);
+    }
+    if (started) {
+      ctx.closePath();
+      any = true;
+    }
+  }
+  return any;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  DOWNLOAD
 // ═══════════════════════════════════════════════════════════════
@@ -3235,10 +4036,11 @@ async function downloadCurrent() {
   let failed = 0;
   const BATCH = 20;
   const loadTile = (x,y) => new Promise(res => {
-    const el = new Image(); //el.crossOrigin='anonymous';
+    const el = new Image();
+    applyObliqueTileCors(el);
     el.onload = () => { ctx.drawImage(el, x*tileSize, (rows-1-y)*tileSize, tileSize, tileSize); res(); };
     el.onerror = () => { failed++; res(); };
-    el.src = `${img.remoteBaseUrl}/${img.name}/${maxZoom}/${x}/${y}.jpg`;
+    el.src = tileRemoteJpgUrl(img, maxZoom, x, y);
   });
 
   for (let i=0; i<tasks.length; i+=BATCH) {
@@ -3251,13 +4053,286 @@ async function downloadCurrent() {
     a.href = canvas.toDataURL('image/jpeg', 0.92);
     a.download = `${img.name}_z${maxZoom}.jpg`;
     a.click();
-  } catch(e) {
-    alert(e);
-    console.log(e);
+  } catch (e) {
+    const msg = (e?.name === 'SecurityError' || /taint/i.test(e?.message || ''))
+      ? 'Export needs CORS on the tile CDN: serve JPEGs with Access-Control-Allow-Origin including https://dreamtent.dev (or *). Example: add the header on cdn.map.dreamtent.dev.'
+      : (e?.message || String(e));
+    alert(msg);
+    console.error(e);
     const w = window.open('','_blank');
-    const urls = tasks.map(([x,y]) => `${img.remoteBaseUrl}/${img.name}/${maxZoom}/${x}/${y}.jpg`).join('\n');
+    const urls = tasks.map(([x,y]) => tileRemoteJpgUrl(img, maxZoom, x, y)).join('\n');
     w.document.write(`<pre style="font:12px monospace;background:#0d1117;color:#c9d1d9;padding:16px">${urls}</pre>`);
   }
+}
+
+/**
+ * Stitch ortho preview + warped neighbors + main oblique into one HR crop (matches on-screen ortho union).
+ */
+async function downloadBezirkHighResOrthoUnion(feat, mainImg, z, scaleOut, layout, sortedNeighbors) {
+  const roi = featureBezirkUnionBounds(layout, feat);
+  if (!roi) {
+    alert('The Bezirk does not overlap the ortho-union footprint for this view (check Z / camera).');
+    return;
+  }
+
+  const rw = roi.maxX - roi.minX;
+  const rh = roi.maxY - roi.minY;
+  const outW = Math.max(1, Math.round(rw * scaleOut));
+  const outH = Math.max(1, Math.round(rh * scaleOut));
+  if (outW * outH > 120e6) {
+    if (!confirm(`Export is large (${outW}×${outH} px) — may be slow or run out of memory. Continue?`)) return;
+  }
+
+  const orthoPieces = [];
+  for (const layer of layout.orthoTileLayers || []) {
+    const qu = layer.quadUnion;
+    if (!qu?.length) continue;
+    if (!quadBboxIntersectsRect(qu, roi.minX, roi.minY, roi.maxX, roi.maxY)) continue;
+    const mb = layer.mgiBounds;
+    if (mb && !mgiRectIntersectsBezirk(mb.xmin, mb.xmax, mb.ymin, mb.ymax, feat)) continue;
+    const pw = layer.pw;
+    const ph = layer.ph;
+    orthoPieces.push({
+      url: layer.previewUrl,
+      srcQuad: [[0, 0], [pw, 0], [pw, ph], [0, ph]],
+      dstQuad: qu,
+    });
+  }
+
+  const neighborPieces = [];
+  for (const nimg of sortedNeighbors) {
+    neighborPieces.push(...collectOrthoUnionWarpedPiecesForImage(nimg, z, layout, roi, feat));
+  }
+  const mainPieces = collectOrthoUnionWarpedPiecesForImage(mainImg, z, layout, roi, feat);
+
+  const drawOrder = [...orthoPieces, ...neighborPieces, ...mainPieces];
+  if (!drawOrder.length) {
+    alert('Nothing to export — no tiles or ortho previews intersect this Bezirk at the chosen level.');
+    return;
+  }
+
+  const tileCountLabel = orthoPieces.length + neighborPieces.length + mainPieces.length;
+  if (!confirm(`Export HR Bezirk (ortho union): ${outW}×${outH} px · z${z} · ${tileCountLabel} draw layers?`)) return;
+
+  const uniqueUrls = [...new Set(drawOrder.map(p => p.url))];
+  const imgMap = new Map();
+  let failedLoads = 0;
+  const BATCH = 16;
+  const sub = document.getElementById('viewerSub');
+
+  for (let i = 0; i < uniqueUrls.length; i += BATCH) {
+    const chunk = uniqueUrls.slice(i, i + BATCH);
+    await Promise.all(chunk.map(u => new Promise(res => {
+      if (imgMap.has(u)) {
+        res();
+        return;
+      }
+      const el = new Image();
+      applyObliqueTileCors(el);
+      el.onload = () => {
+        imgMap.set(u, el);
+        res();
+      };
+      el.onerror = () => {
+        failedLoads++;
+        imgMap.set(u, null);
+        res();
+      };
+      el.src = u;
+    })));
+    if (sub) {
+      sub.textContent = `HR ortho union… loading ${Math.min(i + BATCH, uniqueUrls.length)}/${uniqueUrls.length}`;
+    }
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#0a0c10';
+  ctx.fillRect(0, 0, outW, outH);
+  ctx.save();
+  ctx.beginPath();
+  if (bezirkAppendClipPathUnionPx(ctx, layout, feat, roi, scaleOut)) ctx.clip();
+
+  let drawMiss = 0;
+  for (const piece of drawOrder) {
+    const el = imgMap.get(piece.url);
+    if (!el) {
+      drawMiss++;
+      continue;
+    }
+    try {
+      const d = scaleQuadFromRoi(piece.dstQuad, roi, scaleOut);
+      drawImageMappedQuad(ctx, el, piece.srcQuad, d);
+    } catch (e) {
+      console.warn(e);
+      drawMiss++;
+    }
+  }
+  ctx.restore();
+
+  try {
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/jpeg', 0.92);
+    a.download = `${mainImg.name}_bezirk${districtHighlightBezNr}_ortho_union_z${z}_${outW}x${outH}.jpg`;
+    a.click();
+  } catch (err) {
+    const msg = (err?.name === 'SecurityError' || /taint/i.test(err?.message || ''))
+      ? 'Export needs CORS on the tile CDN: serve JPEGs with Access-Control-Allow-Origin including https://dreamtent.dev (or *).'
+      : (err?.message || String(err));
+    alert(msg);
+    console.error(err);
+  }
+
+  const failed = failedLoads + drawMiss;
+  if (sub) {
+    sub.textContent = failed ? `HR ortho union finished (${failed} pieces missing)` : 'HR ortho union finished';
+  }
+}
+
+/**
+ * Crop export: Bezirk axis-aligned bounds at pyramid level z, fetching only tiles that intersect.
+ * Output size = crop × export scale (2×/3× upsamples the stitched native image).
+ */
+async function downloadBezirkHighRes() {
+  if (!currentImage) return;
+  if (districtHighlightBezNr == null) {
+    alert('Select a Bezirk first (dropdown above).');
+    return;
+  }
+  await ensureDistrictBoundariesLoaded();
+  const feat = districtFeaturesByBezNr[districtHighlightBezNr];
+  if (!feat) {
+    alert('Bezirk boundaries are not loaded.');
+    return;
+  }
+  const img = currentImage;
+  if (!img.pToImage) {
+    alert('This image has no camera model — cannot map the Bezirk.');
+    return;
+  }
+
+  const maxZ = img.tileResolution.length - 1;
+  const zSel = document.getElementById('exportRegionTileZSel');
+  let z = zSel ? Number(zSel.value) : maxZ;
+  if (!Number.isFinite(z)) z = maxZ;
+  z = Math.max(0, Math.min(maxZ, z));
+
+  const scaleOut = Math.max(1, Math.min(32, Number(document.getElementById('exportRegionScaleSel')?.value) || 1));
+
+  const hVal = document.getElementById('heightNum').value;
+  const Zg = hVal === '' ? 0 : Number(hVal);
+
+  if (
+    orthographicUnionViewEnabled
+    && orthoTilesData?.tiles?.length
+  ) {
+    const neighbors = orthoUnionNeighborImagesForComposite(img);
+    const sorted = [...neighbors].sort((a, b) => {
+      const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+      const da = Math.hypot(qx - a.lookAtMgi[0], qy - a.lookAtMgi[1]);
+      const db = Math.hypot(qx - b.lookAtMgi[0], qy - b.lookAtMgi[1]);
+      return db - da;
+    });
+    const unionLayout = computeOrthoLayout(img, currentRotDeg, currentContentW, currentContentH, sorted, true);
+    if (unionLayout?.affineGroundUnion) {
+      await downloadBezirkHighResOrthoUnion(feat, img, z, scaleOut, unionLayout, sorted);
+      return;
+    }
+  }
+
+  const roi = featureSourcePixelBounds(img, feat, Zg);
+  if (!roi) {
+    alert('The Bezirk does not overlap the visible part of this image (check Z / camera).');
+    return;
+  }
+
+  const rw = roi.maxX - roi.minX;
+  const rh = roi.maxY - roi.minY;
+  const outW = Math.max(1, Math.round(rw * scaleOut));
+  const outH = Math.max(1, Math.round(rh * scaleOut));
+  if (outW * outH > 120e6) {
+    if (!confirm(`Export is large (${outW}×${outH} px) — may be slow or run out of memory. Continue?`)) return;
+  }
+
+  const tiles = tilesOverlappingBezirk(img, z, feat, Zg);
+  if (!tiles.length) {
+    alert('No tiles overlap this Bezirk polygon at the chosen pyramid level.');
+    return;
+  }
+
+  if (!confirm(`Export HR Bezirk crop: ${outW}×${outH} px · z${z} · ${tiles.length} tiles (polygon overlap only)?`)) return;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#0a0c10';
+  ctx.fillRect(0, 0, outW, outH);
+  ctx.save();
+  ctx.beginPath();
+  if (bezirkAppendClipPathSourcePx(ctx, img, feat, Zg, roi, scaleOut)) ctx.clip();
+
+  const span = tileSpanForZ(img, z);
+  const r = tileSize / span;
+  let failed = 0;
+  const BATCH = 16;
+
+  const loadOne = ([tx, ty]) => new Promise(res => {
+    const el = new Image();
+    applyObliqueTileCors(el);
+    el.onload = () => {
+      try {
+        const b = tileSourceRectIndices(img, z, tx, ty);
+        const ix0 = Math.max(b.x0, roi.minX);
+        const ix1 = Math.min(b.x1, roi.maxX);
+        const iy0 = Math.max(b.y0, roi.minY);
+        const iy1 = Math.min(b.y1, roi.maxY);
+        if (ix1 <= ix0 || iy1 <= iy0) { res(); return; }
+        const sx = (ix0 - b.x0) * r;
+        const sy = (iy0 - b.y0) * r;
+        const sw = (ix1 - ix0) * r;
+        const sh = (iy1 - iy0) * r;
+        const dx = (ix0 - roi.minX) * scaleOut;
+        const dy = (iy0 - roi.minY) * scaleOut;
+        const dw = (ix1 - ix0) * scaleOut;
+        const dh = (iy1 - iy0) * scaleOut;
+        ctx.drawImage(el, sx, sy, sw, sh, dx, dy, dw, dh);
+      } catch (e) {
+        console.warn(e);
+        failed++;
+      }
+      res();
+    };
+    el.onerror = () => { failed++; res(); };
+    el.src = tileRemoteJpgUrl(img, z, tx, ty);
+  });
+
+  const sub = document.getElementById('viewerSub');
+  for (let i = 0; i < tiles.length; i += BATCH) {
+    await Promise.all(tiles.slice(i, i + BATCH).map(loadOne));
+    if (sub) sub.textContent = `HR export… ${Math.min(i + BATCH, tiles.length)}/${tiles.length} tiles`;
+  }
+  ctx.restore();
+
+  try {
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/jpeg', 0.92);
+    a.download = `${img.name}_bezirk${districtHighlightBezNr}_z${z}_${outW}x${outH}.jpg`;
+    a.click();
+  } catch (err) {
+    const msg = (err?.name === 'SecurityError' || /taint/i.test(err?.message || ''))
+      ? 'Export needs CORS on the tile CDN: serve JPEGs with Access-Control-Allow-Origin including https://dreamtent.dev (or *).'
+      : (err?.message || String(err));
+    alert(msg);
+    console.error(err);
+  }
+  if (sub) sub.textContent = failed ? `HR export finished (${failed} tiles failed)` : 'HR export finished';
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3316,6 +4391,7 @@ function toggleOverlay() {
     // Back to single-image mode — re-render clears all layers via area.innerHTML.
     if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
   }
+  syncBezirkHrOptionsDisabled();
 }
 
 function toggleOrthographicUnionView() {
@@ -3323,6 +4399,7 @@ function toggleOrthographicUnionView() {
   const btn = document.getElementById('orthoUnionViewBtn');
   if (btn) btn.style.opacity = orthographicUnionViewEnabled ? '' : '.5';
   syncViewerAreaOverflow();
+  syncBezirkHrOptionsDisabled();
   if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
 
@@ -3494,7 +4571,7 @@ function switchToImageBg(img, qx, qy) {
   probe.onload  = commit;
   probe.onerror = commit;
   setTimeout(commit, 800);
-  probe.src = `${img.remoteBaseUrl}/${img.name}/0/0/0.jpg`;
+  probe.src = tileRemoteJpgUrl(img, 0, 0, 0);
 }
 
 function highlightInList(name) {
