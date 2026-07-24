@@ -500,6 +500,21 @@
         <input type="checkbox" id="orthoUnionVoronoiDebugCb" onchange="onOrthoUnionVoronoiOptionsChange()">
         V debug
       </label>
+      <span class="filter-label" style="display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap;max-width:22rem"
+            title="Nearest-cam &amp; shingle: move each camera’s site ray on its own image (source px from frame centre; +u right, +v down). Same offset applied to every camera.">
+        <label style="display:inline-flex;align-items:center;gap:3px;white-space:nowrap">
+          <input type="checkbox" id="voronoiSiteCustomCb" onchange="onVoronoiSiteCustomChange()">
+          Site Δ
+        </label>
+        <input type="number" id="voronoiSiteOffsetUPx" value="0" step="20"
+               style="width:54px;padding:2px 4px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.72rem"
+               title="Δu (pixels): shift site ray right from image centre" oninput="onVoronoiSiteOffsetInput()" disabled>
+        <input type="number" id="voronoiSiteOffsetVPx" value="0" step="20"
+               style="width:54px;padding:2px 4px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.72rem"
+               title="Δv (pixels): shift site ray down from image centre" oninput="onVoronoiSiteOffsetInput()" disabled>
+        <button type="button" class="btn-sm" id="voronoiSiteOffsetResetBtn" onclick="resetVoronoiSiteOffsets()"
+                style="padding:1px 5px;font-size:.62rem" title="Clear offsets (back to centre ray)" disabled>Reset</button>
+      </span>
       <button class="btn-sm" id="lockImagesBtn"    onclick="toggleLockImages()">🔓 Lock image</button>
       <label class="filter-label" style="margin-left:4px"
              title="Decode every tile for the next view before swapping. Current image stays until the new one is ready.">
@@ -878,11 +893,56 @@ function groundMgiToPixel(img, X, Y, Z) {
  * MGI point used as a Voronoi site for “nearest cam”: centre-pixel ray ∩ ground plane at the same Z as
  * heightNum (ortho union / tiles). `lookAtMgi` on the image is computed at parse time for Z=0 only, so
  * it can disagree with the viewer when elevation ≠ 0.
+ * Optional: toolbar “Site Δ” shifts the ray origin in each camera’s image (same Δu,Δv for all).
  */
+function voronoiSiteCustomEnabled() {
+  return document.getElementById('voronoiSiteCustomCb')?.checked === true;
+}
+
+function syncVoronoiSiteControlsDisabled() {
+  const on = voronoiSiteCustomEnabled();
+  for (const id of ['voronoiSiteOffsetUPx', 'voronoiSiteOffsetVPx', 'voronoiSiteOffsetResetBtn']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !on;
+  }
+}
+
+function onVoronoiSiteCustomChange() {
+  syncVoronoiSiteControlsDisabled();
+  onVoronoiSiteOffsetInput();
+}
+
+function onVoronoiSiteOffsetInput() {
+  if (currentImage && orthographicUnionViewEnabled) {
+    renderTiles(currentImage, getTileZoomIndex(currentImage));
+  }
+}
+
+function resetVoronoiSiteOffsets() {
+  const u = document.getElementById('voronoiSiteOffsetUPx');
+  const v = document.getElementById('voronoiSiteOffsetVPx');
+  if (u) u.value = '0';
+  if (v) v.value = '0';
+  onVoronoiSiteOffsetInput();
+}
+
 function cameraVoronoiSiteMgi(img, groundZ) {
   if (!img) return null;
   if (img.pToImage) {
-    const g = pixelToGroundMgi(img, img.width / 2, img.height / 2, groundZ);
+    let px = img.width / 2;
+    let py = img.height / 2;
+    if (voronoiSiteCustomEnabled()) {
+      const du = Number(document.getElementById('voronoiSiteOffsetUPx')?.value);
+      const dv = Number(document.getElementById('voronoiSiteOffsetVPx')?.value);
+      if (Number.isFinite(du)) px += du;
+      if (Number.isFinite(dv)) py += dv;
+    }
+    const trim = IMAGE_EDGE_TRIM_SOURCE_PX;
+    const maxX = Math.max(trim + 1e-3, img.width - trim);
+    const maxY = Math.max(trim + 1e-3, img.height - trim);
+    px = Math.max(trim, Math.min(maxX, px));
+    py = Math.max(trim, Math.min(maxY, py));
+    const g = pixelToGroundMgi(img, px, py, groundZ);
     if (g && Number.isFinite(g[0]) && Number.isFinite(g[1])) return g;
   }
   if (img.lookAtMgi?.length >= 2) return [img.lookAtMgi[0], img.lookAtMgi[1]];
