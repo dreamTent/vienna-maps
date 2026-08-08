@@ -494,11 +494,41 @@ const IMAGE_SETS = [
   {
     id: '2020',
     label: 'Wien 2020',
-    remoteBaseUrl: 'https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/Oblique_Wien_2020',
+    remoteBaseUrl: 'https://cdn.map.dreamtent.dev/data/oblique/vienna/2020/',
     imageJsonPath: 'sources/2020/image.json',
     tilesDir: 'sources/2020/tiles',
   },
 ];
+
+/**
+ * Nadir orthophoto underlay Image sources.
+ * Either value may be a relative local path or an absolute URL on another host.
+ * THe S0 images in total are only 90MB
+ * 
+ * Local examples:
+ *   indexUrl: 'orthofotos/2023/ortho-tiles.json'
+ *   imageBaseUrl: 'orthofotos/2023/'
+ * CDN examples:
+ *   indexUrl: 'https://cdn.map.dreamtent.dev/data/orthofoto/vienna/2023/ortho-tiles.json'
+ *   imageBaseUrl: 'https://cdn.map.dreamtent.dev/data/orthofoto/vienna/2023/'
+ */
+const ORTHO_SOURCE = {
+  indexUrl: 'orthofotos/2023/ortho-tiles.json',
+  imageBaseUrl: 'orthofotos/2023/',
+};
+
+/** Rewrite tile previewUrl paths to ORTHO_SOURCE.imageBaseUrl. */
+function applyOrthoSourceUrls(data) {
+  if (!data || !data.tiles) return data;
+  const base = ORTHO_SOURCE.imageBaseUrl || '';
+  const baseNorm = base.endsWith('/') ? base : `${base}/`;
+  for (const t of data.tiles) {
+    const file = (t.previewUrl && String(t.previewUrl).split('/').pop())
+      || (t.id ? `${t.id}_s0.jpg` : null);
+    if (file) t.previewUrl = baseNorm + file;
+  }
+  return data;
+}
 
 let tileSize = 1024;
 /** Set during index load; copied onto each image row as remoteBaseUrl / setId. */
@@ -1059,9 +1089,9 @@ async function loadIndex() {
     loadedCount = 0;
     const total = tileFiles.length;
 
-    const orthoFetch = fetch('orthofotos/2023/ortho-tiles.json')
+    const orthoFetch = fetch(ORTHO_SOURCE.indexUrl)
       .then(r => (r.ok ? r.json() : null))
-      .then(d => { orthoTilesData = d; })
+      .then(d => { orthoTilesData = d ? applyOrthoSourceUrls(d) : null; })
       .catch(() => { orthoTilesData = null; });
 
     await Promise.all([orthoFetch, ...tileFiles.map(async tile => {
@@ -1479,7 +1509,7 @@ let viewPadX = 0, viewPadY = 0;  // centering padding so marker-scroll math is c
 let markerDX = -1, markerDY = -1; // last marker display position (px), -1 = no marker
 const IMAGE_EDGE_TRIM_SOURCE_PX = 6;
 
-/** Loaded from orthofotos/2023/ortho-tiles.json — nadir orthophoto previews aligned in MGI. */
+/** Loaded via ORTHO_SOURCE — nadir orthophoto previews aligned in MGI. */
 let orthoTilesData = null;
 /** Offset from ortho union wrapper origin to rotClip top-left (single mode with ortho only). */
 let orthoContentOffsetX = 0, orthoContentOffsetY = 0;
