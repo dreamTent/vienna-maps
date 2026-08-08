@@ -83,7 +83,7 @@
 
     .viewer-area { flex: 1; overflow: auto; background: #080a0e; cursor: grab; position: relative; }
     /* Dim main oblique only when ortho is the only thing behind it — if reprojected neighbors sit under #rotPadDiv, dimming looks like a double image */
-    .viewer-area.has-ortho-dim-main #rotPadDiv .tile-canvas-wrap { opacity: 0.78; }
+    /*.viewer-area.has-ortho-dim-main #rotPadDiv .tile-canvas-wrap { opacity: 0.78; } */
     /* Shift+O: hide nadir ortho; restore full opacity on main oblique while hidden */
     .viewer-area.ortho-bg-hidden #orthoUnderlay,
     .viewer-area.ortho-bg-hidden #orthoBaseLayer { visibility: hidden !important; }
@@ -115,16 +115,20 @@
     ::-webkit-scrollbar-track { background: var(--bg); }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-    /* Mobile “infinite scroll”: map only — left + viewer toolbars stay in DOM for scripts */
-    body.infinite-scroll .header { display: none !important; }
-    body.infinite-scroll .left-panel { display: none !important; }
-    body.infinite-scroll #viewerHeader { display: none !important; }
-    body.infinite-scroll .app { height: 100vh; height: 100dvh; }
+    /* Infinite scroll: map stays below orbit FAB */
     body.infinite-scroll .right-panel { min-height: 0; }
-    /* Keep map below fixed UI (orbit FAB is a body-level sibling after .app) */
     body.infinite-scroll .app {
       position: relative;
       z-index: 0;
+    }
+    /* Toggle: hide search list + toolbars (button stays in orbit FAB) */
+    body.chrome-hidden .header { display: none !important; }
+    body.chrome-hidden .left-panel { display: none !important; }
+    body.chrome-hidden #viewerHeader { display: none !important; }
+    body.chrome-hidden .app { height: 100vh; height: 100dvh; }
+    .orbit-tool.chrome-toggle[aria-pressed="true"] {
+      border-color: var(--accent2);
+      color: var(--accent2);
     }
     /* Pinch / one-finger pan — avoid browser scroll & zoom stealing gestures */
     .right-panel .viewer-area {
@@ -263,6 +267,8 @@
     <div class="spinner" id="spinner"></div>
     <span id="badgeText">Loading index…</span>
   </div>
+  <button type="button" class="btn-sm" id="chromeToggleHeaderBtn" onclick="toggleChromeUi()"
+          title="Hide search list and toolbars">Hide UI</button>
 </div>
 
 <div class="app">
@@ -348,7 +354,7 @@
           <input type="checkbox" id="filterOutOfFrame" onchange="applySort()">
           Hide ⚠ outside
         </label>
-        <input type="number" id="frameRadiusM" value="0" min="0" max="2000" step="5"
+        <input type="number" id="frameRadiusM" value="0" min="0" max="250" step="5"
                class="filter-input" style="width:52px"
                title="Radius (m) around the marker that must be fully inside the image"
                oninput="applySort()">
@@ -401,10 +407,14 @@
               title="Keep the marker pinned to the exact viewport centre; image translates, dark space fills the edges">⊙ Pin centre</button>
       <button class="btn-sm" id="overlayBtn"     onclick="toggleOverlay()"  style="opacity:.5"
               title="Stack images when navigating — each new image is layered on top, aligned so the marker stays at the same screen position. Best combined with ⊙ Pin centre.">⧉ Overlay</button>
+      <button class="btn-sm" id="orthoToggleBtn" onclick="toggleOrthoBackground()"
+              title="Show/hide nadir orthophoto underlay (Shift+O)">▣ Ortho</button>
       <select id="overlayLayersSel" class="sort-select" disabled onchange="onOverlayLayersChange()"
               title="Max layers kept in the overlay stack" style="padding:2px 4px">
+        <option value="0" selected>×0</option>
+        <option value="1">×1</option>
         <option value="2">×2</option>
-        <option value="3" selected>×3</option>
+        <option value="3">×3</option>
         <option value="5">×5</option>
         <option value="10">×10</option>
         <option value="20">×20</option>
@@ -1106,7 +1116,7 @@ async function loadIndex() {
       }
     })]);
 
-    if (currentImage && !overlayEnabled) {
+    if (currentImage) {
       const z = getTileZoomIndex(currentImage);
       renderTiles(currentImage, z);
     }
@@ -1488,8 +1498,9 @@ let currentRotDeg    = 0;  // degrees currently applied as CSS rotate() on the c
 let currentEdgeTrimDisp = 0; // displayed trim in px to hide source-edge black bleed
 let autoRotate       = false; // when true, rotate so the marker is horizontally centred
 let pinMarkerCenter  = false; // when true, translate the image so the marker is at the exact viewport centre
-let overlayEnabled   = false; // when true, stack images as layers aligned at the marker
-let overlayMaxLayers = 1;    // max layers kept in the overlay stack
+/** When true: keep a history stack, neighbors, blur/reproject. Layout is always the absolute overlay path. */
+let overlayEnabled   = false;
+let overlayMaxLayers = 1;    // max history layers when overlayEnabled (forced to 1 when off)
 let overlayBlurFixed = 0;   // px applied to every layer behind the main (top) layer
 let overlayBlurStep  = 0;    // px of blur added per layer further back (0 = no blur)
 let overlayNeighborCount = 0; // 0,4,8,… preloaded nearest images shown when reproject is on
@@ -1727,13 +1738,19 @@ function removeNeighborPreviewLayers(area) {
   });
 }
 
+/** Max history layers to keep: full stack when overlay is on, otherwise a single main frame. */
+function effectiveOverlayHistoryLimit() {
+  return overlayEnabled ? overlayMaxLayers : 1;
+}
+
 /** Max user-navigated layers; neighbor previews do not count toward this cap. */
 function trimOverlayHistory() {
   const area = document.getElementById('viewerArea');
-  if (!area || !overlayEnabled) return;
+  if (!area) return;
+  const max = effectiveOverlayHistoryLimit();
   while (true) {
     const userLayers = Array.from(area.children).filter(el => el._overlayHistory);
-    if (userLayers.length <= overlayMaxLayers) break;
+    if (userLayers.length <= max) break;
     userLayers[0].remove();
   }
 }
@@ -2045,7 +2062,7 @@ function applyOrthoLayoutToUnderlay(el, layout) {
  * Must run before scrollToMarker so _orthoMarkerX/Y match the current search point.
  */
 function refreshOrthoUnderlayLive() {
-  if (!overlayEnabled || !currentImage) return;
+  if (!currentImage) return;
   const el = document.getElementById('orthoUnderlay');
   if (!el) return;
   const layout = computeOrthoLayout(currentImage, currentRotDeg, currentContentW, currentContentH);
@@ -2117,9 +2134,35 @@ function syncOrthoBackgroundVisibilityClass() {
   const area = document.getElementById('viewerArea');
   if (!area || !area.classList.contains('has-ortho')) {
     area?.classList.remove('ortho-bg-hidden');
+    syncOrthoToggleButtons();
     return;
   }
   area.classList.toggle('ortho-bg-hidden', !orthoBackgroundVisible);
+  syncOrthoToggleButtons();
+}
+
+/** Keep header + FAB ortho buttons in sync with visibility / availability. */
+function syncOrthoToggleButtons() {
+  const area = document.getElementById('viewerArea');
+  const hasOrtho = !!(area && area.classList.contains('has-ortho'));
+  const hdr = document.getElementById('orthoToggleBtn');
+  const fab = document.getElementById('orthoToggleFabBtn');
+  const labelOn = '▣ Ortho';
+  const labelOff = '▢ Ortho';
+  if (hdr) {
+    hdr.disabled = !hasOrtho;
+    hdr.textContent = orthoBackgroundVisible ? labelOn : labelOff;
+    hdr.style.opacity = !hasOrtho ? '.35' : (orthoBackgroundVisible ? '' : '.5');
+    hdr.title = hasOrtho
+      ? (orthoBackgroundVisible ? 'Hide nadir orthophoto underlay (Shift+O)' : 'Show nadir orthophoto underlay (Shift+O)')
+      : 'No orthophoto underlay for this view';
+  }
+  if (fab) {
+    fab.disabled = !hasOrtho;
+    fab.style.opacity = !hasOrtho ? '.35' : (orthoBackgroundVisible ? '' : '.5');
+    fab.setAttribute('aria-pressed', orthoBackgroundVisible && hasOrtho ? 'true' : 'false');
+    fab.title = hdr ? hdr.title : '';
+  }
 }
 
 /** Hotkey: Shift+O when viewer has ortho (single or overlay mode). */
@@ -2177,7 +2220,7 @@ function wrapInnerHtmlWithOrthoIfNeeded(innerHtml, img, rotDeg, contentW, conten
 }
 
 function renderTiles(img, zoom) {
-  if (overlayEnabled) orthoContentOffsetX = orthoContentOffsetY = 0;
+  orthoContentOffsetX = orthoContentOffsetY = 0;
   const area = document.getElementById('viewerArea');
   const {cols, rows} = tileDims(img.width, img.height, zoom, img.tileResolution);
   const res = img.tileResolution[zoom];
@@ -2215,18 +2258,10 @@ function renderTiles(img, zoom) {
   currentContentH = contentH;
   updateAutoRotateLabel(rotDeg);
 
-  // In pin-centre or overlay mode padding is irrelevant (translate handles positioning).
-  // In normal mode centre the image, with extra room for rotated corners.
-  if (pinMarkerCenter || overlayEnabled) {
-    viewPadX = 0;
-    viewPadY = 0;
-  } else {
-    const rotRad    = Math.abs(rotDeg) * Math.PI / 180;
-    const rotExtraW = Math.round((contentW * (1 - Math.cos(rotRad)) + contentH * Math.sin(rotRad)) / 2);
-    const rotExtraH = Math.round((contentH * (1 - Math.cos(rotRad)) + contentW * Math.sin(rotRad)) / 2);
-    viewPadX = Math.max(0, Math.floor((viewW - contentW) / 2)) + rotExtraW;
-    viewPadY = Math.max(0, Math.floor((viewH - contentH) / 2)) + rotExtraH;
-  }
+  // Absolute marker-centring: CSS translate on each layer (same path with or without overlay stacking).
+  viewPadX = 0;
+  viewPadY = 0;
+  area.style.overflow = 'hidden';
 
   let tilesHtml = '';
   for (let y = rows - 1; y >= 0; y--) {
@@ -2234,7 +2269,7 @@ function renderTiles(img, zoom) {
     for (let x = 0; x < cols; x++) {
       tilesHtml += `<img src="${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg"
                         width="${dispTileW}" height="${dispTileW}"
-                        loading="lazy" onerror="this.style.opacity='.1'"
+                        loading="eager" decoding="async" onerror="this.style.opacity='.1'"
                         title="z${zoom}/${x}/${y}">`;
     }
     tilesHtml += '</div>';
@@ -2245,7 +2280,6 @@ function renderTiles(img, zoom) {
     : '';
 
   // IDs rotPadDiv / rotClipDiv / dotOverlay always belong to the CURRENT (topmost) layer.
-  // refreshDot() and scrollToMarker() use these IDs so they always affect the live layer.
   const innerHtml = `
     <div id="rotClipDiv" style="position:relative;width:${clipW}px;height:${clipH}px;overflow:hidden;${rotStyle}">
       <div style="position:absolute;top:-${topBlack + edgeTrimDisp}px;left:0;">
@@ -2254,47 +2288,33 @@ function renderTiles(img, zoom) {
       <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
 
-  if (overlayEnabled) {
-    // ── OVERLAY MODE ─────────────────────────────────────────────
-    updateOrthoUnderlayForOverlay(img, rotDeg, contentW, contentH);
-    // Strip IDs from the previous current layer so only the new layer owns them.
-    const oldPad  = area.querySelector('#rotPadDiv');
-    const oldClip = area.querySelector('#rotClipDiv');
-    const oldSvg  = area.querySelector('#dotOverlay');
-    if (oldPad)  oldPad.removeAttribute('id');
-    if (oldClip) oldClip.removeAttribute('id');
-    if (oldSvg)  oldSvg.remove();   // old layers get no dot overlay
+  updateOrthoUnderlayForOverlay(img, rotDeg, contentW, contentH);
 
-    // Append the new layer; it is position:absolute so all layers stack on top of each other.
-    const layer = document.createElement('div');
-    layer.id    = 'rotPadDiv';
-    layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform;';
-    layer.innerHTML = innerHtml;
-    layer._overlayImage = img;
-    layer._overlayRotDeg = rotDeg;
-    layer._overlayHistory = true;
-    layer._overlayNeighborPreview = false;
-    area.appendChild(layer);
+  const oldPad  = area.querySelector('#rotPadDiv');
+  const oldClip = area.querySelector('#rotClipDiv');
+  const oldSvg  = area.querySelector('#dotOverlay');
+  if (oldPad)  oldPad.removeAttribute('id');
+  if (oldClip) oldClip.removeAttribute('id');
+  if (oldSvg)  oldSvg.remove();
 
-    trimOverlayHistory();
-    scheduleRebuildOverlayNeighborLayers();
-  } else {
-    // ── SINGLE MODE ──────────────────────────────────────────────
-    removeOrthoUnderlay();
-    const displayInner = wrapInnerHtmlWithOrthoIfNeeded(innerHtml, img, rotDeg, contentW, contentH);
-    area.innerHTML = `
-      <div id="rotPadDiv" style="padding:${viewPadY}px ${viewPadX}px;min-width:max-content;background:#080a0e;">
-        ${displayInner}
-      </div>`;
-  }
+  const layer = document.createElement('div');
+  layer.id = 'rotPadDiv';
+  layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform;';
+  layer.innerHTML = innerHtml;
+  layer._overlayImage = img;
+  layer._overlayRotDeg = rotDeg;
+  layer._overlayHistory = true;
+  layer._overlayNeighborPreview = false;
+  area.appendChild(layer);
+
+  trimOverlayHistory();
+  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
 
   refreshDot();
   updateCacheSizeDropdownLabels();
   updateZoomPillClasses();
-  if (overlayEnabled) {
-    syncOrthoUnderlayTransform();
-    applyOverlayStitchedLayerVisibility();
-  }
+  syncOrthoUnderlayTransform();
+  if (overlayEnabled) applyOverlayStitchedLayerVisibility();
   syncOrthoDimMainClass();
   syncOrthoBackgroundVisibilityClass();
 }
@@ -2382,9 +2402,9 @@ function refreshDot() {
       updateAutoRotateLabel(newRot);
       const clipDiv = document.getElementById('rotClipDiv');
       if (clipDiv) clipDiv.style.transform = `rotate(${newRot}deg)`;
-      // Re-derive padding so scrollToMarker stays accurate.
-      // In pin-centre mode padding is always 0 — the translate handles positioning.
-      if (!pinMarkerCenter) {
+      // Absolute layers use CSS translate for centring — do not rewrite scroll padding.
+      const padDiv = document.getElementById('rotPadDiv');
+      if (padDiv && !padDiv._overlayImage && !pinMarkerCenter) {
         const area2  = document.getElementById('viewerArea');
         const vW2    = area2.clientWidth  || 800;
         const vH2    = area2.clientHeight || 600;
@@ -2393,15 +2413,14 @@ function refreshDot() {
         const exH    = Math.round((currentContentH * (1 - Math.cos(rRad)) + currentContentW * Math.sin(rRad)) / 2);
         viewPadX = Math.max(0, Math.floor((vW2 - currentContentW) / 2)) + exW;
         viewPadY = Math.max(0, Math.floor((vH2 - currentContentH) / 2)) + exH;
-        const padDiv = document.getElementById('rotPadDiv');
-        if (padDiv) padDiv.style.padding = `${viewPadY}px ${viewPadX}px`;
+        padDiv.style.padding = `${viewPadY}px ${viewPadX}px`;
       }
     }
   }
 
   // Keep ortho aligned with the marker / auto-rotate before layer translate (avoids lag and innerHTML blink).
   if (markerDX >= 0 && markerDY >= 0) {
-    if (overlayEnabled && document.getElementById('orthoUnderlay')) refreshOrthoUnderlayLive();
+    if (document.getElementById('orthoUnderlay')) refreshOrthoUnderlayLive();
     else if (document.getElementById('orthoUnionWrap')) refreshOrthoSingleModeLive();
   }
 
@@ -2453,11 +2472,11 @@ function togglePinCenter() {
   const btn = document.getElementById('pinCenterBtn');
   btn.style.opacity = pinMarkerCenter ? '' : '.5';
   const area = document.getElementById('viewerArea');
-  if (area) area.style.overflow = (pinMarkerCenter || overlayEnabled) ? 'hidden' : '';
+  if (area) area.style.overflow = 'hidden';
   if (!pinMarkerCenter) {
     // Clear the translate so the image returns to normal centred padding.
     const padDiv = document.getElementById('rotPadDiv');
-    if (padDiv) padDiv.style.transform = '';
+    if (padDiv && !padDiv._overlayImage) padDiv.style.transform = '';
   }
   if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
 }
@@ -2688,17 +2707,32 @@ function getMarkerCentreTranslateParts() {
 }
 
 function getPinchPanParts() {
-  if (overlayEnabled && zoomToMarker) return getMarkerCentreTranslateParts();
+  // Absolute-centred map (overlay and single-mode): pinch around marker translate.
+  if (zoomToMarker) return getMarkerCentreTranslateParts();
   return getPinCenterTranslateParts();
 }
 
 /**
- * ⧉ Overlay: each layer uses its own camera so the ground marker is centred in that view
- * (layers are offset behind each other). Optional “Reproject to main” applies a plane
- * homography (ground Z) + CSS matrix3d so back layers match the main image’s perspective.
+ * Pinch scale origin in #rotPadDiv border-box coords (legacy scroll single-mode fallback).
+ * markerVisualInPadPx is rotClip-local; must add view padding + ortho union offset.
+ */
+function getSingleModePinchOrigin() {
+  const sc = markerScrollContentPx();
+  if (sc) {
+    return { ox: viewPadX + sc.vx, oy: viewPadY + sc.vy };
+  }
+  return {
+    ox: viewerAreaEl.scrollLeft + viewerAreaEl.clientWidth / 2,
+    oy: viewerAreaEl.scrollTop + viewerAreaEl.clientHeight / 2,
+  };
+}
+
+/**
+ * Centre each absolute layer so the ground marker sits in the viewport middle.
+ * Used for overlay stacks and single-mode (same motion model; reproject only when overlay is on).
  */
 function syncOverlayLayersToMarker() {
-  if (!overlayEnabled || !zoomToMarker) return;
+  if (!zoomToMarker) return;
   const area = document.getElementById('viewerArea');
   if (!area) return;
   const viewW = area.clientWidth || 800;
@@ -2708,13 +2742,13 @@ function syncOverlayLayersToMarker() {
   const Z = hVal === '' ? 0 : Number(hVal);
 
   const main = currentImage;
-  const reprojectToMain = document.getElementById('overlayStretchToMainCb')?.checked;
+  const reprojectToMain = overlayEnabled && document.getElementById('overlayStretchToMainCb')?.checked;
 
   layers.forEach((layer, idx) => {
     const img = layer._overlayImage;
     if (!img) return;
     const isTop = idx === layers.length - 1;
-    const rotDeg = isTop ? currentRotDeg : (layer._overlayRotDeg || 0);
+    const rotDeg = (img === currentImage) ? currentRotDeg : (layer._overlayRotDeg || 0);
     const baseFit = Math.min(viewW / img.width, viewH / img.height);
     const scale = baseFit * viewerZoom;
     const proj = projectToPixel(img, searchLat, searchLon, Z);
@@ -2779,7 +2813,7 @@ function syncOverlayLayersToMarker() {
     layer.style.transform = homography3x3ToMatrix3dString(Hvp);
   });
   syncOrthoUnderlayTransform();
-  updateOverlayBlur();
+  if (overlayEnabled) updateOverlayBlur();
 }
 
 /**
@@ -2789,7 +2823,7 @@ function syncOverlayLayersToMarker() {
 function syncOrthoUnderlayTransform() {
   const area = document.getElementById('viewerArea');
   const orthoUnderlay = document.getElementById('orthoUnderlay');
-  if (!area || !orthoUnderlay || !overlayEnabled) return;
+  if (!area || !orthoUnderlay) return;
   const ox = orthoUnderlay._orthoMarkerX;
   const oy = orthoUnderlay._orthoMarkerY;
   if (typeof ox !== 'number' || typeof oy !== 'number' || !Number.isFinite(ox) || !Number.isFinite(oy)) return;
@@ -2801,35 +2835,14 @@ function syncOrthoUnderlayTransform() {
   orthoUnderlay.style.transform = `translate(${tx}px, ${ty}px)`;
 }
 
-/** Position the viewer so the marker is centred (respects zoomToMarker and pinMarkerCenter). */
+/** Position the viewer so the marker is centred (absolute translate — same for overlay on/off). */
 function scrollToMarker() {
   if (!zoomToMarker || markerDX < 0 || markerDY < 0) return;
   const area = document.getElementById('viewerArea');
   if (!area) return;
-
-  if (overlayEnabled) {
-    syncOverlayLayersToMarker();
-    area.scrollLeft = 0;
-    area.scrollTop = 0;
-    return;
-  }
-
-  const o = markerScrollContentPx();
-  if (!o) return;
-
-  if (pinMarkerCenter) {
-    const tx = area.clientWidth / 2 - o.vx;
-    const ty = area.clientHeight / 2 - o.vy;
-    const padDiv = document.getElementById('rotPadDiv');
-    if (padDiv) padDiv.style.transform = `translate(${tx}px, ${ty}px)`;
-    area.scrollLeft = 0;
-    area.scrollTop = 0;
-  } else {
-    const sc = markerScrollContentPx();
-    if (!sc) return;
-    area.scrollLeft = viewPadX + sc.vx - area.clientWidth / 2;
-    area.scrollTop = viewPadY + sc.vy - area.clientHeight / 2;
-  }
+  syncOverlayLayersToMarker();
+  area.scrollLeft = 0;
+  area.scrollTop = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2921,26 +2934,27 @@ function toggleOverlay() {
     nsel.disabled = !overlayEnabled;
     nsel.style.opacity = overlayEnabled ? '' : '.4';
     if (overlayEnabled) overlayNeighborCount = Number(nsel.value) || 0;
+    else overlayNeighborCount = 0;
   }
   const area = document.getElementById('viewerArea');
-  if (area) area.style.overflow = (pinMarkerCenter || overlayEnabled) ? 'hidden' : '';
-  if (overlayEnabled) {
-    // Start with a clean slate so old single-image content doesn't linger.
-    if (area) area.innerHTML = '';
-    if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
-  } else {
-    // Back to single-image mode — re-render clears all layers via area.innerHTML.
-    if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
+  if (area) area.style.overflow = 'hidden';
+
+  // Same render path either way — only stacking / neighbors / blur differ.
+  if (area) removeNeighborPreviewLayers(area);
+  trimOverlayHistory();
+  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
+  if (currentImage) {
+    syncOverlayLayersToMarker();
+    applyOverlayStitchedLayerVisibility();
+    updateOverlayBlur();
+    syncOrthoDimMainClass();
   }
 }
 
 function onOverlayLayersChange() {
   overlayMaxLayers = Number(document.getElementById('overlayLayersSel').value);
-  const area = document.getElementById('viewerArea');
-  if (area && overlayEnabled) {
-    trimOverlayHistory();
-    scheduleRebuildOverlayNeighborLayers();
-  }
+  trimOverlayHistory();
+  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
 }
 
 function onOverlayBlurChange() {
@@ -3335,7 +3349,7 @@ function getPinchLayerEl() {
 
 function capturePinchOverlaySnapshots() {
   pinchOverlaySnapshots = null;
-  if (!overlayEnabled || !viewerAreaEl) return;
+  if (!viewerAreaEl) return;
   const snaps = [];
   for (const el of Array.from(viewerAreaEl.children)) {
     if (!el._overlayImage) continue;
@@ -3383,7 +3397,7 @@ function restorePinchOverlaySnapshots() {
 function setOrthoUnderlayPinchPreview(pinchRatio) {
   const ortho = document.getElementById('orthoUnderlay');
   const area = document.getElementById('viewerArea');
-  if (!ortho || !overlayEnabled || !area) return;
+  if (!ortho || !area) return;
   const ox = ortho._orthoMarkerX;
   const oy = ortho._orthoMarkerY;
   if (typeof ox !== 'number' || typeof oy !== 'number' || !Number.isFinite(ox) || !Number.isFinite(oy)) return;
@@ -3406,10 +3420,10 @@ function clearOrthoUnderlayPinchPreview() {
   ortho.style.transform = '';
 }
 
-/** Match legacy pinch: ortho scale origin before the first touchmove (overlay only). */
+/** Match legacy pinch: ortho scale origin before the first touchmove. */
 function primeOrthoUnderlayForPinchStart() {
   const ortho = document.getElementById('orthoUnderlay');
-  if (!ortho || !overlayEnabled) return;
+  if (!ortho) return;
   const pan = getPinchPanParts();
   if (pan || markerVisualInPadPx()) {
     const ox = ortho._orthoMarkerX;
@@ -3451,35 +3465,14 @@ viewerAreaEl.addEventListener('touchstart', e => {
       primeOrthoUnderlayForPinchStart();
     } else {
       const el = getPinchLayerEl();
-      const ortho = document.getElementById('orthoUnderlay');
       if (el) {
         const pan = getPinchPanParts();
         if (pan) {
+          // Pin-centre: origin at marker in pad space (viewPad is 0; sc includes ortho offset).
           el.style.transformOrigin = `${pan.vx}px ${pan.vy}px`;
-          if (ortho && overlayEnabled) {
-            const ox = ortho._orthoMarkerX;
-            const oy = ortho._orthoMarkerY;
-            if (typeof ox === 'number' && typeof oy === 'number' && Number.isFinite(ox) && Number.isFinite(oy)) {
-              ortho.style.transformOrigin = `${ox}px ${oy}px`;
-            }
-          }
         } else {
-          const m = markerVisualInPadPx();
-          if (m) {
-            el.style.transformOrigin = `${m.vx}px ${m.vy}px`;
-            if (ortho && overlayEnabled) {
-              const ox = ortho._orthoMarkerX;
-              const oy = ortho._orthoMarkerY;
-              if (typeof ox === 'number' && typeof oy === 'number' && Number.isFinite(ox) && Number.isFinite(oy)) {
-                ortho.style.transformOrigin = `${ox}px ${oy}px`;
-              }
-            }
-          } else {
-            el.style.transformOrigin = `${viewerAreaEl.scrollLeft + viewerAreaEl.clientWidth / 2}px ${viewerAreaEl.scrollTop + viewerAreaEl.clientHeight / 2}px`;
-            if (ortho && overlayEnabled) {
-              ortho.style.transformOrigin = `${ortho.clientWidth / 2}px ${ortho.clientHeight / 2}px`;
-            }
-          }
+          const o = getSingleModePinchOrigin();
+          el.style.transformOrigin = `${o.ox}px ${o.oy}px`;
         }
       }
     }
@@ -3493,7 +3486,7 @@ viewerAreaEl.addEventListener('touchmove', e => {
     applyDrag(e.touches[0].clientX, e.touches[0].clientY);
   } else if (e.touches.length === 2 && isPinching) {
     pinchLastRatio = pinchDist(e.touches) / pinchStartDist;
-    if (overlayEnabled && pinchOverlaySnapshots) {
+    if (pinchOverlaySnapshots) {
       applyPinchOverlayStackPreview(pinchLastRatio);
     } else {
       const el = getPinchLayerEl();
@@ -3590,15 +3583,43 @@ function orbitToDirection(dir) {
   selectImage(idx, document.createElement('div'));
 }
 
+/** Show/hide header, search list, and viewer toolbar. Preference in localStorage. */
+function setChromeUiVisible(visible) {
+  document.body.classList.toggle('chrome-hidden', !visible);
+  const fab = document.getElementById('chromeToggleFabBtn');
+  const hdr = document.getElementById('chromeToggleHeaderBtn');
+  if (fab) {
+    fab.setAttribute('aria-pressed', visible ? 'true' : 'false');
+    fab.title = visible ? 'Hide search list and toolbars' : 'Show search list and toolbars';
+  }
+  if (hdr) {
+    hdr.textContent = visible ? 'Hide UI' : 'Show UI';
+    hdr.title = fab ? fab.title : '';
+  }
+  try { localStorage.setItem('infChromeVisible', visible ? '1' : '0'); } catch (_) {}
+}
+
+function toggleChromeUi() {
+  setChromeUiVisible(document.body.classList.contains('chrome-hidden'));
+}
+
 function initInfiniteScrollMode() {
   if (infiniteScrollModeInitialized) return;
   infiniteScrollModeInitialized = true;
   document.body.classList.add('infinite-scroll');
 
+  let chromeVisible = true;
+  try {
+    const stored = localStorage.getItem('infChromeVisible');
+    if (stored === '0') chromeVisible = false;
+    if (stored === '1') chromeVisible = true;
+  } catch (_) {}
+  setChromeUiVisible(chromeVisible);
+
   const coords = document.getElementById('coordsInput');
   if (coords) coords.value = '48.2297801, 16.4137043';
   const rad = document.getElementById('radiusInput');
-  if (rad) rad.value = '2000';
+  if (rad) rad.value = '280';
   const autoSearch = document.getElementById('autoSearchOnMoveCb');
   if (autoSearch) autoSearch.checked = false;
 
@@ -3697,6 +3718,10 @@ loadIndex();
     <button type="button" class="orbit-tool" onclick="changeViewZoom(-1)">−</button>
     <span class="orbit-vzoom" id="orbitVzoomLabel">1×</span>
     <button type="button" class="orbit-tool" onclick="changeViewZoom(+1)">+</button>
+    <button type="button" class="orbit-tool" id="orthoToggleFabBtn" onclick="toggleOrthoBackground()"
+            title="Show/hide nadir orthophoto underlay (Shift+O)">▣</button>
+    <button type="button" class="orbit-tool chrome-toggle" id="chromeToggleFabBtn" onclick="toggleChromeUi()"
+            aria-pressed="false" title="Hide search list and toolbars">☰</button>
   </div>
 </div>
 </body>
