@@ -439,7 +439,7 @@
         Reproject to main
       </label>
       <select id="overlayNeighborPreloadSel" class="sort-select" disabled onchange="onOverlayNeighborPreloadChange()"
-              title="When Reproject is on: pre-decode tiles and show the N nearest candidate images (same view direction first, then distance to marker) behind your stack, warped into the main view"
+              title="When Reproject is on: keep N nearest candidates preloaded. Visible reprojected layers only swap when the main image changes (quick crossfade, same as main)."
               style="padding:2px 4px">
         <option value="0" selected>near 0</option>
         <option value="4">near 4</option>
@@ -903,6 +903,11 @@ let globeModeEnabled = true;
 let virtualGlobeImg = null;
 let globePoseLastTs = 0;
 let globePoseMarkerKey = '';
+/**
+ * While a main-image crossfade is pending, keep warping the still-visible outgoing
+ * stack with this image so mounting the incoming main does not snap the scene.
+ */
+let transitionOutgoingMain = null;
 const GLOBE_INFLUENCE_M = 3200;
 const GLOBE_SIGMA_M = 280;
 /** Fixed local-patch half-extent (m) for stable homographies. */
@@ -919,25 +924,24 @@ function ensureCameraExtras(img) {
   if (!(img._focalPx > 0)) img._focalPx = estimateFocalPx(img);
 }
 
-function updateVirtualGlobeCamera() {
-  if (!globeModeEnabled || !currentImage?.pToImage) {
-    virtualGlobeImg = null;
-    return;
+/** Call before replacing currentImage when the main identity changes. */
+function noteOutgoingMainBeforeSwitch(nextImg) {
+  if (currentImage && nextImg && currentImage.name !== nextImg.name) {
+    transitionOutgoingMain = currentImage;
   }
+}
+
+/** Build a virtual globe camera for an anchor image (does not touch globals). */
+function computeVirtualGlobeCamera(anchorImg) {
+  const src = anchorImg;
+  if (!globeModeEnabled || !src?.pToImage) return null;
 
   const hVal = document.getElementById('heightNum').value;
   const Z = hVal === '' ? 0 : Number(hVal);
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
-  const dir = currentImage.viewDirection;
-  const W = currentImage.width;
-  const H = currentImage.height;
-  const now = performance.now();
-  const markerKey = `${mx.toFixed(3)},${my.toFixed(3)},${dir},${W}`;
-  // Deduplicate multi-caller updates within the same frame only if marker unchanged.
-  if (virtualGlobeImg && globePoseLastTs && (now - globePoseLastTs) < 6 &&
-      globePoseMarkerKey === markerKey) return;
-  globePoseLastTs = now;
-  globePoseMarkerKey = markerKey;
+  const dir = src.viewDirection;
+  const W = src.width;
+  const H = src.height;
 
   let wSum = 0;
   let Cx = 0, Cy = 0, Cz = 0, fAcc = 0, rAcc = 0;
@@ -965,11 +969,11 @@ function updateVirtualGlobeCamera() {
 
   let tCx, tCy, tCz, tF, tR;
   if (!(wSum > 1e-12)) {
-    ensureCameraExtras(currentImage);
-    const C = currentImage._camCenter;
-    if (!C) return;
+    ensureCameraExtras(src);
+    const C = src._camCenter;
+    if (!C) return null;
     tCx = C[0]; tCy = C[1]; tCz = C[2];
-    tF = currentImage._focalPx;
+    tF = src._focalPx;
     tR = Math.hypot(C[0] - mx, C[1] - my, C[2] - Z);
   } else {
     tCx = Cx / wSum;
@@ -983,7 +987,7 @@ function updateVirtualGlobeCamera() {
   let vx = tCx - mx, vy = tCy - my, vz = tCz - Z;
   let vr = Math.hypot(vx, vy, vz);
   if (vr < 1e-3) {
-    const h = ((currentImage.heading || 0) * Math.PI) / 180;
+    const h = ((src.heading || 0) * Math.PI) / 180;
     vx = -Math.sin(h);
     vy = -Math.cos(h);
     vz = 0.75;
@@ -997,25 +1001,47 @@ function updateVirtualGlobeCamera() {
   if (Cz < Z + 40) Cz = Z + Math.max(40, tR * 0.35);
 
   const P = makeLookAtProjection(Cx, Cy, Cz, mx, my, Z, tF, W, H);
-  if (!P) return;
-  virtualGlobeImg = {
+  if (!P) return null;
+  return {
     name: '__globe__',
     width: W,
     height: H,
     pToImage: P,
     lookAtMgi: [mx, my],
     viewDirection: dir,
-    heading: currentImage.heading,
+    heading: src.heading,
+    _anchorName: src.name,
   };
 }
 
-/** Camera used for display warps / ortho / drag when globe mode is on. */
-function getDisplayCameraImg() {
-  if (globeModeEnabled) {
-    if (!virtualGlobeImg) updateVirtualGlobeCamera();
-    if (virtualGlobeImg) return virtualGlobeImg;
+function updateVirtualGlobeCamera(anchorImg) {
+  const src = anchorImg || transitionOutgoingMain || currentImage;
+  if (!globeModeEnabled || !src?.pToImage) {
+    virtualGlobeImg = null;
+    return null;
   }
-  return currentImage;
+
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const markerKey = `${mx.toFixed(3)},${my.toFixed(3)},${src.viewDirection},${src.width},${src.name}`;
+  const now = performance.now();
+  if (virtualGlobeImg && globePoseLastTs && (now - globePoseLastTs) < 6 &&
+      globePoseMarkerKey === markerKey) {
+    return virtualGlobeImg;
+  }
+  globePoseLastTs = now;
+  globePoseMarkerKey = markerKey;
+  virtualGlobeImg = computeVirtualGlobeCamera(src);
+  return virtualGlobeImg;
+}
+
+/** Camera used for visible warps / ortho / drag (outgoing during pending main crossfade). */
+function getDisplayCameraImg() {
+  const anchor = transitionOutgoingMain || currentImage;
+  if (globeModeEnabled) {
+    const v = updateVirtualGlobeCamera(anchor);
+    if (v) return v;
+  }
+  return anchor;
 }
 
 function resetOrthoGlobeLayoutCache() {
@@ -1527,8 +1553,9 @@ function doSearch(opts) {
 
   document.getElementById('resultsHeader').style.display = 'flex';
   applySort();   // applySort sets resultCount (supports "X / Y" when filtered)
+  // Moving/searching only preloads neighbors — visible layers swap on main-image change.
   if (overlayEnabled && document.getElementById('overlayStretchToMainCb')?.checked && overlayNeighborCount > 0 && currentImage) {
-    scheduleRebuildOverlayNeighborLayers();
+    schedulePreloadNeighborTiles();
   }
 }
 
@@ -1845,6 +1872,12 @@ let overlayBlurFixed = 0;   // px applied to every layer behind the main (top) l
 let overlayBlurStep  = 0;    // px of blur added per layer further back (0 = no blur)
 let overlayNeighborCount = 0; // 0,4,8,… preloaded nearest images shown when reproject is on
 let overlayNeighborGen   = 0; // invalidates async neighbor rebuild
+/** Main image name the currently visible neighbor layers were built for (null = none yet). */
+let neighborLayersMainName = null;
+/** Neighbor images locked to `neighborLayersMainName` (picked at main look-at; not the live marker). */
+let lockedNeighborImages = [];
+let neighborPreloadTimer = null;
+let neighborPreloadGen = 0;
 /** When true: hide neighbor previews + older overlay history; only the top (main) image layer stays visible. Hotkey: Shift+S */
 let overlayStitchedOnlyMain = false;
 /** User toggle for nadir ortho underlay / base layer. Hotkey: Shift+O */
@@ -1895,6 +1928,7 @@ function selectImage(idx, el) {
   if (currentImage && next && currentImage.name !== next.name) {
     captureDisplayJacobianForTransition();
   }
+  noteOutgoingMainBeforeSwitch(next);
   currentImage = next;
   const maxZoom = currentImage.tileResolution.length - 1;
   currentZoom = Math.min(currentZoom, maxZoom);
@@ -1902,7 +1936,7 @@ function selectImage(idx, el) {
   const img = currentImage;
   const z = getTileZoomIndex(img);
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForAllTilesDecoded(img, z).then(() => {
+    waitForMainAndNeighborTiles(img, z).then(() => {
       if (gen !== imageSwitchGen) return;
       openViewer(img, z);
     });
@@ -2066,9 +2100,9 @@ function whenImagesReady(imgs) {
 
 /** Bumps to cancel stale crossfades when another image mounts. */
 let imageRevealGen = 0;
-const IMAGE_CROSSFADE_MS = 420;
+const IMAGE_CROSSFADE_MS = 220;
 /** Ground-Jacobian morph duration when switching cameras (squeeze/stretch into the new view). */
-const IMAGE_MORPH_MS = 560;
+const IMAGE_MORPH_MS = 360;
 
 /**
  * CSS rotate (deg) that makes the ground-plane horizon horizontal.
@@ -2106,7 +2140,9 @@ function computeAutoRotDegForImage(img) {
   return 0;
 }
 
-/** Neighbor preview layer (no dot overlay, no rotPadDiv id) — same tile layout as the main stack. */
+/** Neighbor preview layer (no dot overlay, no rotPadDiv id) — same tile layout as the main stack.
+ *  Always unrotated: orientation comes from the reproject/globe homography. A CSS rotate
+ *  inside the layer fights that warp and looks like jumping while the marker moves. */
 function buildNeighborLayerDOM(img, zoom) {
   const area = document.getElementById('viewerArea');
   const viewW = area.clientWidth || 800;
@@ -2122,7 +2158,7 @@ function buildNeighborLayerDOM(img, zoom) {
   const contentH = Math.floor(img.height * scale);
   const clipW = Math.max(1, contentW - edgeTrimDisp);
   const clipH = Math.max(1, contentH - edgeTrimDisp);
-  const rotDeg = computeAutoRotDegForImage(img);
+  const rotDeg = 0;
   let tilesHtml = '';
   for (let y = rows - 1; y >= 0; y--) {
     tilesHtml += '<div class="tile-row">';
@@ -2134,11 +2170,8 @@ function buildNeighborLayerDOM(img, zoom) {
     }
     tilesHtml += '</div>';
   }
-  const rotStyle = rotDeg !== 0
-    ? `transform:rotate(${rotDeg}deg);transform-origin:50% 50%;`
-    : '';
   const innerHtml = `
-    <div style="position:relative;width:${clipW}px;height:${clipH}px;overflow:hidden;${rotStyle}">
+    <div style="position:relative;width:${clipW}px;height:${clipH}px;overflow:hidden;">
       <div style="position:absolute;top:-${topBlack + edgeTrimDisp}px;left:0;">
         <div class="tile-canvas-wrap">${tilesHtml}</div>
       </div>
@@ -2157,6 +2190,8 @@ function removeNeighborPreviewLayers(area) {
   Array.from(area.children).forEach(el => {
     if (el._overlayNeighborPreview) el.remove();
   });
+  neighborLayersMainName = null;
+  lockedNeighborImages = [];
 }
 
 /** Max history layers to keep: full stack when overlay is on, otherwise a single main frame.
@@ -2179,11 +2214,15 @@ function trimOverlayHistory() {
 }
 
 /**
- * Candidates for “next” views: same view direction as main first, then nearest ground-centre (MGI) to marker.
+ * Candidates for “next” views: same view direction as main first, then nearest ground-centre (MGI).
+ * @param {'main'|'marker'} [anchor='marker'] — `main` uses the main image look-at (stable per main);
+ *   `marker` uses the live search position (for preload-ahead while panning).
  */
-function pickNearestNeighborImages(mainImg, count) {
+function pickNearestNeighborImages(mainImg, count, anchor) {
   if (!count || !mainImg || !allImages.length) return [];
-  const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const [qx, qy] = (anchor === 'main' && mainImg.lookAtMgi)
+    ? mainImg.lookAtMgi
+    : wgs84ToMgi.forward([searchLon, searchLat]);
   const dir = mainImg.viewDirection;
   return allImages
     .filter(img => img.name !== mainImg.name)
@@ -2208,133 +2247,258 @@ function firstHistoryLayer(area) {
 
 let neighborRebuildTimer = null;
 
-function scheduleRebuildOverlayNeighborLayers() {
-  overlayNeighborGen++;
-  const gen = overlayNeighborGen;
-  if (neighborRebuildTimer) clearTimeout(neighborRebuildTimer);
-  // Debounce: rapid auto-switch / marker move shouldn't wipe neighbors every frame.
-  neighborRebuildTimer = setTimeout(() => {
-    neighborRebuildTimer = null;
-    rebuildOverlayNeighborLayers(gen);
-  }, 100);
+/**
+ * Decode/cache nearest neighbor tiles while moving — does not change visible layers.
+ */
+function schedulePreloadNeighborTiles() {
+  if (!overlayEnabled || !currentImage) return;
+  if (!document.getElementById('overlayStretchToMainCb')?.checked) return;
+  const n = overlayNeighborCount;
+  if (!n) return;
+
+  neighborPreloadGen++;
+  const gen = neighborPreloadGen;
+  if (neighborPreloadTimer) clearTimeout(neighborPreloadTimer);
+  neighborPreloadTimer = setTimeout(() => {
+    neighborPreloadTimer = null;
+    if (gen !== neighborPreloadGen) return;
+    const neighbors = pickNearestNeighborImages(currentImage, n);
+    if (!neighbors.length) return;
+    const z = 0;
+    neighbors.forEach(img => {
+      waitForAllTilesDecoded(img, z);
+      preloadToCache(img, z);
+    });
+  }, 80);
+}
+
+/** Whether overlay reproject-neighbor stack is active. */
+function overlayNeighborsActive() {
+  return !!(
+    overlayEnabled &&
+    overlayNeighborCount > 0 &&
+    document.getElementById('overlayStretchToMainCb')?.checked
+  );
 }
 
 /**
- * Diff-update reprojected neighbor layers: keep ones still needed, fade in newcomers,
- * only remove obsolete — avoids the blank flash from remove-all-then-add.
+ * Lock neighbor identity to `mainImg` (look-at based). Returns the gen for prepare/reveal.
+ * Call only when the main image identity changes (or settings force).
  */
-function rebuildOverlayNeighborLayers(gen) {
-  if (gen !== overlayNeighborGen) return;
+function lockNeighborsForMain(mainImg) {
+  neighborLayersMainName = mainImg ? mainImg.name : null;
+  lockedNeighborImages = (mainImg && overlayNeighborsActive())
+    ? pickNearestNeighborImages(mainImg, overlayNeighborCount, 'main')
+    : [];
+  overlayNeighborGen++;
+  return overlayNeighborGen;
+}
+
+/**
+ * Decode + mount locked neighbors at opacity 0. Does not fade — caller reveals
+ * together with the main image once everything is ready.
+ * @returns {Promise<{gen:number, newcomers:Element[], obsolete:Element[], clearAll?:boolean}|null>}
+ */
+function prepareLockedNeighborLayers(gen) {
   const area = document.getElementById('viewerArea');
-  if (!area || !overlayEnabled) return;
+  if (!area || !overlayEnabled) return Promise.resolve(null);
+  if (gen !== overlayNeighborGen) return Promise.resolve(null);
 
-  const n = overlayNeighborCount;
-  const reproject = document.getElementById('overlayStretchToMainCb')?.checked;
-  if (!n || !reproject || !currentImage) {
-    removeNeighborPreviewLayers(area);
-    syncOverlayLayersToMarker();
-    updateOverlayBlur();
-    syncOrthoDimMainClass();
-    return;
+  if (!overlayNeighborsActive() || !lockedNeighborImages.length) {
+    const obsolete = Array.from(area.children).filter(el => el._overlayNeighborPreview);
+    return Promise.resolve({ gen, newcomers: [], obsolete, clearAll: true });
   }
 
-  const neighbors = pickNearestNeighborImages(currentImage, n);
-  if (!neighbors.length) {
-    removeNeighborPreviewLayers(area);
-    syncOverlayLayersToMarker();
-    updateOverlayBlur();
-    syncOrthoDimMainClass();
-    return;
-  }
-
+  const neighbors = lockedNeighborImages;
+  const mainName = neighborLayersMainName;
   const z = 0;
-  const mainName = currentImage.name;
+  const fadeMs = IMAGE_CROSSFADE_MS;
+  const waitMs = document.getElementById('waitFullTilesSwitchCb')?.checked ? 12000 : 2000;
 
-  Promise.all(neighbors.map(img => waitForAllTilesDecoded(img, z))).then(() => {
-    if (gen !== overlayNeighborGen) return;
-    if (!overlayEnabled || !currentImage || currentImage.name !== mainName) return;
-    const area2 = document.getElementById('viewerArea');
-    if (!area2) return;
-
-    const wantNames = new Set(neighbors.map(img => img.name));
-    const existing = Array.from(area2.children).filter(el => el._overlayNeighborPreview);
-    const byName = new Map();
-    for (const el of existing) {
-      const name = el._overlayImage && el._overlayImage.name;
-      if (!name || !wantNames.has(name) || byName.has(name)) {
-        el.remove();
-        continue;
-      }
-      byName.set(name, el);
-    }
-
-    const sorted = [...neighbors].sort((a, b) => {
-      const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
-      const da = Math.hypot(qx - a.lookAtMgi[0], qy - a.lookAtMgi[1]);
-      const db = Math.hypot(qx - b.lookAtMgi[0], qy - b.lookAtMgi[1]);
-      return db - da; // farthest first → nearest ends closest to main
-    });
-
-    const histAnchor = firstHistoryLayer(area2);
-    const newcomers = [];
-
-    for (const img of sorted) {
-      let layer = byName.get(img.name);
-      if (!layer) {
-        layer = buildNeighborLayerDOM(img, z);
-        layer.style.opacity = '0';
-        newcomers.push(layer);
-        if (histAnchor) area2.insertBefore(layer, histAnchor);
-        else area2.appendChild(layer);
-      } else {
-        layer._overlayRotDeg = computeAutoRotDegForImage(img);
-        layer.style.opacity = '1';
-        layer.style.transition = '';
-        if (histAnchor) area2.insertBefore(layer, histAnchor);
-        else area2.appendChild(layer);
-      }
-    }
-
-    const finish = () => {
-      if (gen !== overlayNeighborGen) {
-        newcomers.forEach(el => { if (el.isConnected) el.remove(); });
-        return;
-      }
-      for (const layer of newcomers) {
-        if (!layer.isConnected) continue;
-        layer.style.transition = 'opacity 220ms ease';
-        layer.style.opacity = '1';
-      }
-      neighbors.forEach(img => preloadToCache(img, z));
-      syncOverlayLayersToMarker();
-      updateOverlayBlur();
-      syncOrthoDimMainClass();
+  return new Promise(resolve => {
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
     };
 
-    if (!newcomers.length) {
-      finish();
-      return;
-    }
+    Promise.all(neighbors.map(ni => waitForAllTilesDecoded(ni, z))).then(() => {
+      if (gen !== overlayNeighborGen) { done(null); return; }
+      if (!overlayEnabled || neighborLayersMainName !== mainName) { done(null); return; }
+      const area2 = document.getElementById('viewerArea');
+      if (!area2) { done(null); return; }
 
-    const imgs = [];
-    newcomers.forEach(layer => {
-      layer.querySelectorAll('.tile-canvas-wrap img').forEach(im => imgs.push(im));
+      const wantNames = new Set(neighbors.map(ni => ni.name));
+      const existing = Array.from(area2.children).filter(el => el._overlayNeighborPreview);
+      const existingNames = new Set(
+        existing.map(el => el._overlayImage && el._overlayImage.name).filter(Boolean)
+      );
+      if (
+        wantNames.size === existingNames.size &&
+        [...wantNames].every(name => existingNames.has(name))
+      ) {
+        neighbors.forEach(ni => preloadToCache(ni, z));
+        syncOverlayLayersToMarker();
+        done({ gen, newcomers: [], obsolete: [] });
+        return;
+      }
+
+      const byName = new Map();
+      const obsolete = [];
+      for (const el of existing) {
+        const name = el._overlayImage && el._overlayImage.name;
+        if (!name || !wantNames.has(name) || byName.has(name)) {
+          obsolete.push(el);
+          continue;
+        }
+        byName.set(name, el);
+      }
+
+      const mainImg = currentImage;
+      const [qx, qy] = (mainImg && mainImg.lookAtMgi)
+        || wgs84ToMgi.forward([searchLon, searchLat]);
+      const sorted = [...neighbors].sort((a, b) => {
+        const da = Math.hypot(qx - a.lookAtMgi[0], qy - a.lookAtMgi[1]);
+        const db = Math.hypot(qx - b.lookAtMgi[0], qy - b.lookAtMgi[1]);
+        return db - da;
+      });
+
+      const histAnchor = firstHistoryLayer(area2);
+      const newcomers = [];
+      for (const ni of sorted) {
+        let layer = byName.get(ni.name);
+        if (!layer) {
+          layer = buildNeighborLayerDOM(ni, z);
+          layer.style.opacity = '0';
+          layer.style.visibility = 'hidden'; // hide until first correct warp (avoids place-jump)
+          layer.style.transition = `opacity ${fadeMs}ms ease`;
+          layer._neighborPendingReveal = true;
+          newcomers.push(layer);
+          if (histAnchor) area2.insertBefore(layer, histAnchor);
+          else area2.appendChild(layer);
+        } else if (histAnchor && layer.nextSibling !== histAnchor) {
+          area2.insertBefore(layer, histAnchor);
+        }
+      }
+
+      syncOverlayLayersToMarker();
+      // Safe to composite at opacity 0 now that transforms are set.
+      for (const layer of newcomers) {
+        layer.style.visibility = '';
+      }
+
+      const finishMount = () => {
+        if (gen !== overlayNeighborGen) {
+          newcomers.forEach(el => { if (el.isConnected) el.remove(); });
+          done(null);
+          return;
+        }
+        neighbors.forEach(ni => preloadToCache(ni, z));
+        done({ gen, newcomers, obsolete });
+      };
+
+      if (!newcomers.length) {
+        finishMount();
+        return;
+      }
+      const imgs = [];
+      newcomers.forEach(layer => {
+        layer.querySelectorAll('.tile-canvas-wrap img').forEach(im => imgs.push(im));
+      });
+      whenImagesReady(imgs).then(finishMount);
+      setTimeout(finishMount, waitMs);
     });
-    whenImagesReady(imgs).then(finish);
-    setTimeout(finish, 4000);
   });
+}
+
+/** Crossfade prepared neighbors (call in lockstep with main reveal). */
+function beginNeighborCrossfade(prep) {
+  if (!prep || prep.gen !== overlayNeighborGen) return;
+  const fadeMs = IMAGE_CROSSFADE_MS;
+  const { newcomers, obsolete, clearAll } = prep;
+
+  if (clearAll) {
+    for (const el of obsolete) {
+      el.style.transition = `opacity ${fadeMs}ms ease`;
+      el.style.opacity = '0';
+      const capt = el;
+      setTimeout(() => { if (capt.isConnected) capt.remove(); }, fadeMs + 40);
+    }
+    syncOrthoDimMainClass();
+    return;
+  }
+
+  for (const el of obsolete) {
+    el.style.transition = `opacity ${fadeMs}ms ease`;
+    el.style.opacity = '0';
+    const capt = el;
+    setTimeout(() => { if (capt.isConnected) capt.remove(); }, fadeMs + 40);
+  }
+
+  // Ensure incoming neighbors are warped to the new main before they become visible.
+  syncOverlayLayersToMarker();
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      if (prep.gen !== overlayNeighborGen) return;
+      for (const layer of newcomers) {
+        if (!layer.isConnected) continue;
+        layer.style.visibility = '';
+        layer.style.opacity = '1';
+        // Settings-only rebuild: no outgoing freeze — clear pending immediately.
+        if (!transitionOutgoingMain) layer._neighborPendingReveal = false;
+      }
+    });
+  });
+  syncOrthoDimMainClass();
+}
+
+/**
+ * Prefetch tile cache for main + its locked reproject neighbors (no DOM).
+ * Used before openViewer so the joint reveal can start sooner.
+ */
+function waitForMainAndNeighborTiles(mainImg, zoom) {
+  const tasks = [waitForAllTilesDecoded(mainImg, zoom)];
+  if (overlayNeighborsActive()) {
+    const neighbors = pickNearestNeighborImages(mainImg, overlayNeighborCount, 'main');
+    neighbors.forEach(ni => tasks.push(waitForAllTilesDecoded(ni, 0)));
+  }
+  return Promise.all(tasks);
+}
+
+/**
+ * Swap visible reprojected neighbor layers (settings / force path).
+ * Main-image switches use prepare+reveal inside renderTiles instead.
+ */
+function scheduleRebuildOverlayNeighborLayers(force) {
+  if (!currentImage) return;
+  if (!force && neighborLayersMainName === currentImage.name) {
+    schedulePreloadNeighborTiles();
+    return;
+  }
+  const gen = lockNeighborsForMain(currentImage);
+  if (neighborRebuildTimer) clearTimeout(neighborRebuildTimer);
+  neighborRebuildTimer = setTimeout(() => {
+    neighborRebuildTimer = null;
+    if (gen !== overlayNeighborGen) return;
+    prepareLockedNeighborLayers(gen).then(prep => {
+      if (!prep || gen !== overlayNeighborGen) return;
+      beginNeighborCrossfade(prep);
+    });
+  }, 40);
 }
 
 function onOverlayNeighborPreloadChange() {
   const sel = document.getElementById('overlayNeighborPreloadSel');
   overlayNeighborCount = sel ? Math.max(0, Number(sel.value) || 0) : 0;
-  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
+  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers(true);
 }
 
 function onOverlayReprojectChange() {
   if (!overlayEnabled) return;
   syncOverlayLayersToMarker();
-  scheduleRebuildOverlayNeighborLayers();
+  scheduleRebuildOverlayNeighborLayers(true);
   syncOrthoDimMainClass();
 }
 
@@ -2931,14 +3095,30 @@ function renderTiles(img, zoom) {
       <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
 
-  if (globeModeEnabled) updateVirtualGlobeCamera();
-  const orthoCam = getDisplayCameraImg() || img;
-  updateOrthoUnderlayForOverlay(orthoCam, globeModeEnabled ? 0 : rotDeg, contentW, contentH);
+  // During a pending main crossfade, keep the visible ortho on the outgoing camera
+  // (rebuilding with the incoming image size here was a visible jump).
+  if (!transitionOutgoingMain) {
+    if (globeModeEnabled) updateVirtualGlobeCamera(img);
+    const orthoCam = getDisplayCameraImg() || img;
+    updateOrthoUnderlayForOverlay(orthoCam, globeModeEnabled ? 0 : rotDeg, contentW, contentH);
+  } else if (globeModeEnabled) {
+    updateVirtualGlobeCamera(transitionOutgoingMain);
+  }
 
   const morphFrom = pendingDisplayJFrom;
   pendingDisplayJFrom = null;
 
   const hadPrev = Array.from(area.children).some(el => el._overlayHistory);
+  let prevMainName = null;
+  for (let i = area.children.length - 1; i >= 0; i--) {
+    const el = area.children[i];
+    if (el._overlayHistory && el._overlayImage) {
+      prevMainName = el._overlayImage.name;
+      break;
+    }
+  }
+  const mainChanged = !prevMainName || prevMainName !== img.name;
+
   const oldPad  = area.querySelector('#rotPadDiv');
   const oldClip = area.querySelector('#rotClipDiv');
   const oldSvg  = area.querySelector('#dotOverlay');
@@ -2955,10 +3135,13 @@ function renderTiles(img, zoom) {
   layer._overlayHistory = true;
   layer._overlayNeighborPreview = false;
 
-  // Keep previous frame visible until this layer’s tiles have pixels, then crossfade.
-  if (hadPrev) {
+  // Hold new main (and later neighbors) invisible until main + reprojected set are ready.
+  const jointNeighborReveal = overlayEnabled && mainChanged;
+  if (hadPrev || jointNeighborReveal) {
     layer.style.opacity = '0';
+    layer.style.visibility = 'hidden';
     layer.style.transition = `opacity ${IMAGE_CROSSFADE_MS}ms ease`;
+    layer._overlayPendingReveal = true;
   }
   area.appendChild(layer);
 
@@ -2967,11 +3150,20 @@ function renderTiles(img, zoom) {
     armDisplayJacobianTransition(morphFrom);
   }
 
+  // Lock + decode/mount new reprojected neighbors now; fade them with the main.
+  let neighborPrepPromise = Promise.resolve(null);
+  if (jointNeighborReveal) {
+    const nGen = lockNeighborsForMain(img);
+    neighborPrepPromise = prepareLockedNeighborLayers(nGen);
+  }
+
   const afterMount = () => {
+    // Place incoming layers with the new camera; outgoing stack keeps transitionOutgoingMain.
+    syncOverlayLayersToMarker();
+    if (layer._overlayPendingReveal) layer.style.visibility = '';
     refreshDot();
     updateCacheSizeDropdownLabels();
     updateZoomPillClasses();
-    syncOrthoUnderlayTransform();
     if (overlayEnabled) applyOverlayStitchedLayerVisibility();
     syncOrthoDimMainClass();
     syncOrthoBackgroundVisibilityClass();
@@ -2980,33 +3172,75 @@ function renderTiles(img, zoom) {
 
   const revealGen = ++imageRevealGen;
   let revealed = false;
+  let neighborPrep = null;
   const reveal = () => {
     if (revealed || revealGen !== imageRevealGen) return;
     revealed = true;
-    if (hadPrev) {
+    const finishTransition = () => {
+      if (revealGen !== imageRevealGen) return;
+      // Crossfade done — drop outgoing freeze and settle everyone on the new main.
+      transitionOutgoingMain = null;
+      layer._overlayPendingReveal = false;
+      const area2 = document.getElementById('viewerArea');
+      if (area2) {
+        Array.from(area2.children).forEach(el => {
+          if (el._neighborPendingReveal) el._neighborPendingReveal = false;
+        });
+      }
+      if (globeModeEnabled) updateVirtualGlobeCamera(currentImage);
+      const orthoCam = getDisplayCameraImg() || currentImage;
+      if (orthoCam) {
+        updateOrthoUnderlayForOverlay(
+          orthoCam,
+          globeModeEnabled ? 0 : currentRotDeg,
+          currentContentW,
+          currentContentH
+        );
+      }
+      trimOverlayHistory();
+      syncOverlayLayersToMarker();
+      updateOverlayBlur();
+      applyOverlayStitchedLayerVisibility();
+      syncOrthoDimMainClass();
+    };
+    const runFade = () => {
+      if (revealGen !== imageRevealGen) return;
+      // Keep transitionOutgoingMain through the fade so the old stack does not snap.
+      syncOverlayLayersToMarker();
+      layer.style.visibility = '';
+      layer.style.opacity = '1';
+      if (jointNeighborReveal) beginNeighborCrossfade(neighborPrep);
+      setTimeout(finishTransition, IMAGE_CROSSFADE_MS + 40);
+    };
+    if (hadPrev || jointNeighborReveal) {
       // Double rAF so opacity:0 is committed before fading in.
       requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (revealGen !== imageRevealGen) return;
-          layer.style.opacity = '1';
-          setTimeout(() => {
-            if (revealGen !== imageRevealGen) return;
-            trimOverlayHistory();
-            if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
-            updateOverlayBlur();
-            applyOverlayStitchedLayerVisibility();
-          }, IMAGE_CROSSFADE_MS + 40);
-        });
+        requestAnimationFrame(runFade);
       });
     } else {
+      transitionOutgoingMain = null;
       trimOverlayHistory();
-      if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
+      syncOverlayLayersToMarker();
     }
   };
 
   const waitMs = document.getElementById('waitFullTilesSwitchCb')?.checked ? 12000 : 2000;
-  whenImagesReady(layer.querySelectorAll('.tile-canvas-wrap img')).then(reveal);
-  setTimeout(reveal, waitMs);
+  const mainReady = whenImagesReady(layer.querySelectorAll('.tile-canvas-wrap img'));
+  // Only reveal once main tiles AND new reprojected layers are loaded (or timeout).
+  Promise.all([mainReady, neighborPrepPromise]).then(([, prep]) => {
+    if (revealGen !== imageRevealGen) return;
+    neighborPrep = prep;
+    reveal();
+  });
+  setTimeout(() => {
+    if (revealed || revealGen !== imageRevealGen) return;
+    // Timeout: use whatever neighbor prep has finished; otherwise skip neighbor fade this frame.
+    neighborPrepPromise.then(prep => {
+      if (revealed || revealGen !== imageRevealGen) return;
+      neighborPrep = prep;
+      reveal();
+    });
+  }, waitMs);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3700,64 +3934,77 @@ function syncOverlayLayersToMarker() {
   const hVal = document.getElementById('heightNum').value;
   const Z = hVal === '' ? 0 : Number(hVal);
 
-  const main = currentImage;
-  if (!main) return;
+  const incoming = currentImage;
+  if (!incoming) return;
+  // Outgoing stack stays on the previous main’s camera until the crossfade finishes.
+  const outgoing = transitionOutgoingMain || incoming;
 
-  if (globeModeEnabled) {
-    updateVirtualGlobeCamera();
-    const virt = virtualGlobeImg || main;
-    if (!virt?.pToImage) return;
-
-    const baseFit = Math.min(viewW / virt.width, viewH / virt.height);
-    const vScale = baseFit * viewerZoom;
-
-    layers.forEach((layer) => {
-      const img = layer._overlayImage;
-      if (!img?.pToImage) return;
-      // Same fit basis as virt when dimensions match — keep float scale (no Math.round).
-      const scale = Math.min(viewW / img.width, viewH / img.height) * viewerZoom;
-
-      const Hvp = homographyLayerPadToGlobeViewport(img, virt, Z, scale, vScale, viewW, viewH);
-      if (!Hvp) {
-        const proj = projectToPixel(img, searchLat, searchLon, Z);
-        if (!proj) return;
-        const tx = viewW / 2 - proj[0] * scale;
-        const ty = viewH / 2 - proj[1] * scale;
-        layer.style.transformOrigin = '0 0';
-        layer.style.transform = `translate(${tx}px, ${ty}px)`;
-        return;
-      }
-      layer.style.transformOrigin = '0 0';
-      layer.style.transform = homography3x3ToMatrix3dString(Hvp);
-    });
-
-    syncOrthoUnderlayTransform();
-    if (overlayEnabled) updateOverlayBlur();
-    return;
-  }
+  const virtOut = globeModeEnabled ? computeVirtualGlobeCamera(outgoing) : null;
+  const virtIn = (globeModeEnabled && transitionOutgoingMain)
+    ? computeVirtualGlobeCamera(incoming)
+    : virtOut;
+  virtualGlobeImg = virtOut;
 
   const reprojectToMain = overlayEnabled && document.getElementById('overlayStretchToMainCb')?.checked;
-  const A_main = computeImageGroundJacobian(main, currentRotDeg);
 
-  const applyXf = (layer, inner, A_src) => {
-    layer.style.transformOrigin = '0 0';
-    const M = morphMatrixForSourceJacobian(A_src || A_main);
-    layer.style.transform = wrapTransformWithMorphMatrix(inner, viewW, viewH, M);
-  };
+  // Find topmost history layer (main) — children may include ortho + neighbors.
+  let topHist = null;
+  for (let i = layers.length - 1; i >= 0; i--) {
+    if (layers[i]._overlayHistory) { topHist = layers[i]; break; }
+  }
 
-  layers.forEach((layer, idx) => {
+  const A_out = (!globeModeEnabled)
+    ? computeImageGroundJacobian(outgoing, currentRotDeg)
+    : null;
+  const A_in = (!globeModeEnabled && transitionOutgoingMain)
+    ? computeImageGroundJacobian(incoming, currentRotDeg)
+    : A_out;
+
+  layers.forEach((layer) => {
     const img = layer._overlayImage;
-    if (!img) return;
-    const isTop = idx === layers.length - 1;
-    const rotDeg = (img === currentImage) ? currentRotDeg : (layer._overlayRotDeg || 0);
-    const baseFit = Math.min(viewW / img.width, viewH / img.height);
-    const scale = baseFit * viewerZoom;
+    if (!img?.pToImage) return;
+    const isTop = layer === topHist;
+    const pending = !!(layer._overlayPendingReveal || layer._neighborPendingReveal);
+    const anchor = pending ? incoming : outgoing;
+    const displayCam = globeModeEnabled
+      ? ((pending ? virtIn : virtOut) || anchor)
+      : anchor;
+    if (!displayCam?.pToImage) return;
+
+    const baseFitDisp = Math.min(viewW / displayCam.width, viewH / displayCam.height);
+    const vScale = baseFitDisp * viewerZoom;
+    const scale = Math.min(viewW / img.width, viewH / img.height) * viewerZoom;
+    const A_main = pending ? A_in : A_out;
+
+    // Neighbors + history behind main: analytical plane H into that layer’s display camera.
+    const wantReproject = !isTop && reprojectToMain && img.name !== anchor.name;
+    const wantGlobe = globeModeEnabled;
+
+    if (wantGlobe || wantReproject) {
+      const Hvp = homographyLayerPadToGlobeViewport(img, displayCam, Z, scale, vScale, viewW, viewH);
+      layer.style.transformOrigin = '0 0';
+      if (Hvp) {
+        layer._lastGlobeH = Hvp;
+        layer.style.transform = homography3x3ToMatrix3dString(Hvp);
+      } else if (layer._lastGlobeH) {
+        // Keep last good warp — translate fallback made reprojected layers pop.
+        layer.style.transform = homography3x3ToMatrix3dString(layer._lastGlobeH);
+      } else {
+        const proj = projectToPixel(img, searchLat, searchLon, Z);
+        if (!proj) return;
+        layer.style.transform = `translate(${viewW / 2 - proj[0] * scale}px, ${viewH / 2 - proj[1] * scale}px)`;
+      }
+      return;
+    }
+
+    // Top / non-reproject classic: pan (+ optional N·45° morph).
+    const rotDeg = (img.name === anchor.name) ? currentRotDeg : (layer._overlayRotDeg || 0);
     const proj = projectToPixel(img, searchLat, searchLon, Z);
     if (!proj) return;
     let vx = proj[0] * scale;
     let vy = proj[1] * scale;
-    const cw = Math.round(img.width * scale);
-    const ch = Math.round(img.height * scale);
+    const cw = img.width * scale;
+    const ch = img.height * scale;
     if (rotDeg !== 0 && cw > 0 && ch > 0) {
       const cx = cw / 2, cy = ch / 2;
       const θ = rotDeg * Math.PI / 180;
@@ -3765,54 +4012,19 @@ function syncOverlayLayersToMarker() {
       vx = cx + dx0 * Math.cos(θ) - dy0 * Math.sin(θ);
       vy = cy + dx0 * Math.sin(θ) + dy0 * Math.cos(θ);
     }
-
-    const tx = viewW / 2 - vx;
-    const ty = viewH / 2 - vy;
-    const pan = `translate(${tx}px, ${ty}px)`;
-    const A_layer = (img === main)
-      ? A_main
-      : computeImageGroundJacobian(img, rotDeg);
-
-    if (isTop || !reprojectToMain || !main || !main.pToImage || !img.pToImage || img === main) {
-      applyXf(layer, pan, A_layer);
-      return;
+    const pan = `translate(${viewW / 2 - vx}px, ${viewH / 2 - vy}px)`;
+    layer.style.transformOrigin = '0 0';
+    if (!globeModeEnabled && A_main) {
+      const A_layer = (img.name === anchor.name) ? A_main : computeImageGroundJacobian(img, rotDeg);
+      const M = morphMatrixForSourceJacobian(A_layer || A_main);
+      layer.style.transform = wrapTransformWithMorphMatrix(pan, viewW, viewH, M);
+    } else {
+      layer.style.transform = pan;
     }
-
-    const Hnm = homographyLayerNativeToMainNative(img, main, Z);
-    if (!Hnm) {
-      applyXf(layer, pan, A_layer);
-      return;
-    }
-
-    const Wn = img.width, Hn = img.height;
-    const nc = [[0, 0], [Wn, 0], [Wn, Hn], [0, Hn]];
-    const srcPad = [];
-    const dstVp = [];
-    for (let k = 0; k < 4; k++) {
-      const pm = applyHomography2D(Hnm, nc[k][0], nc[k][1]);
-      if (!pm) {
-        applyXf(layer, pan, A_layer);
-        return;
-      }
-      const vp = mainNativeToViewportPx(pm[0], pm[1], viewW, viewH);
-      if (!vp) {
-        applyXf(layer, pan, A_layer);
-        return;
-      }
-      srcPad.push(overlayNativeToPadXY(nc[k][0], nc[k][1], scale, rotDeg, cw, ch));
-      dstVp.push([vp.x, vp.y]);
-    }
-
-    const Hvp = homographyFrom4Points2D(srcPad, dstVp);
-    if (!Hvp) {
-      applyXf(layer, pan, A_layer);
-      return;
-    }
-
-    applyXf(layer, homography3x3ToMatrix3dString(Hvp), A_main);
   });
+
   syncOrthoUnderlayTransform();
-  if (overlayEnabled) updateOverlayBlur();
+  // Do not updateOverlayBlur() here — rewriting filter/z-index every pointer move made layers jump.
 }
 
 /**
@@ -3993,7 +4205,7 @@ function toggleOverlay() {
   // Same render path either way — only stacking / neighbors / blur differ.
   if (area) removeNeighborPreviewLayers(area);
   trimOverlayHistory();
-  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
+  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers(true);
   if (currentImage) {
     syncOverlayLayersToMarker();
     applyOverlayStitchedLayerVisibility();
@@ -4005,7 +4217,6 @@ function toggleOverlay() {
 function onOverlayLayersChange() {
   overlayMaxLayers = Number(document.getElementById('overlayLayersSel').value);
   trimOverlayHistory();
-  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
 }
 
 function onOverlayBlurChange() {
@@ -4052,10 +4263,11 @@ function updateOverlayBlur() {
   if (!overlayEnabled) return;
   const area = document.getElementById('viewerArea');
   if (!area) return;
-  const layers = Array.from(area.children);
-  const n = layers.length;
-  layers.forEach((layer, i) => {
-    if (layer._overlayImage) layer.style.zIndex = String(i + 1);
+  // Only count image layers (skip ortho) so blur steps stay stable.
+  const imageLayers = Array.from(area.children).filter(el => el._overlayImage);
+  const n = imageLayers.length;
+  imageLayers.forEach((layer, i) => {
+    layer.style.zIndex = String(i + 1);
     const stepsBack = n - 1 - i;   // 0 for current top layer
     const blurPx = (stepsBack > 0 ? overlayBlurFixed : 0) + stepsBack * overlayBlurStep;
     layer.style.filter = blurPx > 0 ? `blur(${blurPx}px)` : '';
@@ -4179,6 +4391,7 @@ function switchToImageBg(img, qx, qy) {
     if (currentImage && currentImage.name !== img.name) {
       captureDisplayJacobianForTransition();
     }
+    noteOutgoingMainBeforeSwitch(img);
     currentImage = img;
     currentZoom = z;
     openViewer(img, z);
@@ -4186,8 +4399,10 @@ function switchToImageBg(img, qx, qy) {
     if (gen === imageSwitchGen) pendingSwitchName = null;
   };
 
+  // Always warm main + reprojected-neighbor tiles before mounting so the joint
+  // crossfade in renderTiles can start as soon as DOM imgs are ready.
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForAllTilesDecoded(img, z).then(commit);
+    waitForMainAndNeighborTiles(img, z).then(commit);
     return;
   }
 
@@ -4195,6 +4410,10 @@ function switchToImageBg(img, qx, qy) {
   const once = () => {
     if (done) return;
     done = true;
+    // Still prefetch neighbors in the background; renderTiles waits on DOM ready.
+    if (overlayNeighborsActive()) {
+      waitForMainAndNeighborTiles(img, z).catch(() => {});
+    }
     commit();
   };
   const probe = new Image();
@@ -4940,10 +5159,11 @@ function orbitToDirection(dir) {
     if (currentImage && currentImage.name !== best.name) {
       captureDisplayJacobianForTransition();
     }
+    noteOutgoingMainBeforeSwitch(best);
     currentImage = best;
     const z = getTileZoomIndex(best);
     if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-      waitForAllTilesDecoded(best, z).then(() => {
+      waitForMainAndNeighborTiles(best, z).then(() => {
         if (gen !== imageSwitchGen) return;
         openViewer(best, z);
       });
@@ -5041,6 +5261,7 @@ function initInfiniteScrollMode() {
 
   imageSwitchGen++;
   const gen = imageSwitchGen;
+  transitionOutgoingMain = null;
   currentImage = items[0];
   const maxZ = currentImage.tileResolution.length - 1;
   currentZoom = Math.min(currentZoom, maxZ);
@@ -5057,7 +5278,7 @@ function initInfiniteScrollMode() {
   };
 
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForAllTilesDecoded(img, z).then(() => {
+    waitForMainAndNeighborTiles(img, z).then(() => {
       if (gen !== imageSwitchGen) return;
       openViewer(img, z);
       finishOverlayInit();
