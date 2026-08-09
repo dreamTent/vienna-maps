@@ -460,7 +460,10 @@
         <input type="checkbox" id="autoSwitchWhileMovingCb" checked>
         Switch while moving
       </label>
-      <button class="btn-sm" id="autoRotateBtn"   onclick="toggleAutoRotate()">↻ Rotate to marker</button>
+      <button class="btn-sm" id="autoRotateBtn" onclick="toggleAutoRotate()" style="opacity:.5"
+              title="Rotate the image so the ground marker sits on the vertical centre line">↻ Rotate to marker</button>
+      <button class="btn-sm" id="horizonStableBtn" onclick="toggleHorizonStable()" style="opacity:.5"
+              title="Rotate so the ground-plane horizon (from the camera matrix) is horizontal">⇄ Horizon stable</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
       <span style="display:flex;align-items:center;gap:4px;font-size:.68rem;color:var(--text-dim);white-space:nowrap"
             title="Auto-advance through the sorted list (same as . key)">
@@ -1496,7 +1499,9 @@ let currentDispScale = 1;  // display pixels per image pixel — SAME at all zoo
 let currentContentW  = 0, currentContentH = 0; // content div size (after scale, before rotation)
 let currentRotDeg    = 0;  // degrees currently applied as CSS rotate() on the clip div
 let currentEdgeTrimDisp = 0; // displayed trim in px to hide source-edge black bleed
-let autoRotate       = false; // when true, rotate so the marker is horizontally centred
+let autoRotate       = false; // deprecated alias — use rotateMode === 'marker'
+/** Image CSS rotate mode: off | marker (centre marker horizontally) | horizon (level ground vanishing line). */
+let rotateMode       = 'off';
 let pinMarkerCenter  = false; // when true, translate the image so the marker is at the exact viewport centre
 /** When true: keep a history stack, neighbors, blur/reproject. Layout is always the absolute overlay path. */
 let overlayEnabled   = false;
@@ -1671,18 +1676,40 @@ function waitForAllTilesDecoded(img, zoom) {
   return Promise.all(promises);
 }
 
+/**
+ * CSS rotate (deg) that makes the ground-plane horizon horizontal.
+ * Horizon = vanishing line of Z=0 = cross product of vanishing points of world X and Y.
+ */
+function computeHorizonLevelRotDeg(img) {
+  const P = img && img.pToImage;
+  if (!P) return 0;
+  const vE = [P[0][0], P[1][0], P[2][0]];
+  const vN = [P[0][1], P[1][1], P[2][1]];
+  // Line l = vE × vN  →  a·x + b·y + c = 0
+  const a = vE[1] * vN[2] - vE[2] * vN[1];
+  const b = vE[2] * vN[0] - vE[0] * vN[2];
+  if (!Number.isFinite(a) || !Number.isFinite(b) || (a === 0 && b === 0)) return 0;
+  // Angle of the horizon line from +x (image right); y increases downward.
+  let deg = -Math.atan2(a, -b) * (180 / Math.PI);
+  // Keep in (-180, 180] for stable labels / smallest visual twist.
+  deg = ((deg + 180) % 360 + 360) % 360 - 180;
+  return deg;
+}
+
+/** Active image rotation for the current rotateMode (marker / horizon / off). */
 function computeAutoRotDegForImage(img) {
-  let rotDeg = 0;
-  if (autoRotate && img.pToImage) {
+  if (!img || !img.pToImage) return 0;
+  if (rotateMode === 'horizon') return computeHorizonLevelRotDeg(img);
+  if (rotateMode === 'marker') {
     const hVal = document.getElementById('heightNum').value;
     const Z = hVal === '' ? 0 : Number(hVal);
     const proj = projectToPixel(img, searchLat, searchLon, Z);
-    if (proj) {
-      const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
-      if (fx >= 1) rotDeg = -Math.atan((proj[0] - img.width / 2) / fx) * (180 / Math.PI);
-    }
+    if (!proj) return 0;
+    const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
+    if (fx < 1) return 0;
+    return -Math.atan((proj[0] - img.width / 2) / fx) * (180 / Math.PI);
   }
-  return rotDeg;
+  return 0;
 }
 
 /** Neighbor preview layer (no dot overlay, no rotPadDiv id) — same tile layout as the main stack. */
@@ -2241,22 +2268,12 @@ function renderTiles(img, zoom) {
   const clipW = Math.max(1, contentW - edgeTrimDisp);
   const clipH = Math.max(1, contentH - edgeTrimDisp);
 
-  // Compute auto-rotation: rotate so the marker is horizontally centred.
-  // rotDeg = -horizAngle  (positive horizAngle → marker right of centre → rotate left).
-  let rotDeg = 0;
-  if (autoRotate && img.pToImage) {
-    const hVal = document.getElementById('heightNum').value;
-    const Z = hVal === '' ? 0 : Number(hVal);
-    const proj = projectToPixel(img, searchLat, searchLon, Z);
-    if (proj) {
-      const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
-      if (fx >= 1) rotDeg = -Math.atan((proj[0] - img.width / 2) / fx) * (180 / Math.PI);
-    }
-  }
+  // Image rotation: marker-centring or horizon-level (mutually exclusive modes).
+  const rotDeg = computeAutoRotDegForImage(img);
   currentRotDeg   = rotDeg;
   currentContentW = contentW;
   currentContentH = contentH;
-  updateAutoRotateLabel(rotDeg);
+  updateRotateModeButtons(rotDeg);
 
   // Absolute marker-centring: CSS translate on each layer (same path with or without overlay stacking).
   viewPadX = 0;
@@ -2370,10 +2387,7 @@ function refreshDot() {
         <line x1="${dx-24}" y1="${dy}" x2="${dx+24}" y2="${dy}" stroke="${stroke}" stroke-width="1.5" opacity=".85"/>
         <line x1="${dx}" y1="${dy-24}" x2="${dx}" y2="${dy+24}" stroke="${stroke}" stroke-width="1.5" opacity=".85"/>
         <circle cx="${dx}" cy="${dy}" r="14" fill="none" stroke="${stroke}" stroke-width="2" opacity=".85"/>
-        <circle cx="${dx}" cy="${dy}" r="3" fill="${stroke}" opacity=".95"/>
-        <rect x="${dx+18}" y="${dy-11}" width="60" height="14" rx="3" fill="#0d1117" fill-opacity=".75"/>
-        <text x="${dx+21}" y="${dy}" fill="${stroke}" font-size="10" font-family="monospace"
-              dominant-baseline="middle">${px.toFixed(0)}, ${py.toFixed(0)}</text>`;
+        <circle cx="${dx}" cy="${dy}" r="3" fill="${stroke}" opacity=".95"/>`;
     } else {
       const cx = W/2, cy = H/2;
       const angle = Math.atan2(dy - cy, dx - cx);
@@ -2386,9 +2400,8 @@ function refreshDot() {
     }
   }
 
-  // When autoRotate is on, update the CSS rotation live as the marker moves
-  // (no tile rebuild — just change the clip div's transform and padding).
-  if (autoRotate && currentImage.pToImage && result) {
+  // Live rotation update while moving: only “rotate to marker” depends on the marker.
+  if (rotateMode === 'marker' && currentImage.pToImage && result) {
     const fx = Math.hypot(
       currentImage.pToImage[0][0],
       currentImage.pToImage[0][1],
@@ -2399,7 +2412,7 @@ function refreshDot() {
       : 0;
     if (Math.abs(newRot - currentRotDeg) > 0.15) {
       currentRotDeg = newRot;
-      updateAutoRotateLabel(newRot);
+      updateRotateModeButtons(newRot);
       const clipDiv = document.getElementById('rotClipDiv');
       if (clipDiv) clipDiv.style.transform = `rotate(${newRot}deg)`;
       // Absolute layers use CSS translate for centring — do not rewrite scroll padding.
@@ -3012,22 +3025,44 @@ function updateOverlayBlur() {
   applyOverlayStitchedLayerVisibility();
 }
 
-function toggleAutoRotate() {
-  autoRotate = !autoRotate;
-  const btn = document.getElementById('autoRotateBtn');
-  btn.style.opacity = autoRotate ? '' : '.5';
+function setRotateMode(mode) {
+  rotateMode = mode;
+  autoRotate = mode === 'marker';
   if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
+  else updateRotateModeButtons(0);
 }
 
-/** Update the rotate button label to show the applied angle. */
-function updateAutoRotateLabel(deg) {
-  const btn = document.getElementById('autoRotateBtn');
-  if (!btn) return;
-  if (!autoRotate || deg === 0) {
-    btn.textContent = '↻ Rotate to marker';
-  } else {
-    btn.textContent = `↻ ${deg >= 0 ? '+' : ''}${deg.toFixed(1)}°`;
+function toggleAutoRotate() {
+  setRotateMode(rotateMode === 'marker' ? 'off' : 'marker');
+}
+
+function toggleHorizonStable() {
+  setRotateMode(rotateMode === 'horizon' ? 'off' : 'horizon');
+}
+
+/** Sync both rotate-mode buttons (active state + angle label). */
+function updateRotateModeButtons(deg) {
+  const markerBtn = document.getElementById('autoRotateBtn');
+  const horizonBtn = document.getElementById('horizonStableBtn');
+  const d = Number.isFinite(deg) ? deg : currentRotDeg;
+  if (markerBtn) {
+    const on = rotateMode === 'marker';
+    markerBtn.style.opacity = on ? '' : '.5';
+    markerBtn.textContent = (on && Math.abs(d) >= 0.05)
+      ? `↻ ${d >= 0 ? '+' : ''}${d.toFixed(1)}°`
+      : '↻ Rotate to marker';
   }
+  if (horizonBtn) {
+    const on = rotateMode === 'horizon';
+    horizonBtn.style.opacity = on ? '' : '.5';
+    horizonBtn.textContent = (on && Math.abs(d) >= 0.05)
+      ? `⇄ ${d >= 0 ? '+' : ''}${d.toFixed(1)}°`
+      : '⇄ Horizon stable';
+  }
+}
+
+function updateAutoRotateLabel(deg) {
+  updateRotateModeButtons(deg);
 }
 
 const AUTO_SWITCH_MS = 120;
