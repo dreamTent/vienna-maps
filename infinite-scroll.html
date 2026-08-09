@@ -464,6 +464,12 @@
               title="Rotate the image so the ground marker sits on the vertical centre line">↻ Rotate to marker</button>
       <button class="btn-sm" id="horizonStableBtn" onclick="toggleHorizonStable()" style="opacity:.5"
               title="Rotate so the ground-plane horizon (from the camera matrix) is horizontal">⇄ Horizon stable</button>
+      <button class="btn-sm" id="globeModeBtn" onclick="toggleGlobeMode()"
+              title="Project onto a continuous semi-globe camera blended from nearby images so along-view motion doesn’t jump when the photo swaps. Main, reprojected stack, and ortho all share that view."
+              aria-pressed="true">🌐 Globe</button>
+      <button class="btn-sm" id="groundScaleLockBtn" onclick="toggleGroundScaleLock()" style="opacity:.5"
+              title="Warp the view to a fixed fake camera: north-facing, 45° look-down. Same squeeze/stretch for every image (main, reprojected, ortho)."
+              aria-pressed="false">⬆ N·45°</button>
       <button class="btn-sm" onclick="downloadCurrent()">⬇ Download</button>
       <span style="display:flex;align-items:center;gap:4px;font-size:.68rem;color:var(--text-dim);white-space:nowrap"
             title="Auto-advance through the sorted list (same as . key)">
@@ -473,6 +479,23 @@
                style="width:48px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.72rem;padding:2px 4px"
                oninput="restartListPlayIfActive()">
         <span>s</span>
+      </span>
+      <span style="display:flex;align-items:center;gap:4px;font-size:.68rem;color:var(--text-dim);white-space:nowrap;flex-wrap:wrap"
+            title="Random tour: pick a nearby place, glide there on a curved path, pick another, and so on. Drag or arrow keys stop the tour.">
+        <button type="button" class="btn-sm" id="autoTourBtn" onclick="toggleAutoTour()" style="padding:2px 8px;opacity:.5"
+                aria-pressed="false">✈ Tour</button>
+        <input type="number" id="autoTourRadiusM" value="2000" min="50" max="20000" step="50"
+               title="Stay within this radius (m) of where the tour started"
+               style="width:58px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.72rem;padding:2px 4px">
+        <span>R m</span>
+        <input type="number" id="autoTourHopM" value="400" min="30" max="5000" step="10"
+               title="Max distance (m) to the next waypoint"
+               style="width:52px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.72rem;padding:2px 4px">
+        <span>hop</span>
+        <input type="number" id="autoTourSpeed" value="35" min="1" max="500" step="1"
+               title="Ground speed (m/s)"
+               style="width:44px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.72rem;padding:2px 4px">
+        <span>m/s</span>
       </span>
       <span style="font-size:.68rem;color:var(--text-dim);white-space:nowrap"
             title="Arrow keys: move along view (↑↓←→, Shift=×10). + / # visual zoom (DE layout). , / . list.">⌨ ↑↓←→ +# · , .</span>
@@ -789,6 +812,316 @@ function groundMgiToPixel(img, X, Y, Z) {
   return [u / w, v / w];
 }
 
+function solveLinear3(A, b) {
+  const inv = invert3x3(A);
+  if (!inv) return null;
+  return [
+    inv[0][0] * b[0] + inv[0][1] * b[1] + inv[0][2] * b[2],
+    inv[1][0] * b[0] + inv[1][1] * b[1] + inv[1][2] * b[2],
+    inv[2][0] * b[0] + inv[2][1] * b[1] + inv[2][2] * b[2],
+  ];
+}
+
+/** Camera centre in MGI from 3×4 projection (null-space of P). */
+function cameraCenterFromP(P) {
+  if (!P) return null;
+  const A = [
+    [P[0][0], P[0][1], P[0][2]],
+    [P[1][0], P[1][1], P[1][2]],
+    [P[2][0], P[2][1], P[2][2]],
+  ];
+  const b = [-P[0][3], -P[1][3], -P[2][3]];
+  const C = solveLinear3(A, b);
+  if (!C || !Number.isFinite(C[0]) || !Number.isFinite(C[1]) || !Number.isFinite(C[2])) return null;
+  return C;
+}
+
+/** Approximate focal length (px) from local ground scale at the image look-at. */
+function estimateFocalPx(img) {
+  if (!img?.pToImage) return img?.width || 1000;
+  const C = cameraCenterFromP(img.pToImage);
+  if (!C) return img.width;
+  const [Lx, Ly] = img.lookAtMgi;
+  const Z = 0;
+  const dist = Math.hypot(C[0] - Lx, C[1] - Ly, C[2] - Z);
+  if (!(dist > 1)) return img.width;
+  const p0 = groundMgiToPixel(img, Lx, Ly, Z);
+  const p1 = groundMgiToPixel(img, Lx + 10, Ly, Z);
+  if (!p0 || !p1) return img.width;
+  const pxPerM = Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) / 10;
+  const f = pxPerM * dist;
+  return Math.max(img.width * 0.25, Math.min(img.width * 6, f));
+}
+
+/**
+ * Build a pinhole P (y-down image) looking from C toward look-at L.
+ * World: +X east, +Y north, +Z up. Image: +x right, +y down.
+ */
+function makeLookAtProjection(Cx, Cy, Cz, Lx, Ly, Lz, f, width, height) {
+  let fx = Lx - Cx, fy = Ly - Cy, fz = Lz - Cz;
+  const flen = Math.hypot(fx, fy, fz);
+  if (!(flen > 1e-6)) return null;
+  fx /= flen; fy /= flen; fz /= flen;
+
+  // right = forward × worldUp
+  let rx = fy, ry = -fx, rz = 0;
+  let rlen = Math.hypot(rx, ry, rz);
+  if (rlen < 1e-8) {
+    rx = 1; ry = 0; rz = 0;
+    rlen = 1;
+  } else {
+    rx /= rlen; ry /= rlen; rz /= rlen;
+  }
+  // down = forward × right
+  const dx = fy * rz - fz * ry;
+  const dy = fz * rx - fx * rz;
+  const dz = fx * ry - fy * rx;
+
+  const R = [
+    [rx, ry, rz],
+    [dx, dy, dz],
+    [fx, fy, fz],
+  ];
+  const tx = -(R[0][0] * Cx + R[0][1] * Cy + R[0][2] * Cz);
+  const ty = -(R[1][0] * Cx + R[1][1] * Cy + R[1][2] * Cz);
+  const tz = -(R[2][0] * Cx + R[2][1] * Cy + R[2][2] * Cz);
+  const cx = width / 2;
+  const cy = height / 2;
+  return [
+    [f * R[0][0] + cx * R[2][0], f * R[0][1] + cx * R[2][1], f * R[0][2] + cx * R[2][2], f * tx + cx * tz],
+    [f * R[1][0] + cy * R[2][0], f * R[1][1] + cy * R[2][1], f * R[1][2] + cy * R[2][2], f * ty + cy * tz],
+    [R[2][0], R[2][1], R[2][2], tz],
+  ];
+}
+
+/**
+ * Continuous “semi-globe” display camera: Gaussian-blend nearby same-direction cameras’
+ * centres + FOV, then ride on a sphere around the marker. No pose EMA — the blend is
+ * already continuous; lag-smoothing was causing a visible rubber-band wiggle.
+ */
+let globeModeEnabled = true;
+let virtualGlobeImg = null;
+let globePoseLastTs = 0;
+let globePoseMarkerKey = '';
+const GLOBE_INFLUENCE_M = 3200;
+const GLOBE_SIGMA_M = 280;
+/** Fixed local-patch half-extent (m) for stable homographies. */
+const GLOBE_PATCH_M = 160;
+/** Ortho metric plane: snap origin & rebuild tiles only after moving this far. */
+const ORTHO_ORIGIN_SNAP_M = 40;
+const ORTHO_REBUILD_DIST_M = 100;
+let orthoGlobeLockedScale = null;
+let orthoGlobeLockedZoom = null;
+
+function ensureCameraExtras(img) {
+  if (!img || !img.pToImage) return;
+  if (!img._camCenter) img._camCenter = cameraCenterFromP(img.pToImage);
+  if (!(img._focalPx > 0)) img._focalPx = estimateFocalPx(img);
+}
+
+function updateVirtualGlobeCamera() {
+  if (!globeModeEnabled || !currentImage?.pToImage) {
+    virtualGlobeImg = null;
+    return;
+  }
+
+  const hVal = document.getElementById('heightNum').value;
+  const Z = hVal === '' ? 0 : Number(hVal);
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const dir = currentImage.viewDirection;
+  const W = currentImage.width;
+  const H = currentImage.height;
+  const now = performance.now();
+  const markerKey = `${mx.toFixed(3)},${my.toFixed(3)},${dir},${W}`;
+  // Deduplicate multi-caller updates within the same frame only if marker unchanged.
+  if (virtualGlobeImg && globePoseLastTs && (now - globePoseLastTs) < 6 &&
+      globePoseMarkerKey === markerKey) return;
+  globePoseLastTs = now;
+  globePoseMarkerKey = markerKey;
+
+  let wSum = 0;
+  let Cx = 0, Cy = 0, Cz = 0, fAcc = 0, rAcc = 0;
+  const inv2Sig = 1 / (2 * GLOBE_SIGMA_M * GLOBE_SIGMA_M);
+
+  for (const img of allImages) {
+    if (!img.pToImage || img.viewDirection !== dir) continue;
+    const d = Math.hypot(mx - img.lookAtMgi[0], my - img.lookAtMgi[1]);
+    if (d > GLOBE_INFLUENCE_M) continue;
+    ensureCameraExtras(img);
+    const C = img._camCenter;
+    if (!C) continue;
+    const [Lx, Ly] = img.lookAtMgi;
+    const distCam = Math.hypot(C[0] - Lx, C[1] - Ly, C[2] - Z);
+    if (!(distCam > 1)) continue;
+    const w = Math.exp(-(d * d) * inv2Sig);
+    if (w < 1e-6) continue;
+    Cx += w * C[0];
+    Cy += w * C[1];
+    Cz += w * C[2];
+    fAcc += w * img._focalPx;
+    rAcc += w * distCam;
+    wSum += w;
+  }
+
+  let tCx, tCy, tCz, tF, tR;
+  if (!(wSum > 1e-12)) {
+    ensureCameraExtras(currentImage);
+    const C = currentImage._camCenter;
+    if (!C) return;
+    tCx = C[0]; tCy = C[1]; tCz = C[2];
+    tF = currentImage._focalPx;
+    tR = Math.hypot(C[0] - mx, C[1] - my, C[2] - Z);
+  } else {
+    tCx = Cx / wSum;
+    tCy = Cy / wSum;
+    tCz = Cz / wSum;
+    tF = fAcc / wSum;
+    tR = rAcc / wSum;
+  }
+  if (!(tR > 1)) tR = 500;
+
+  let vx = tCx - mx, vy = tCy - my, vz = tCz - Z;
+  let vr = Math.hypot(vx, vy, vz);
+  if (vr < 1e-3) {
+    const h = ((currentImage.heading || 0) * Math.PI) / 180;
+    vx = -Math.sin(h);
+    vy = -Math.cos(h);
+    vz = 0.75;
+    vr = Math.hypot(vx, vy, vz);
+  }
+  const ux = vx / vr, uy = vy / vr, uz = vz / vr;
+
+  Cx = mx + ux * tR;
+  Cy = my + uy * tR;
+  Cz = Z + uz * tR;
+  if (Cz < Z + 40) Cz = Z + Math.max(40, tR * 0.35);
+
+  const P = makeLookAtProjection(Cx, Cy, Cz, mx, my, Z, tF, W, H);
+  if (!P) return;
+  virtualGlobeImg = {
+    name: '__globe__',
+    width: W,
+    height: H,
+    pToImage: P,
+    lookAtMgi: [mx, my],
+    viewDirection: dir,
+    heading: currentImage.heading,
+  };
+}
+
+/** Camera used for display warps / ortho / drag when globe mode is on. */
+function getDisplayCameraImg() {
+  if (globeModeEnabled) {
+    if (!virtualGlobeImg) updateVirtualGlobeCamera();
+    if (virtualGlobeImg) return virtualGlobeImg;
+  }
+  return currentImage;
+}
+
+function resetOrthoGlobeLayoutCache() {
+  orthoGlobeLockedScale = null;
+  orthoGlobeLockedZoom = null;
+  const el = document.getElementById('orthoUnderlay');
+  if (el) {
+    el._orthoOriginX = el._orthoOriginY = undefined;
+  }
+}
+
+function toggleGlobeMode() {
+  globeModeEnabled = !globeModeEnabled;
+  const btn = document.getElementById('globeModeBtn');
+  if (btn) {
+    btn.style.opacity = globeModeEnabled ? '' : '.5';
+    btn.setAttribute('aria-pressed', globeModeEnabled ? 'true' : 'false');
+  }
+  virtualGlobeImg = null;
+  globePoseLastTs = 0;
+  resetOrthoGlobeLayoutCache();
+  if (currentImage) {
+    renderTiles(currentImage, getTileZoomIndex(currentImage));
+  }
+}
+
+/** Fixed patch size (kept for any remaining callers). */
+function globePatchHalfExtentM() {
+  return GLOBE_PATCH_M;
+}
+
+/** 3×3: ground [X, Y, 1] → image homogeneous [u, v, w] on plane Z. */
+function planeMapMgiToImage(P, Z) {
+  return [
+    [P[0][0], P[0][1], P[0][2] * Z + P[0][3]],
+    [P[1][0], P[1][1], P[1][2] * Z + P[1][3]],
+    [P[2][0], P[2][1], P[2][2] * Z + P[2][3]],
+  ];
+}
+
+function normalizeHomography3(H) {
+  const h22 = H[2][2];
+  if (!Number.isFinite(h22) || Math.abs(h22) < 1e-18) return null;
+  return [
+    [H[0][0] / h22, H[0][1] / h22, H[0][2] / h22],
+    [H[1][0] / h22, H[1][1] / h22, H[1][2] / h22],
+    [H[2][0] / h22, H[2][1] / h22, 1],
+  ];
+}
+
+/**
+ * Analytical plane-induced homography: layer pad → viewport via virt camera.
+ * No 4-point DLT — that refit every frame was the main/reprojected stutter.
+ */
+function homographyLayerPadToGlobeViewport(img, virt, Z, scale, vScale, viewW, viewH) {
+  if (!img?.pToImage || !virt?.pToImage || !(scale > 0) || !(vScale > 0)) return null;
+  const markerVirt = projectToPixel(virt, searchLat, searchLon, Z);
+  if (!markerVirt) return null;
+
+  const M_layer = planeMapMgiToImage(img.pToImage, Z);
+  const M_virt = planeMapMgiToImage(virt.pToImage, Z);
+  const invLayer = invert3x3(M_layer);
+  if (!invLayer) return null;
+
+  // layer native → virt homogeneous
+  const H_nv = multiply3x3(M_virt, invLayer);
+  // pad → native
+  const S_pad_to_native = [
+    [1 / scale, 0, 0],
+    [0, 1 / scale, 0],
+    [0, 0, 1],
+  ];
+  // virt homogeneous → centred viewport (works before /w)
+  const cx = viewW / 2 - markerVirt[0] * vScale;
+  const cy = viewH / 2 - markerVirt[1] * vScale;
+  const S_virt_to_vp = [
+    [vScale, 0, cx],
+    [0, vScale, cy],
+    [0, 0, 1],
+  ];
+  return normalizeHomography3(multiply3x3(S_virt_to_vp, multiply3x3(H_nv, S_pad_to_native)));
+}
+
+/** Analytical: ortho metric-local pad → globe viewport (same plane Z). */
+function homographyOrthoMetricToGlobeViewport(virt, Z, s, originX, originY, minLeft, minTop, vScale, viewW, viewH) {
+  if (!virt?.pToImage || !(s > 0) || !(vScale > 0)) return null;
+  const markerVirt = projectToPixel(virt, searchLat, searchLon, Z);
+  if (!markerVirt) return null;
+
+  // local (x_l,y_l) → MGI (X,Y): x_l = s(X-ox)-minLeft, y_l = s(oy-Y)-minTop
+  const M_local_to_mgi = [
+    [1 / s, 0, minLeft / s + originX],
+    [0, -1 / s, originY - minTop / s],
+    [0, 0, 1],
+  ];
+  const M_virt = planeMapMgiToImage(virt.pToImage, Z);
+  const cx = viewW / 2 - markerVirt[0] * vScale;
+  const cy = viewH / 2 - markerVirt[1] * vScale;
+  const S_virt_to_vp = [
+    [vScale, 0, cx],
+    [0, vScale, cy],
+    [0, 0, 1],
+  ];
+  return normalizeHomography3(multiply3x3(S_virt_to_vp, multiply3x3(M_virt, M_local_to_mgi)));
+}
+
 function applyHomography2D(H, x, y) {
   const w = H[2][0] * x + H[2][1] * y + H[2][2];
   if (Math.abs(w) < 1e-14) return null;
@@ -971,13 +1304,15 @@ function mainNativeToViewportPx(pmx, pmy, viewW, viewH) {
 
 function homography3x3ToMatrix3dString(H) {
   const h = H;
+  // Full precision — toFixed(6) was quantizing small perspective terms and causing wiggle.
+  const fmt = (v) => (Number.isFinite(v) ? String(v) : '0');
   const m = [
     h[0][0], h[1][0], 0, h[2][0],
     h[0][1], h[1][1], 0, h[2][1],
     0, 0, 1, 0,
     h[0][2], h[1][2], 0, h[2][2],
   ];
-  return `matrix3d(${m.join(',')})`;
+  return `matrix3d(${m.map(fmt).join(',')})`;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1521,6 +1856,24 @@ let listPlayActive   = false;
 // Kept between image switches; independent of tile quality zoom.
 const VZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 6, 8, 12, 16, 20, 24, 30];
 let viewerZoom = 1;          // current visual zoom multiplier
+/**
+ * Shared ground→screen Jacobian at the viewport centre, plus optional animated morph
+ * when switching cameras. Applied per-layer (main, history, reprojected, ortho) so
+ * foreshortening eases instead of jumping (esp. along-view / “up-down” switches).
+ */
+let groundScaleLockEnabled = false;
+/** Locked px-per-metre (east–west); captured on enable / after user zoom. */
+let groundScaleLockPxPerMeter = null;
+/** Desired ground→screen Jacobian currently shown (lerp target of transition). */
+let displayGroundJacobian = null;
+/** Screen←screen morph for the *current* main image: displayJ · inv(A_main). */
+let morphMatrix = [1, 0, 0, 1];
+/** Depression angle of the canonical fake view (from horizontal). */
+const CANONICAL_VIEW_DEPRESS_DEG = 45;
+/** { from, to, t0, dur, raf } while morphing between cameras. */
+let displayJacobianTransition = null;
+/** Captured before currentImage changes; consumed in renderTiles. */
+let pendingDisplayJFrom = null;
 let viewPadX = 0, viewPadY = 0;  // centering padding so marker-scroll math is correct
 let markerDX = -1, markerDY = -1; // last marker display position (px), -1 = no marker
 const IMAGE_EDGE_TRIM_SOURCE_PX = 6;
@@ -1534,10 +1887,15 @@ let imageSwitchGen = 0;
 
 function selectImage(idx, el) {
   imageSwitchGen++;
+  pendingSwitchName = null;
   const gen = imageSwitchGen;
   document.querySelectorAll('.result-item.active').forEach(e => e.classList.remove('active'));
   el.classList.add('active');
-  currentImage = document.getElementById('resultsList')._items[idx];
+  const next = document.getElementById('resultsList')._items[idx];
+  if (currentImage && next && currentImage.name !== next.name) {
+    captureDisplayJacobianForTransition();
+  }
+  currentImage = next;
   const maxZoom = currentImage.tileResolution.length - 1;
   currentZoom = Math.min(currentZoom, maxZoom);
 
@@ -1665,16 +2023,52 @@ function waitForAllTilesDecoded(img, zoom) {
     for (let x = 0; x < cols; x++) {
       promises.push(new Promise(resolve => {
         const el = new Image();
-        const done = () => resolve();
-        el.onload = done;
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        const finish = () => {
+          if (typeof el.decode === 'function') {
+            el.decode().then(done).catch(done);
+          } else {
+            done();
+          }
+        };
+        el.onload = finish;
         el.onerror = done;
         el.src = `${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg`;
-        if (el.complete && el.naturalWidth) done();
+        if (el.complete) finish();
       }));
     }
   }
   return Promise.all(promises);
 }
+
+/** Wait until viewer <img> nodes have pixels (works for newly mounted layers; uses HTTP cache after waitForAllTilesDecoded). */
+function whenImagesReady(imgs) {
+  if (!imgs || !imgs.length) return Promise.resolve();
+  return Promise.all(Array.from(imgs).map(im => {
+    if (im.complete && im.naturalWidth > 0) {
+      return typeof im.decode === 'function' ? im.decode().catch(() => {}) : Promise.resolve();
+    }
+    return new Promise(resolve => {
+      const done = () => resolve();
+      im.addEventListener('load', () => {
+        if (typeof im.decode === 'function') im.decode().then(done).catch(done);
+        else done();
+      }, { once: true });
+      im.addEventListener('error', done, { once: true });
+    });
+  }));
+}
+
+/** Bumps to cancel stale crossfades when another image mounts. */
+let imageRevealGen = 0;
+const IMAGE_CROSSFADE_MS = 420;
+/** Ground-Jacobian morph duration when switching cameras (squeeze/stretch into the new view). */
+const IMAGE_MORPH_MS = 560;
 
 /**
  * CSS rotate (deg) that makes the ground-plane horizon horizontal.
@@ -1735,7 +2129,7 @@ function buildNeighborLayerDOM(img, zoom) {
     for (let x = 0; x < cols; x++) {
       tilesHtml += `<img src="${img.remoteBaseUrl}/${img.name}/${zoom}/${x}/${y}.jpg"
                         width="${dispTileW}" height="${dispTileW}"
-                        loading="lazy" onerror="this.style.opacity='.1'"
+                        loading="eager" decoding="async" onerror="this.style.opacity='.1'"
                         title="z${zoom}/${x}/${y}">`;
     }
     tilesHtml += '</div>';
@@ -1750,7 +2144,7 @@ function buildNeighborLayerDOM(img, zoom) {
       </div>
     </div>`;
   const layer = document.createElement('div');
-  layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform;';
+  layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform,opacity;';
   layer.innerHTML = innerHtml;
   layer._overlayImage = img;
   layer._overlayRotDeg = rotDeg;
@@ -1765,9 +2159,11 @@ function removeNeighborPreviewLayers(area) {
   });
 }
 
-/** Max history layers to keep: full stack when overlay is on, otherwise a single main frame. */
+/** Max history layers to keep: full stack when overlay is on, otherwise a single main frame.
+ *  ×0 in the UI means “only the current image” (still at least 1). */
 function effectiveOverlayHistoryLimit() {
-  return overlayEnabled ? overlayMaxLayers : 1;
+  if (!overlayEnabled) return 1;
+  return Math.max(1, overlayMaxLayers | 0);
 }
 
 /** Max user-navigated layers; neighbor previews do not count toward this cap. */
@@ -1802,9 +2198,33 @@ function pickNearestNeighborImages(mainImg, count) {
     .map(x => x.img);
 }
 
+/** First history layer in paint order — neighbors insert before this (behind all mains). */
+function firstHistoryLayer(area) {
+  for (const el of area.children) {
+    if (el._overlayHistory) return el;
+  }
+  return null;
+}
+
+let neighborRebuildTimer = null;
+
 function scheduleRebuildOverlayNeighborLayers() {
   overlayNeighborGen++;
   const gen = overlayNeighborGen;
+  if (neighborRebuildTimer) clearTimeout(neighborRebuildTimer);
+  // Debounce: rapid auto-switch / marker move shouldn't wipe neighbors every frame.
+  neighborRebuildTimer = setTimeout(() => {
+    neighborRebuildTimer = null;
+    rebuildOverlayNeighborLayers(gen);
+  }, 100);
+}
+
+/**
+ * Diff-update reprojected neighbor layers: keep ones still needed, fade in newcomers,
+ * only remove obsolete — avoids the blank flash from remove-all-then-add.
+ */
+function rebuildOverlayNeighborLayers(gen) {
+  if (gen !== overlayNeighborGen) return;
   const area = document.getElementById('viewerArea');
   if (!area || !overlayEnabled) return;
 
@@ -1827,12 +2247,8 @@ function scheduleRebuildOverlayNeighborLayers() {
     return;
   }
 
-  // Nearest-neighbor previews (behind the stack when Reproject to main is on) always load z0
-  // tiles so resolution does not follow the main image’s zoom pills.
   const z = 0;
   const mainName = currentImage.name;
-
-  // Keep previous neighbor layers visible until the new set has finished decoding.
 
   Promise.all(neighbors.map(img => waitForAllTilesDecoded(img, z))).then(() => {
     if (gen !== overlayNeighborGen) return;
@@ -1840,29 +2256,72 @@ function scheduleRebuildOverlayNeighborLayers() {
     const area2 = document.getElementById('viewerArea');
     if (!area2) return;
 
-    removeNeighborPreviewLayers(area2);
-
-    const mainEl = area2.lastElementChild;
-    if (!mainEl || !mainEl._overlayHistory) {
-      syncOrthoDimMainClass();
-      return;
+    const wantNames = new Set(neighbors.map(img => img.name));
+    const existing = Array.from(area2.children).filter(el => el._overlayNeighborPreview);
+    const byName = new Map();
+    for (const el of existing) {
+      const name = el._overlayImage && el._overlayImage.name;
+      if (!name || !wantNames.has(name) || byName.has(name)) {
+        el.remove();
+        continue;
+      }
+      byName.set(name, el);
     }
 
     const sorted = [...neighbors].sort((a, b) => {
       const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
       const da = Math.hypot(qx - a.lookAtMgi[0], qy - a.lookAtMgi[1]);
       const db = Math.hypot(qx - b.lookAtMgi[0], qy - b.lookAtMgi[1]);
-      return db - da;
+      return db - da; // farthest first → nearest ends closest to main
     });
 
+    const histAnchor = firstHistoryLayer(area2);
+    const newcomers = [];
+
     for (const img of sorted) {
-      const layer = buildNeighborLayerDOM(img, z);
-      area2.insertBefore(layer, mainEl);
+      let layer = byName.get(img.name);
+      if (!layer) {
+        layer = buildNeighborLayerDOM(img, z);
+        layer.style.opacity = '0';
+        newcomers.push(layer);
+        if (histAnchor) area2.insertBefore(layer, histAnchor);
+        else area2.appendChild(layer);
+      } else {
+        layer._overlayRotDeg = computeAutoRotDegForImage(img);
+        layer.style.opacity = '1';
+        layer.style.transition = '';
+        if (histAnchor) area2.insertBefore(layer, histAnchor);
+        else area2.appendChild(layer);
+      }
     }
-    neighbors.forEach(img => preloadToCache(img, z));
-    syncOverlayLayersToMarker();
-    updateOverlayBlur();
-    syncOrthoDimMainClass();
+
+    const finish = () => {
+      if (gen !== overlayNeighborGen) {
+        newcomers.forEach(el => { if (el.isConnected) el.remove(); });
+        return;
+      }
+      for (const layer of newcomers) {
+        if (!layer.isConnected) continue;
+        layer.style.transition = 'opacity 220ms ease';
+        layer.style.opacity = '1';
+      }
+      neighbors.forEach(img => preloadToCache(img, z));
+      syncOverlayLayersToMarker();
+      updateOverlayBlur();
+      syncOrthoDimMainClass();
+    };
+
+    if (!newcomers.length) {
+      finish();
+      return;
+    }
+
+    const imgs = [];
+    newcomers.forEach(layer => {
+      layer.querySelectorAll('.tile-canvas-wrap img').forEach(im => imgs.push(im));
+    });
+    whenImagesReady(imgs).then(finish);
+    setTimeout(finish, 4000);
   });
 }
 
@@ -1903,6 +2362,144 @@ function rotateAround(x, y, cx, cy, degRad) {
 }
 
 /**
+ * Globe ortho: tiles on a north-up metric plane with a *fixed* MGI origin + locked scale.
+ * Tile matrices only rebuild when the origin snaps; each frame only the container
+ * local-patch warp updates — avoids marker-relative tile reshuffling wiggle.
+ */
+function computeOrthoLayoutGlobeMetric(virt) {
+  if (!orthoTilesData || !orthoTilesData.tiles || !orthoTilesData.tiles.length) return null;
+  if (!virt?.pToImage) return null;
+
+  const hVal = document.getElementById('heightNum').value;
+  const Z = hVal === '' ? 0 : Number(hVal);
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const area = document.getElementById('viewerArea');
+  const viewW = area?.clientWidth || 800;
+  const viewH = area?.clientHeight || 600;
+  const disp = currentDispScale > 0 ? currentDispScale : 1;
+
+  if (orthoGlobeLockedZoom !== viewerZoom) {
+    orthoGlobeLockedScale = null;
+    orthoGlobeLockedZoom = viewerZoom;
+  }
+
+  const p0 = groundMgiToPixel(virt, mx, my, Z);
+  const pE = groundMgiToPixel(virt, mx + 10, my, Z);
+  const pN = groundMgiToPixel(virt, mx, my + 10, Z);
+  if (!p0 || !pE || !pN) return null;
+  const targetS = (
+    Math.hypot(pE[0] - p0[0], pE[1] - p0[1]) +
+    Math.hypot(pN[0] - p0[0], pN[1] - p0[1])
+  ) / 20 * disp;
+  if (!(targetS > 1e-6)) return null;
+
+  if (!(orthoGlobeLockedScale > 0) || Math.abs(orthoGlobeLockedScale - targetS) / targetS > 0.12) {
+    orthoGlobeLockedScale = targetS;
+  }
+  const s = orthoGlobeLockedScale;
+
+  // Fixed snapped origin — only moves in ORTHO_ORIGIN_SNAP_M steps when far enough.
+  let originX, originY;
+  const el = document.getElementById('orthoUnderlay');
+  const prevOx = el?._orthoOriginX;
+  const prevOy = el?._orthoOriginY;
+  if (Number.isFinite(prevOx) && Number.isFinite(prevOy) &&
+      Math.hypot(mx - prevOx, my - prevOy) < ORTHO_REBUILD_DIST_M) {
+    originX = prevOx;
+    originY = prevOy;
+  } else {
+    originX = Math.round(mx / ORTHO_ORIGIN_SNAP_M) * ORTHO_ORIGIN_SNAP_M;
+    originY = Math.round(my / ORTHO_ORIGIN_SNAP_M) * ORTHO_ORIGIN_SNAP_M;
+  }
+
+  const marginM = Math.max(viewW, viewH) / (2 * s) * 1.6 + 150;
+
+  function metricFromMgi(X, Y) {
+    return { x: (X - originX) * s, y: (originY - Y) * s };
+  }
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const nearby = [];
+  for (const t of orthoTilesData.tiles) {
+    if (t.xmax < originX - marginM || t.xmin > originX + marginM ||
+        t.ymax < originY - marginM || t.ymin > originY + marginM) continue;
+    nearby.push(t);
+    const corners = [
+      metricFromMgi(t.xmin, t.ymax),
+      metricFromMgi(t.xmax, t.ymax),
+      metricFromMgi(t.xmax, t.ymin),
+      metricFromMgi(t.xmin, t.ymin),
+    ];
+    for (const p of corners) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+  }
+  if (!nearby.length || !Number.isFinite(minX)) return null;
+
+  const pad = Math.max(viewW, viewH) * 0.35;
+  const minLeft = minX - pad;
+  const minTop = minY - pad;
+  const maxRight = maxX + pad;
+  const maxBottom = maxY + pad;
+  const unionW = Math.max(1, Math.ceil(maxRight - minLeft));
+  const unionH = Math.max(1, Math.ceil(maxBottom - minTop));
+
+  const markerMetX = (mx - originX) * s;
+  const markerMetY = (originY - my) * s;
+  const orthoMarkerX = markerMetX - minLeft;
+  const orthoMarkerY = markerMetY - minTop;
+
+  let orthoTilesHtml = '';
+  const orthoTileLayers = [];
+  const orthoEdgeTrim = IMAGE_EDGE_TRIM_SOURCE_PX;
+  for (const t of nearby) {
+    const pw = t.previewWidth || 1024;
+    const ph = t.previewHeight || 1024;
+    const p0m = metricFromMgi(t.xmin, t.ymax);
+    const p1m = metricFromMgi(t.xmax, t.ymax);
+    const p2m = metricFromMgi(t.xmax, t.ymin);
+    const p3m = metricFromMgi(t.xmin, t.ymin);
+    const q0 = { x: p0m.x - minLeft, y: p0m.y - minTop };
+    const q1 = { x: p1m.x - minLeft, y: p1m.y - minTop };
+    const q2 = { x: p2m.x - minLeft, y: p2m.y - minTop };
+    const q3 = { x: p3m.x - minLeft, y: p3m.y - minTop };
+    const H = homographyFrom4Points2D(
+      [[0, 0], [pw, 0], [pw, ph], [0, ph]],
+      [[q0.x, q0.y], [q1.x, q1.y], [q2.x, q2.y], [q3.x, q3.y]],
+    );
+    if (!H) continue;
+    const mat3d = homography3x3ToMatrix3dString(H);
+    orthoTileLayers.push({ previewUrl: t.previewUrl, pw, ph, mat3d });
+    orthoTilesHtml += `<img src="${t.previewUrl}" alt="" draggable="false" loading="eager" decoding="async" width="${pw}" height="${ph}"
+      style="position:absolute;left:0;top:0;opacity:.88;pointer-events:none;transform-origin:0 0;transform:${mat3d};clip-path:inset(${orthoEdgeTrim}px ${orthoEdgeTrim}px 0 0);"
+      onerror="this.style.opacity='.1'"/>`;
+  }
+  if (!orthoTilesHtml.trim()) return null;
+
+  return {
+    orthoTilesHtml,
+    orthoTileLayers,
+    unionW,
+    unionH,
+    minLeft,
+    minTop,
+    obliqueLeft: 0,
+    obliqueTop: 0,
+    orthoMarkerX,
+    orthoMarkerY,
+    metricScale: s,
+    originX,
+    originY,
+    globeMetric: true,
+    worldW: maxRight - minLeft,
+    worldH: maxBottom - minTop,
+  };
+}
+
+/**
  * Shared MGI layout for ortho preview tiles (*_s0.jpg ~1024px or *_s1 from JSON): full pinhole at fixed Z,
  * marker-relative CSS in unrotated rotClip space, then rotClip auto-rotate; each tile warped with a
  * perspective homography (CSS matrix3d). Affine Jacobian + matrix() was only valid near the marker.
@@ -1910,6 +2507,10 @@ function rotateAround(x, y, cx, cy, degRad) {
 function computeOrthoLayout(img, rotDeg, contentW, contentH) {
   if (!orthoTilesData || !orthoTilesData.tiles || !orthoTilesData.tiles.length) return null;
   if (!img || !img.pToImage) return null;
+
+  if (globeModeEnabled) {
+    return computeOrthoLayoutGlobeMetric(img);
+  }
 
   const hVal = document.getElementById('heightNum').value;
   const Z = hVal === '' ? 0 : Number(hVal);
@@ -2042,6 +2643,7 @@ function computeOrthoLayout(img, rotDeg, contentW, contentH) {
     obliqueTop,
     orthoMarkerX,
     orthoMarkerY,
+    globeMetric: false,
     worldW: maxRight - minLeft,
     worldH: maxBottom - minTop,
   };
@@ -2078,6 +2680,12 @@ function applyOrthoLayoutToUnderlay(el, layout) {
   if (!el || !layout) return;
   el._orthoMarkerX = layout.orthoMarkerX;
   el._orthoMarkerY = layout.orthoMarkerY;
+  el._orthoGlobeMetric = !!layout.globeMetric;
+  el._orthoMetricScale = layout.metricScale || null;
+  el._orthoMinLeft = layout.minLeft;
+  el._orthoMinTop = layout.minTop;
+  el._orthoOriginX = layout.originX;
+  el._orthoOriginY = layout.originY;
   applyOrthoTileSpecsToContainer(el, layout);
   el.style.cssText =
     `position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;`
@@ -2086,13 +2694,30 @@ function applyOrthoLayoutToUnderlay(el, layout) {
 
 /**
  * Recompute ortho geometry after marker / auto-rotate moves without a full renderTiles (overlay mode).
- * Must run before scrollToMarker so _orthoMarkerX/Y match the current search point.
+ * Globe metric: skip tile rebuild while inside the origin cell — only marker coords change.
  */
 function refreshOrthoUnderlayLive() {
   if (!currentImage) return;
   const el = document.getElementById('orthoUnderlay');
   if (!el) return;
-  const layout = computeOrthoLayout(currentImage, currentRotDeg, currentContentW, currentContentH);
+  if (globeModeEnabled) updateVirtualGlobeCamera();
+
+  if (globeModeEnabled && el._orthoGlobeMetric &&
+      Number.isFinite(el._orthoOriginX) && Number.isFinite(el._orthoOriginY) &&
+      el._orthoMetricScale > 0) {
+    const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+    const dist = Math.hypot(mx - el._orthoOriginX, my - el._orthoOriginY);
+    if (dist < ORTHO_REBUILD_DIST_M && orthoGlobeLockedZoom === viewerZoom) {
+      const s = el._orthoMetricScale;
+      el._orthoMarkerX = (mx - el._orthoOriginX) * s - el._orthoMinLeft;
+      el._orthoMarkerY = (el._orthoOriginY - my) * s - el._orthoMinTop;
+      if (!zoomToMarker) syncOrthoUnderlayTransform();
+      return;
+    }
+  }
+
+  const cam = getDisplayCameraImg() || currentImage;
+  const layout = computeOrthoLayout(cam, globeModeEnabled ? 0 : currentRotDeg, currentContentW, currentContentH);
   if (!layout) return;
   applyOrthoLayoutToUnderlay(el, layout);
   if (!zoomToMarker) syncOrthoUnderlayTransform();
@@ -2269,7 +2894,8 @@ function renderTiles(img, zoom) {
   const clipH = Math.max(1, contentH - edgeTrimDisp);
 
   // Image rotation: marker-centring or horizon-level (mutually exclusive modes).
-  const rotDeg = computeAutoRotDegForImage(img);
+  // Globe mode bakes orientation into the virtual camera — keep native layers unrotated.
+  const rotDeg = globeModeEnabled ? 0 : computeAutoRotDegForImage(img);
   currentRotDeg   = rotDeg;
   currentContentW = contentW;
   currentContentH = contentH;
@@ -2305,8 +2931,14 @@ function renderTiles(img, zoom) {
       <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
 
-  updateOrthoUnderlayForOverlay(img, rotDeg, contentW, contentH);
+  if (globeModeEnabled) updateVirtualGlobeCamera();
+  const orthoCam = getDisplayCameraImg() || img;
+  updateOrthoUnderlayForOverlay(orthoCam, globeModeEnabled ? 0 : rotDeg, contentW, contentH);
 
+  const morphFrom = pendingDisplayJFrom;
+  pendingDisplayJFrom = null;
+
+  const hadPrev = Array.from(area.children).some(el => el._overlayHistory);
   const oldPad  = area.querySelector('#rotPadDiv');
   const oldClip = area.querySelector('#rotClipDiv');
   const oldSvg  = area.querySelector('#dotOverlay');
@@ -2316,24 +2948,65 @@ function renderTiles(img, zoom) {
 
   const layer = document.createElement('div');
   layer.id = 'rotPadDiv';
-  layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform;';
+  layer.style.cssText = 'position:absolute;left:0;top:0;will-change:transform,opacity;';
   layer.innerHTML = innerHtml;
   layer._overlayImage = img;
   layer._overlayRotDeg = rotDeg;
   layer._overlayHistory = true;
   layer._overlayNeighborPreview = false;
+
+  // Keep previous frame visible until this layer’s tiles have pixels, then crossfade.
+  if (hadPrev) {
+    layer.style.opacity = '0';
+    layer.style.transition = `opacity ${IMAGE_CROSSFADE_MS}ms ease`;
+  }
   area.appendChild(layer);
 
-  trimOverlayHistory();
-  if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
+  // Arm Jacobian morph before the first sync so the new view starts matching the old foreshortening.
+  if (hadPrev && morphFrom && !globeModeEnabled) {
+    armDisplayJacobianTransition(morphFrom);
+  }
 
-  refreshDot();
-  updateCacheSizeDropdownLabels();
-  updateZoomPillClasses();
-  syncOrthoUnderlayTransform();
-  if (overlayEnabled) applyOverlayStitchedLayerVisibility();
-  syncOrthoDimMainClass();
-  syncOrthoBackgroundVisibilityClass();
+  const afterMount = () => {
+    refreshDot();
+    updateCacheSizeDropdownLabels();
+    updateZoomPillClasses();
+    syncOrthoUnderlayTransform();
+    if (overlayEnabled) applyOverlayStitchedLayerVisibility();
+    syncOrthoDimMainClass();
+    syncOrthoBackgroundVisibilityClass();
+  };
+  afterMount();
+
+  const revealGen = ++imageRevealGen;
+  let revealed = false;
+  const reveal = () => {
+    if (revealed || revealGen !== imageRevealGen) return;
+    revealed = true;
+    if (hadPrev) {
+      // Double rAF so opacity:0 is committed before fading in.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (revealGen !== imageRevealGen) return;
+          layer.style.opacity = '1';
+          setTimeout(() => {
+            if (revealGen !== imageRevealGen) return;
+            trimOverlayHistory();
+            if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
+            updateOverlayBlur();
+            applyOverlayStitchedLayerVisibility();
+          }, IMAGE_CROSSFADE_MS + 40);
+        });
+      });
+    } else {
+      trimOverlayHistory();
+      if (overlayEnabled) scheduleRebuildOverlayNeighborLayers();
+    }
+  };
+
+  const waitMs = document.getElementById('waitFullTilesSwitchCb')?.checked ? 12000 : 2000;
+  whenImagesReady(layer.querySelectorAll('.tile-canvas-wrap img')).then(reveal);
+  setTimeout(reveal, waitMs);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2401,7 +3074,7 @@ function refreshDot() {
   }
 
   // Live rotation update while moving: only “rotate to marker” depends on the marker.
-  if (rotateMode === 'marker' && currentImage.pToImage && result) {
+  if (!globeModeEnabled && rotateMode === 'marker' && currentImage.pToImage && result) {
     const fx = Math.hypot(
       currentImage.pToImage[0][0],
       currentImage.pToImage[0][1],
@@ -2450,6 +3123,7 @@ function changeViewZoom(dir) {
   VZOOM_STEPS.forEach((v, i) => { const d = Math.abs(v - viewerZoom); if (d < best) { best = d; idx = i; } });
   idx = Math.max(0, Math.min(VZOOM_STEPS.length - 1, idx + dir));
   viewerZoom = VZOOM_STEPS[idx];
+  relockGroundScaleAfterUserZoom();
 
   const lbl = viewerZoom >= 1
     ? (Number.isInteger(viewerZoom) ? viewerZoom + '×' : viewerZoom.toFixed(2).replace(/\.?0+$/,'') + '×')
@@ -2741,8 +3415,280 @@ function getSingleModePinchOrigin() {
 }
 
 /**
+ * Local ground metres per native image pixel at (lat,lon), from the inverse projection Jacobian.
+ */
+function localMetresPerImagePx(img, lat, lon, Z) {
+  const inv = computeInvJacobian(img, lat, lon, Z);
+  if (!inv) return null;
+  const sx = Math.hypot(inv.dXdPx, inv.dYdPx);
+  const sy = Math.hypot(inv.dXdPy, inv.dYdPy);
+  if (!Number.isFinite(sx) || !Number.isFinite(sy)) return null;
+  return (sx + sy) / 2;
+}
+
+function mat2Inv(M) {
+  const [a, b, c, d] = M;
+  const det = a * d - b * c;
+  if (!Number.isFinite(det) || Math.abs(det) < 1e-18) return null;
+  return [d / det, -b / det, -c / det, a / det];
+}
+
+function mat2Mul(A, B) {
+  return [
+    A[0] * B[0] + A[1] * B[2],
+    A[0] * B[1] + A[1] * B[3],
+    A[2] * B[0] + A[3] * B[2],
+    A[2] * B[1] + A[3] * B[3],
+  ];
+}
+
+function mat2AvgScale(M) {
+  return (Math.hypot(M[0], M[2]) + Math.hypot(M[1], M[3])) / 2;
+}
+
+function mat2ClampScale(M, lo, hi) {
+  const s = mat2AvgScale(M);
+  if (!(s > 1e-12)) return [1, 0, 0, 1];
+  if (s > hi) {
+    const k = hi / s;
+    return M.map(v => v * k);
+  }
+  if (s < lo) {
+    const k = lo / s;
+    return M.map(v => v * k);
+  }
+  return M;
+}
+
+/**
+ * 2×2 Jacobian: ground metres (MGI ΔX east, ΔY north) → screen px (x right, y down)
+ * for this camera at the marker, including fit×viewerZoom and CSS image rotation.
+ */
+function groundToScreenJacobian(img, lat, lon, Z, viewW, viewH, rotDeg) {
+  const inv = computeInvJacobian(img, lat, lon, Z);
+  if (!inv) return null;
+  const Mig = mat2Inv([inv.dXdPx, inv.dXdPy, inv.dYdPx, inv.dYdPy]);
+  if (!Mig) return null;
+  const baseFit = Math.min(viewW / img.width, viewH / img.height);
+  const disp = baseFit * viewerZoom;
+  const D = [disp * Mig[0], disp * Mig[1], disp * Mig[2], disp * Mig[3]];
+  const th = (rotDeg || 0) * Math.PI / 180;
+  const cos = Math.cos(th);
+  const sin = Math.sin(th);
+  // CSS rotate(θ) with y-down: x' = c x − s y, y' = s x + c y
+  const R = [cos, -sin, sin, cos];
+  return mat2Mul(R, D);
+}
+
+/**
+ * Canonical ground→screen Jacobian: look north, depression CANONICAL_VIEW_DEPRESS_DEG.
+ * MGI +X east, +Y north; screen +x right, +y down. Farther north → up on screen (−y).
+ */
+function canonicalNorthObliqueJacobian(pxPerMeter) {
+  const s = pxPerMeter;
+  const foreshorten = Math.sin((CANONICAL_VIEW_DEPRESS_DEG * Math.PI) / 180);
+  return [
+    s, 0,
+    0, -s * foreshorten,
+  ];
+}
+
+function mat2Lerp(A, B, t) {
+  const u = Math.max(0, Math.min(1, t));
+  const s = u * u * (3 - 2 * u);
+  return [
+    A[0] + (B[0] - A[0]) * s,
+    A[1] + (B[1] - A[1]) * s,
+    A[2] + (B[2] - A[2]) * s,
+    A[3] + (B[3] - A[3]) * s,
+  ];
+}
+
+function mat2DiffNorm(A, B) {
+  return Math.hypot(A[0] - B[0], A[1] - B[1], A[2] - B[2], A[3] - B[3]);
+}
+
+function computeImageGroundJacobian(img, rotDeg) {
+  if (!img) return null;
+  const area = document.getElementById('viewerArea');
+  if (!area) return null;
+  const viewW = area.clientWidth || 800;
+  const viewH = area.clientHeight || 600;
+  const hVal = document.getElementById('heightNum').value;
+  const Z = hVal === '' ? 0 : Number(hVal);
+  return groundToScreenJacobian(img, searchLat, searchLon, Z, viewW, viewH, rotDeg || 0);
+}
+
+/** End-state display Jacobian: N·45° lock or the current camera’s natural mapping. */
+function computeTargetDisplayJacobian() {
+  const A_cur = computeImageGroundJacobian(currentImage, currentRotDeg);
+  if (!A_cur) return null;
+  if (groundScaleLockEnabled) {
+    if (!(groundScaleLockPxPerMeter > 0)) {
+      groundScaleLockPxPerMeter = mat2AvgScale(A_cur);
+    }
+    return canonicalNorthObliqueJacobian(groundScaleLockPxPerMeter);
+  }
+  return A_cur;
+}
+
+/** Snapshot what the viewport currently shows, before swapping cameras. */
+function captureDisplayJacobianForTransition() {
+  if (displayGroundJacobian) {
+    pendingDisplayJFrom = displayGroundJacobian.slice();
+    return;
+  }
+  if (!currentImage) {
+    pendingDisplayJFrom = null;
+    return;
+  }
+  const A = computeImageGroundJacobian(currentImage, currentRotDeg);
+  pendingDisplayJFrom = A ? A.slice() : null;
+}
+
+function stopDisplayJacobianTransition() {
+  if (displayJacobianTransition && displayJacobianTransition.raf != null) {
+    cancelAnimationFrame(displayJacobianTransition.raf);
+  }
+  displayJacobianTransition = null;
+}
+
+/**
+ * Arm a from→to ground-Jacobian morph (applied to every layer via syncOverlayLayersToMarker).
+ * Call after currentRotDeg is updated for the new image.
+ */
+function armDisplayJacobianTransition(fromJ) {
+  const toJ = computeTargetDisplayJacobian();
+  if (!fromJ || !toJ) {
+    pendingDisplayJFrom = null;
+    return;
+  }
+  if (mat2DiffNorm(fromJ, toJ) < 1e-3) {
+    displayGroundJacobian = toJ.slice();
+    pendingDisplayJFrom = null;
+    return;
+  }
+  stopDisplayJacobianTransition();
+  displayGroundJacobian = fromJ.slice();
+  const state = {
+    from: fromJ.slice(),
+    to: toJ.slice(),
+    t0: performance.now(),
+    dur: IMAGE_MORPH_MS,
+    raf: null,
+  };
+  displayJacobianTransition = state;
+  pendingDisplayJFrom = null;
+
+  const tick = () => {
+    if (displayJacobianTransition !== state) return;
+    updateGroundScaleCompensation();
+    syncOverlayLayersToMarker();
+    const u = (performance.now() - state.t0) / state.dur;
+    if (u < 1) {
+      state.raf = requestAnimationFrame(tick);
+    } else {
+      displayJacobianTransition = null;
+      displayGroundJacobian = state.to.slice();
+      updateGroundScaleCompensation();
+      syncOverlayLayersToMarker();
+    }
+  };
+  state.raf = requestAnimationFrame(tick);
+}
+
+/** Screen←screen morph that maps a layer’s natural Jacobian onto displayGroundJacobian. */
+function morphMatrixForSourceJacobian(A_src) {
+  if (!displayGroundJacobian || !A_src) return [1, 0, 0, 1];
+  const inv = mat2Inv(A_src);
+  if (!inv) return [1, 0, 0, 1];
+  return mat2ClampScale(mat2Mul(displayGroundJacobian, inv), 0.12, 10);
+}
+
+function wrapTransformWithMorphMatrix(innerTransform, viewW, viewH, M) {
+  const [a, b, c, d] = M || [1, 0, 0, 1];
+  const almostId =
+    Math.abs(a - 1) < 1e-5 && Math.abs(b) < 1e-5 &&
+    Math.abs(c) < 1e-5 && Math.abs(d - 1) < 1e-5;
+  if (almostId) return innerTransform || '';
+  // Our row-major [a b; c d]: x'=a x + b y, y'=c x + d y
+  // CSS matrix(a, b, c, d, e, f): x'=a x + c y, y'=b x + d y  → pass matrix(a, c, b, d, …)
+  const pre =
+    `translate(${viewW / 2}px, ${viewH / 2}px) matrix(${a}, ${c}, ${b}, ${d}, 0, 0) ` +
+    `translate(${-viewW / 2}px, ${-viewH / 2}px)`;
+  return innerTransform ? `${pre} ${innerTransform}` : pre;
+}
+
+/** After intentional user zoom, recapture scale so the warp doesn’t cancel the zoom. */
+function relockGroundScaleAfterUserZoom() {
+  stopDisplayJacobianTransition();
+  if (groundScaleLockEnabled) groundScaleLockPxPerMeter = null;
+  displayGroundJacobian = null;
+  morphMatrix = [1, 0, 0, 1];
+}
+
+/**
+ * Refresh displayGroundJacobian / morphMatrix for the main image.
+ * During a switch, displayJ lerps from the previous camera toward the new target.
+ * Globe mode owns perspective continuity — skip affine morph there.
+ */
+function updateGroundScaleCompensation() {
+  morphMatrix = [1, 0, 0, 1];
+  if (globeModeEnabled) {
+    displayGroundJacobian = null;
+    return;
+  }
+  const A_cur = computeImageGroundJacobian(currentImage, currentRotDeg);
+  if (!A_cur) {
+    displayGroundJacobian = null;
+    return;
+  }
+
+  const A_tgt = computeTargetDisplayJacobian() || A_cur;
+
+  if (displayJacobianTransition) {
+    const u = (performance.now() - displayJacobianTransition.t0) / displayJacobianTransition.dur;
+    if (u >= 1) {
+      displayGroundJacobian = displayJacobianTransition.to.slice();
+      displayJacobianTransition = null;
+    } else {
+      displayGroundJacobian = mat2Lerp(displayJacobianTransition.from, displayJacobianTransition.to, u);
+    }
+  } else {
+    displayGroundJacobian = A_tgt.slice();
+  }
+
+  morphMatrix = morphMatrixForSourceJacobian(A_cur);
+}
+
+/** Prepend viewport-centred morph for the main-image Jacobian. */
+function wrapTransformWithGroundScale(innerTransform, viewW, viewH) {
+  return wrapTransformWithMorphMatrix(innerTransform, viewW, viewH, morphMatrix);
+}
+
+function toggleGroundScaleLock() {
+  groundScaleLockEnabled = !groundScaleLockEnabled;
+  groundScaleLockPxPerMeter = null;
+  stopDisplayJacobianTransition();
+  displayGroundJacobian = null;
+  morphMatrix = [1, 0, 0, 1];
+  const btn = document.getElementById('groundScaleLockBtn');
+  if (btn) {
+    btn.style.opacity = groundScaleLockEnabled ? '' : '.5';
+    btn.setAttribute('aria-pressed', groundScaleLockEnabled ? 'true' : 'false');
+  }
+  if (currentImage) {
+    updateGroundScaleCompensation();
+    scrollToMarker();
+  }
+}
+
+/**
  * Centre each absolute layer so the ground marker sits in the viewport middle.
- * Used for overlay stacks and single-mode (same motion model; reproject only when overlay is on).
+ *
+ * Globe mode: every layer (main, history, neighbors) is plane-homography-warped into a
+ * continuous virtual camera blended from nearby images — photo swaps no longer change FOV.
+ * Classic mode: optional reproject-to-main + Jacobian morph.
  */
 function syncOverlayLayersToMarker() {
   if (!zoomToMarker) return;
@@ -2755,7 +3701,49 @@ function syncOverlayLayersToMarker() {
   const Z = hVal === '' ? 0 : Number(hVal);
 
   const main = currentImage;
+  if (!main) return;
+
+  if (globeModeEnabled) {
+    updateVirtualGlobeCamera();
+    const virt = virtualGlobeImg || main;
+    if (!virt?.pToImage) return;
+
+    const baseFit = Math.min(viewW / virt.width, viewH / virt.height);
+    const vScale = baseFit * viewerZoom;
+
+    layers.forEach((layer) => {
+      const img = layer._overlayImage;
+      if (!img?.pToImage) return;
+      // Same fit basis as virt when dimensions match — keep float scale (no Math.round).
+      const scale = Math.min(viewW / img.width, viewH / img.height) * viewerZoom;
+
+      const Hvp = homographyLayerPadToGlobeViewport(img, virt, Z, scale, vScale, viewW, viewH);
+      if (!Hvp) {
+        const proj = projectToPixel(img, searchLat, searchLon, Z);
+        if (!proj) return;
+        const tx = viewW / 2 - proj[0] * scale;
+        const ty = viewH / 2 - proj[1] * scale;
+        layer.style.transformOrigin = '0 0';
+        layer.style.transform = `translate(${tx}px, ${ty}px)`;
+        return;
+      }
+      layer.style.transformOrigin = '0 0';
+      layer.style.transform = homography3x3ToMatrix3dString(Hvp);
+    });
+
+    syncOrthoUnderlayTransform();
+    if (overlayEnabled) updateOverlayBlur();
+    return;
+  }
+
   const reprojectToMain = overlayEnabled && document.getElementById('overlayStretchToMainCb')?.checked;
+  const A_main = computeImageGroundJacobian(main, currentRotDeg);
+
+  const applyXf = (layer, inner, A_src) => {
+    layer.style.transformOrigin = '0 0';
+    const M = morphMatrixForSourceJacobian(A_src || A_main);
+    layer.style.transform = wrapTransformWithMorphMatrix(inner, viewW, viewH, M);
+  };
 
   layers.forEach((layer, idx) => {
     const img = layer._overlayImage;
@@ -2780,17 +3768,19 @@ function syncOverlayLayersToMarker() {
 
     const tx = viewW / 2 - vx;
     const ty = viewH / 2 - vy;
+    const pan = `translate(${tx}px, ${ty}px)`;
+    const A_layer = (img === main)
+      ? A_main
+      : computeImageGroundJacobian(img, rotDeg);
 
     if (isTop || !reprojectToMain || !main || !main.pToImage || !img.pToImage || img === main) {
-      layer.style.transformOrigin = '';
-      layer.style.transform = `translate(${tx}px, ${ty}px)`;
+      applyXf(layer, pan, A_layer);
       return;
     }
 
     const Hnm = homographyLayerNativeToMainNative(img, main, Z);
     if (!Hnm) {
-      layer.style.transformOrigin = '';
-      layer.style.transform = `translate(${tx}px, ${ty}px)`;
+      applyXf(layer, pan, A_layer);
       return;
     }
 
@@ -2801,14 +3791,12 @@ function syncOverlayLayersToMarker() {
     for (let k = 0; k < 4; k++) {
       const pm = applyHomography2D(Hnm, nc[k][0], nc[k][1]);
       if (!pm) {
-        layer.style.transformOrigin = '';
-        layer.style.transform = `translate(${tx}px, ${ty}px)`;
+        applyXf(layer, pan, A_layer);
         return;
       }
       const vp = mainNativeToViewportPx(pm[0], pm[1], viewW, viewH);
       if (!vp) {
-        layer.style.transformOrigin = '';
-        layer.style.transform = `translate(${tx}px, ${ty}px)`;
+        applyXf(layer, pan, A_layer);
         return;
       }
       srcPad.push(overlayNativeToPadXY(nc[k][0], nc[k][1], scale, rotDeg, cw, ch));
@@ -2817,35 +3805,84 @@ function syncOverlayLayersToMarker() {
 
     const Hvp = homographyFrom4Points2D(srcPad, dstVp);
     if (!Hvp) {
-      layer.style.transformOrigin = '';
-      layer.style.transform = `translate(${tx}px, ${ty}px)`;
+      applyXf(layer, pan, A_layer);
       return;
     }
 
-    layer.style.transformOrigin = '0 0';
-    layer.style.transform = homography3x3ToMatrix3dString(Hvp);
+    applyXf(layer, homography3x3ToMatrix3dString(Hvp), A_main);
   });
   syncOrthoUnderlayTransform();
   if (overlayEnabled) updateOverlayBlur();
 }
 
 /**
- * Centre the ortho underlay on the viewport using marker position in underlay local coords.
- * (Must not copy the oblique layer transform — that stack uses a different origin than #orthoUnderlay.)
+ * Centre the ortho underlay on the viewport.
+ * Globe metric mode: one local-patch homography from the north-up ground plane → virt view
+ * (same conditioning trick as the oblique layers). Classic: pan + optional Jacobian morph.
  */
 function syncOrthoUnderlayTransform() {
   const area = document.getElementById('viewerArea');
   const orthoUnderlay = document.getElementById('orthoUnderlay');
   if (!area || !orthoUnderlay) return;
+  const viewW = area.clientWidth || 800;
+  const viewH = area.clientHeight || 600;
+
+  if (globeModeEnabled && orthoUnderlay._orthoGlobeMetric) {
+    updateVirtualGlobeCamera();
+    const virt = virtualGlobeImg || currentImage;
+    const s = orthoUnderlay._orthoMetricScale;
+    const minLeft = orthoUnderlay._orthoMinLeft;
+    const minTop = orthoUnderlay._orthoMinTop;
+    if (!virt?.pToImage || !(s > 0) || !Number.isFinite(minLeft) || !Number.isFinite(minTop)) {
+      const ox = orthoUnderlay._orthoMarkerX;
+      const oy = orthoUnderlay._orthoMarkerY;
+      if (typeof ox === 'number' && typeof oy === 'number') {
+        orthoUnderlay.style.transformOrigin = '0 0';
+        orthoUnderlay.style.transform = `translate(${viewW / 2 - ox}px, ${viewH / 2 - oy}px)`;
+      }
+      return;
+    }
+
+    const hVal = document.getElementById('heightNum').value;
+    const Z = hVal === '' ? 0 : Number(hVal);
+    const originX = orthoUnderlay._orthoOriginX;
+    const originY = orthoUnderlay._orthoOriginY;
+    if (!Number.isFinite(originX) || !Number.isFinite(originY)) {
+      const ox = orthoUnderlay._orthoMarkerX;
+      const oy = orthoUnderlay._orthoMarkerY;
+      orthoUnderlay.style.transformOrigin = '0 0';
+      orthoUnderlay.style.transform = `translate(${viewW / 2 - ox}px, ${viewH / 2 - oy}px)`;
+      return;
+    }
+    const baseFit = Math.min(viewW / virt.width, viewH / virt.height);
+    const vScale = baseFit * viewerZoom;
+    const Hvp = homographyOrthoMetricToGlobeViewport(
+      virt, Z, s, originX, originY, minLeft, minTop, vScale, viewW, viewH,
+    );
+    orthoUnderlay.style.transformOrigin = '0 0';
+    if (Hvp) {
+      orthoUnderlay.style.transform = homography3x3ToMatrix3dString(Hvp);
+    } else {
+      const ox = orthoUnderlay._orthoMarkerX;
+      const oy = orthoUnderlay._orthoMarkerY;
+      orthoUnderlay.style.transform = `translate(${viewW / 2 - ox}px, ${viewH / 2 - oy}px)`;
+    }
+    return;
+  }
+
   const ox = orthoUnderlay._orthoMarkerX;
   const oy = orthoUnderlay._orthoMarkerY;
   if (typeof ox !== 'number' || typeof oy !== 'number' || !Number.isFinite(ox) || !Number.isFinite(oy)) return;
-  const viewW = area.clientWidth || 800;
-  const viewH = area.clientHeight || 600;
   const tx = viewW / 2 - ox;
   const ty = viewH / 2 - oy;
-  orthoUnderlay.style.transformOrigin = '';
-  orthoUnderlay.style.transform = `translate(${tx}px, ${ty}px)`;
+  orthoUnderlay.style.transformOrigin = '0 0';
+  if (globeModeEnabled) {
+    orthoUnderlay.style.transform = `translate(${tx}px, ${ty}px)`;
+    return;
+  }
+  const A_main = computeImageGroundJacobian(currentImage, currentRotDeg);
+  const M = morphMatrixForSourceJacobian(A_main);
+  orthoUnderlay.style.transform = wrapTransformWithMorphMatrix(`translate(${tx}px, ${ty}px)`, viewW, viewH, M);
 }
 
 /** Position the viewer so the marker is centred (absolute translate — same for overlay on/off). */
@@ -2853,6 +3890,7 @@ function scrollToMarker() {
   if (!zoomToMarker || markerDX < 0 || markerDY < 0) return;
   const area = document.getElementById('viewerArea');
   if (!area) return;
+  updateGroundScaleCompensation();
   syncOverlayLayersToMarker();
   area.scrollLeft = 0;
   area.scrollTop = 0;
@@ -3115,10 +4153,19 @@ function scheduleAutoSwitch() {
   }, AUTO_SWITCH_MS - (now - lastThrottledAutoSwitch));
 }
 
+/** Name of image currently decoding for a background switch (dedupe repeated auto-switch). */
+let pendingSwitchName = null;
+
 /** Auto-switch to a better image for the same view direction; honours Wait full tiles / fast probe. */
 function switchToImageBg(img, qx, qy) {
+  if (!img) return;
+  if (currentImage && img.name === currentImage.name) return;
+  // Already waiting for this target — don't restart decode / cancel ourselves.
+  if (pendingSwitchName === img.name) return;
+
   imageSwitchGen++;
   const gen = imageSwitchGen;
+  pendingSwitchName = img.name;
   img = {
     ...img,
     distM:       Math.round(Math.hypot(qx - img.lookAtMgi[0], qy - img.lookAtMgi[1])),
@@ -3127,30 +4174,33 @@ function switchToImageBg(img, qx, qy) {
   };
   const z = getTileZoomIndex(img);
 
-  if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForAllTilesDecoded(img, z).then(() => {
-      if (gen !== imageSwitchGen) return;
-      currentImage = img;
-      currentZoom = z;
-      openViewer(img, z);
-      highlightInList(img.name);
-    });
-    return;
-  }
-
-  let done = false;
   const commit = () => {
-    if (done) return; done = true;
     if (gen !== imageSwitchGen) return;
+    if (currentImage && currentImage.name !== img.name) {
+      captureDisplayJacobianForTransition();
+    }
     currentImage = img;
     currentZoom = z;
     openViewer(img, z);
     highlightInList(img.name);
+    if (gen === imageSwitchGen) pendingSwitchName = null;
+  };
+
+  if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
+    waitForAllTilesDecoded(img, z).then(commit);
+    return;
+  }
+
+  let done = false;
+  const once = () => {
+    if (done) return;
+    done = true;
+    commit();
   };
   const probe = new Image();
-  probe.onload  = commit;
-  probe.onerror = commit;
-  setTimeout(commit, 800);
+  probe.onload  = once;
+  probe.onerror = once;
+  setTimeout(once, 800);
   probe.src = `${img.remoteBaseUrl}/${img.name}/0/0/0.jpg`;
 }
 
@@ -3188,6 +4238,7 @@ function stopListPlay() {
 
 function startListPlay() {
   stopListPlay();
+  stopAutoTour();
   const sec = Number(document.getElementById('listPlayIntervalSec')?.value);
   const ms  = Math.max(50, Math.round((Number.isFinite(sec) && sec > 0 ? sec : 1) * 1000));
   listPlayTimer = setInterval(() => stepResultList(1), ms);
@@ -3203,6 +4254,249 @@ function toggleListPlay() {
 
 function restartListPlayIfActive() {
   if (listPlayActive) startListPlay();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  RANDOM AUTO-TOUR  (curved glide between nearby look-at points)
+// ═══════════════════════════════════════════════════════════════
+let autoTourActive = false;
+let autoTourRaf = null;
+let autoTourLastTs = null;
+/** Tour origin in MGI metres [x,y] — waypoints stay inside radius of this. */
+let autoTourHome = null;
+/** Catmull–Rom control points in MGI; travel is along segment autoTourSeg → +1. */
+let autoTourWaypoints = [];
+let autoTourSeg = 1;
+let autoTourT = 0;
+let autoTourSegLen = 1;
+
+function syncAutoTourButtons() {
+  const on = autoTourActive;
+  const btn = document.getElementById('autoTourBtn');
+  if (btn) {
+    btn.textContent = on ? '⏸ Tour' : '✈ Tour';
+    btn.style.opacity = on ? '' : '.5';
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  const fab = document.getElementById('autoTourFabBtn');
+  if (fab) {
+    fab.textContent = on ? '⏸' : '✈';
+    fab.setAttribute('aria-pressed', on ? 'true' : 'false');
+    fab.title = on ? 'Stop random tour' : 'Start random tour';
+  }
+}
+
+function stopAutoTour() {
+  autoTourActive = false;
+  if (autoTourRaf != null) {
+    cancelAnimationFrame(autoTourRaf);
+    autoTourRaf = null;
+  }
+  autoTourLastTs = null;
+  syncAutoTourButtons();
+}
+
+/** Absolute marker position in MGI ground metres. */
+function setMarkerMgi(mx, my) {
+  const [newLon, newLat] = wgs84ToMgi.inverse([mx, my]);
+  searchLat = newLat;
+  searchLon = newLon;
+  const coords = document.getElementById('coordsInput');
+  if (coords) coords.value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  refreshDot();
+  if (document.getElementById('autoSwitchWhileMovingCb')?.checked !== false) scheduleAutoSwitch();
+  schedulePositionSearch();
+}
+
+function catmullRom2(p0, p1, p2, p3, t) {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return [
+    0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+    0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
+  ];
+}
+
+function estimateCRSegLen(p0, p1, p2, p3) {
+  let len = 0;
+  let prev = p1;
+  for (let i = 1; i <= 12; i++) {
+    const q = catmullRom2(p0, p1, p2, p3, i / 12);
+    len += Math.hypot(q[0] - prev[0], q[1] - prev[1]);
+    prev = q;
+  }
+  return Math.max(len, 1);
+}
+
+function clampToTourDisk(x, y) {
+  if (!autoTourHome) return [x, y];
+  const radius = Math.max(50, Number(document.getElementById('autoTourRadiusM')?.value) || 2000);
+  const dx = x - autoTourHome[0];
+  const dy = y - autoTourHome[1];
+  const d = Math.hypot(dx, dy);
+  if (d <= radius || d < 1e-6) return [x, y];
+  const s = radius / d;
+  return [autoTourHome[0] + dx * s, autoTourHome[1] + dy * s];
+}
+
+/**
+ * Pick a nearby destination: prefer another camera look-at inside the tour disk
+ * and within hop distance; otherwise a random point in that annulus.
+ */
+function pickTourWaypoint(fromX, fromY, preferAwayFrom) {
+  const hopMax = Math.max(30, Number(document.getElementById('autoTourHopM')?.value) || 400);
+  const hopMin = Math.min(hopMax * 0.4, Math.max(40, hopMax * 0.25));
+  const radius = Math.max(50, Number(document.getElementById('autoTourRadiusM')?.value) || 2000);
+
+  const near = [];
+  const pool = allImages || [];
+  for (let i = 0; i < pool.length; i++) {
+    const la = pool[i].lookAtMgi;
+    if (!la) continue;
+    const cx = la[0];
+    const cy = la[1];
+    if (autoTourHome && Math.hypot(cx - autoTourHome[0], cy - autoTourHome[1]) > radius) continue;
+    const d = Math.hypot(cx - fromX, cy - fromY);
+    if (d < hopMin || d > hopMax) continue;
+    near.push([cx, cy, d]);
+  }
+
+  let candidates = near;
+  if (preferAwayFrom && near.length > 2) {
+    const bx = fromX - preferAwayFrom[0];
+    const by = fromY - preferAwayFrom[1];
+    const bl = Math.hypot(bx, by);
+    if (bl > 1e-3) {
+      const forward = near.filter(([cx, cy, d]) => {
+        const vx = cx - fromX;
+        const vy = cy - fromY;
+        return (vx * bx + vy * by) / (d * bl) < 0.85;
+      });
+      if (forward.length) candidates = forward;
+    }
+  }
+
+  if (candidates.length) {
+    const pick = candidates[(Math.random() * candidates.length) | 0];
+    return [pick[0], pick[1]];
+  }
+
+  for (let tries = 0; tries < 48; tries++) {
+    const ang = Math.random() * Math.PI * 2;
+    const dist = hopMin + Math.random() * (hopMax - hopMin);
+    let x = fromX + Math.cos(ang) * dist;
+    let y = fromY + Math.sin(ang) * dist;
+    [x, y] = clampToTourDisk(x, y);
+    const d = Math.hypot(x - fromX, y - fromY);
+    if (d >= hopMin * 0.45 && d <= hopMax * 1.05) return [x, y];
+  }
+
+  if (autoTourHome) {
+    const ang = Math.random() * Math.PI * 2;
+    const r = Math.min(hopMax, radius * 0.9);
+    return clampToTourDisk(
+      autoTourHome[0] + Math.cos(ang) * r,
+      autoTourHome[1] + Math.sin(ang) * r,
+    );
+  }
+  const ang = Math.random() * Math.PI * 2;
+  return [fromX + Math.cos(ang) * hopMin, fromY + Math.sin(ang) * hopMin];
+}
+
+function ensureTourWaypoints() {
+  while (autoTourWaypoints.length < autoTourSeg + 3) {
+    const n = autoTourWaypoints.length;
+    const last = autoTourWaypoints[n - 1];
+    const prev = n >= 2 ? autoTourWaypoints[n - 2] : null;
+    autoTourWaypoints.push(pickTourWaypoint(last[0], last[1], prev));
+  }
+}
+
+function autoTourLoop(ts) {
+  if (!autoTourActive) {
+    autoTourRaf = null;
+    return;
+  }
+  if (autoTourLastTs == null) autoTourLastTs = ts;
+  const dt = Math.min((ts - autoTourLastTs) / 1000, 0.1);
+  autoTourLastTs = ts;
+
+  const speed = Math.max(1, Number(document.getElementById('autoTourSpeed')?.value) || 35);
+  let remain = speed * dt;
+
+  ensureTourWaypoints();
+
+  while (remain > 1e-6) {
+    ensureTourWaypoints();
+    const p0 = autoTourWaypoints[autoTourSeg - 1];
+    const p1 = autoTourWaypoints[autoTourSeg];
+    const p2 = autoTourWaypoints[autoTourSeg + 1];
+    const p3 = autoTourWaypoints[autoTourSeg + 2];
+    if (!p0 || !p1 || !p2 || !p3) break;
+
+    if (!(autoTourSegLen > 1e-3)) {
+      autoTourSegLen = estimateCRSegLen(p0, p1, p2, p3);
+    }
+
+    const dT = remain / autoTourSegLen;
+    if (autoTourT + dT >= 1) {
+      remain -= (1 - autoTourT) * autoTourSegLen;
+      autoTourSeg++;
+      autoTourT = 0;
+      autoTourSegLen = 0;
+      if (autoTourSeg > 10) {
+        const drop = autoTourSeg - 2;
+        autoTourWaypoints.splice(0, drop);
+        autoTourSeg -= drop;
+      }
+      continue;
+    }
+
+    autoTourT += dT;
+    remain = 0;
+  }
+
+  ensureTourWaypoints();
+  {
+    const p0 = autoTourWaypoints[autoTourSeg - 1];
+    const p1 = autoTourWaypoints[autoTourSeg];
+    const p2 = autoTourWaypoints[autoTourSeg + 1];
+    const p3 = autoTourWaypoints[autoTourSeg + 2];
+    if (p0 && p1 && p2 && p3) {
+      if (!(autoTourSegLen > 1e-3)) autoTourSegLen = estimateCRSegLen(p0, p1, p2, p3);
+      const pos = catmullRom2(p0, p1, p2, p3, autoTourT);
+      setMarkerMgi(pos[0], pos[1]);
+    }
+  }
+
+  autoTourRaf = requestAnimationFrame(autoTourLoop);
+}
+
+function startAutoTour() {
+  if (!allImages || !allImages.length) return;
+  stopListPlay();
+  stopAutoTour();
+
+  if (!zoomToMarker) toggleZoomToMarker();
+
+  autoTourHome = wgs84ToMgi.forward([searchLon, searchLat]);
+  const cur = [autoTourHome[0], autoTourHome[1]];
+  const next = pickTourWaypoint(cur[0], cur[1], null);
+  autoTourWaypoints = [cur, cur, next, pickTourWaypoint(next[0], next[1], cur)];
+  autoTourSeg = 1;
+  autoTourT = 0;
+  autoTourSegLen = estimateCRSegLen(
+    autoTourWaypoints[0], autoTourWaypoints[1], autoTourWaypoints[2], autoTourWaypoints[3],
+  );
+  autoTourActive = true;
+  autoTourLastTs = null;
+  syncAutoTourButtons();
+  autoTourRaf = requestAnimationFrame(autoTourLoop);
+}
+
+function toggleAutoTour() {
+  if (autoTourActive) stopAutoTour();
+  else startAutoTour();
 }
 
 // ── Continuous keyboard movement: fires every animation frame while keys held ──
@@ -3254,6 +4548,7 @@ document.addEventListener('keydown', e => {
 
   if (!ARROW_KEYS.includes(e.key) || !currentImage) return;
   e.preventDefault();
+  if (autoTourActive) stopAutoTour();
   keysHeld.add(e.key);
   if (!keyRafId) keyRafId = requestAnimationFrame(keyMoveLoop);
 });
@@ -3302,6 +4597,7 @@ function keyMoveLoop(ts) {
 // ── Mouse / touch drag: moves the marker by inverting the camera Jacobian ──
 let   isDragging    = false;
 let   dragStartCX   = 0, dragStartCY = 0;
+let   dragLastCX    = 0, dragLastCY = 0;
 let   dragStartMX   = 0, dragStartMY = 0;
 let   dragInvJ      = null, dragScale = 1;
 
@@ -3322,21 +4618,55 @@ if (typeof ResizeObserver !== 'undefined' && viewerAreaEl) {
 
 function beginDrag(clientX, clientY) {
   if (!currentImage) return false;
+  if (autoTourActive) stopAutoTour();
   const hVal = document.getElementById('heightNum').value;
   const Z    = hVal === '' ? 0 : Number(hVal);
-  const invJ = computeInvJacobian(currentImage, searchLat, searchLon, Z);
+  if (globeModeEnabled) updateVirtualGlobeCamera();
+  const dragImg = getDisplayCameraImg() || currentImage;
+  const invJ = computeInvJacobian(dragImg, searchLat, searchLon, Z);
   if (!invJ) return false;
   isDragging  = true;
   dragStartCX = clientX;
   dragStartCY = clientY;
+  dragLastCX  = clientX;
+  dragLastCY  = clientY;
   [dragStartMX, dragStartMY] = wgs84ToMgi.forward([searchLon, searchLat]);
   dragInvJ    = invJ;
-  dragScale   = currentDispScale;
+  // Globe warp is a full homography — drag scale is display fit only (no affine morph).
+  dragScale   = currentDispScale * (!globeModeEnabled && groundScaleLockEnabled ? mat2AvgScale(morphMatrix) : 1);
   return true;
 }
 
 function applyDrag(clientX, clientY) {
-  if (!isDragging || !dragInvJ) return;
+  if (!isDragging) return;
+
+  // Globe: incremental steps with a fresh virtual-camera Jacobian each frame
+  // so along-view motion tracks the moving semi-globe pose.
+  if (globeModeEnabled) {
+    const hVal = document.getElementById('heightNum').value;
+    const Z = hVal === '' ? 0 : Number(hVal);
+    updateVirtualGlobeCamera();
+    const invJ = computeInvJacobian(getDisplayCameraImg() || currentImage, searchLat, searchLon, Z);
+    if (!invJ) return;
+    const ddxImg = -(clientX - dragLastCX) / (currentDispScale || 1);
+    const ddyImg = -(clientY - dragLastCY) / (currentDispScale || 1);
+    dragLastCX = clientX;
+    dragLastCY = clientY;
+    if (Math.abs(ddxImg) < 1e-9 && Math.abs(ddyImg) < 1e-9) return;
+    const dX = invJ.dXdPx * ddxImg + invJ.dXdPy * ddyImg;
+    const dY = invJ.dYdPx * ddxImg + invJ.dYdPy * ddyImg;
+    const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+    const [newLon, newLat] = wgs84ToMgi.inverse([mx + dX, my + dY]);
+    searchLat = newLat;
+    searchLon = newLon;
+    document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+    refreshDot();
+    if (document.getElementById('autoSwitchWhileMovingCb')?.checked !== false) scheduleAutoSwitch();
+    schedulePositionSearch();
+    return;
+  }
+
+  if (!dragInvJ) return;
   const ddxImg = -(clientX - dragStartCX) / dragScale;
   const ddyImg = -(clientY - dragStartCY) / dragScale;
   const dX = dragInvJ.dXdPx * ddxImg + dragInvJ.dXdPy * ddyImg;
@@ -3473,6 +4803,10 @@ function primeOrthoUnderlayForPinchStart() {
 
 function setViewerZoomTo(z) {
   viewerZoom = Math.max(VZOOM_STEPS[0], Math.min(VZOOM_STEPS[VZOOM_STEPS.length-1], z));
+  relockGroundScaleAfterUserZoom();
+  resetOrthoGlobeLayoutCache();
+  virtualGlobeImg = null;
+  globePoseLastTs = 0;
   const v = viewerZoom;
   const lbl = v >= 1
     ? (Number.isInteger(v) ? v+'×' : v.toFixed(2).replace(/\.?0+$/,'')+'×')
@@ -3603,6 +4937,9 @@ function orbitToDirection(dir) {
   if (idx < 0) {
     imageSwitchGen++;
     const gen = imageSwitchGen;
+    if (currentImage && currentImage.name !== best.name) {
+      captureDisplayJacobianForTransition();
+    }
     currentImage = best;
     const z = getTileZoomIndex(best);
     if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
@@ -3664,6 +5001,13 @@ function initInfiniteScrollMode() {
   if (rep) rep.checked = true;
   const nsel = document.getElementById('overlayNeighborPreloadSel');
   if (nsel) nsel.value = '64';
+
+  globeModeEnabled = true;
+  const globeBtn = document.getElementById('globeModeBtn');
+  if (globeBtn) {
+    globeBtn.style.opacity = '';
+    globeBtn.setAttribute('aria-pressed', 'true');
+  }
 
   try {
     const bf = localStorage.getItem('infOverlayBlurFixed');
@@ -3755,6 +5099,8 @@ loadIndex();
     <button type="button" class="orbit-tool" onclick="changeViewZoom(+1)">+</button>
     <button type="button" class="orbit-tool" id="orthoToggleFabBtn" onclick="toggleOrthoBackground()"
             title="Show/hide nadir orthophoto underlay (Shift+O)">▣</button>
+    <button type="button" class="orbit-tool" id="autoTourFabBtn" onclick="toggleAutoTour()"
+            aria-pressed="false" title="Start random tour">✈</button>
     <button type="button" class="orbit-tool chrome-toggle" id="chromeToggleFabBtn" onclick="toggleChromeUi()"
             aria-pressed="false" title="Hide search list and toolbars">☰</button>
   </div>
