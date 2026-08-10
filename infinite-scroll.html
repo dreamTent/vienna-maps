@@ -2862,6 +2862,10 @@ function applyOrthoLayoutToUnderlay(el, layout) {
  */
 function refreshOrthoUnderlayLive() {
   if (!currentImage) return;
+  if (zoomRescaleHold) {
+    applyZoomRescaleHold();
+    return;
+  }
   const el = document.getElementById('orthoUnderlay');
   if (!el) return;
   if (globeModeEnabled) updateVirtualGlobeCamera();
@@ -3095,20 +3099,19 @@ function renderTiles(img, zoom) {
       <svg id="dotOverlay" style="position:absolute;top:0;left:0;width:${clipW}px;height:${clipH}px;overflow:visible;pointer-events:none;"></svg>
     </div>`;
 
-  // During a pending main crossfade, keep the visible ortho on the outgoing camera
-  // (rebuilding with the incoming image size here was a visible jump).
-  if (!transitionOutgoingMain) {
+  // During a pending main crossfade or zoom rescale hold, keep the visible ortho
+  // on its captured transform (rebuilding here flashed the wrong scale).
+  if (!transitionOutgoingMain && !zoomRescaleHold) {
     if (globeModeEnabled) updateVirtualGlobeCamera(img);
     const orthoCam = getDisplayCameraImg() || img;
     updateOrthoUnderlayForOverlay(orthoCam, globeModeEnabled ? 0 : rotDeg, contentW, contentH);
   } else if (globeModeEnabled) {
-    updateVirtualGlobeCamera(transitionOutgoingMain);
+    updateVirtualGlobeCamera(transitionOutgoingMain || img);
   }
 
   const morphFrom = pendingDisplayJFrom;
   pendingDisplayJFrom = null;
 
-  const hadPrev = Array.from(area.children).some(el => el._overlayHistory);
   let prevMainName = null;
   for (let i = area.children.length - 1; i >= 0; i--) {
     const el = area.children[i];
@@ -3118,6 +3121,26 @@ function renderTiles(img, zoom) {
     }
   }
   const mainChanged = !prevMainName || prevMainName !== img.name;
+  // Same main, new viewerZoom / tile layout — old layers have tiles baked at the previous scale.
+  const zoomRescale = !!prevMainName && !mainChanged;
+
+  if (!zoomRescale) {
+    // Zoom hold only applies to same-main rescale waits.
+    clearZoomRescaleHold();
+  }
+
+  if (zoomRescale) {
+    // Drop wrong-scale neighbor DOMs now; remount after lock (below). Keep old main
+    // visible (under zoomRescaleHold) until the new one is ready.
+    Array.from(area.children).forEach(el => {
+      if (el._overlayNeighborPreview) el.remove();
+    });
+    neighborLayersMainName = null;
+    lockedNeighborImages = [];
+    applyZoomRescaleHold();
+  }
+
+  const hadPrev = Array.from(area.children).some(el => el._overlayHistory);
 
   const oldPad  = area.querySelector('#rotPadDiv');
   const oldClip = area.querySelector('#rotClipDiv');
@@ -3136,17 +3159,18 @@ function renderTiles(img, zoom) {
   layer._overlayNeighborPreview = false;
 
   // Hold new main (and later neighbors) invisible until main + reprojected set are ready.
-  const jointNeighborReveal = overlayEnabled && mainChanged;
+  // Zoom rescale also remounts neighbors at the new baked scale.
+  const jointNeighborReveal = overlayEnabled && (mainChanged || zoomRescale);
   if (hadPrev || jointNeighborReveal) {
     layer.style.opacity = '0';
     layer.style.visibility = 'hidden';
-    layer.style.transition = `opacity ${IMAGE_CROSSFADE_MS}ms ease`;
+    layer.style.transition = zoomRescale ? '' : `opacity ${IMAGE_CROSSFADE_MS}ms ease`;
     layer._overlayPendingReveal = true;
   }
   area.appendChild(layer);
 
   // Arm Jacobian morph before the first sync so the new view starts matching the old foreshortening.
-  if (hadPrev && morphFrom && !globeModeEnabled) {
+  if (hadPrev && morphFrom && !globeModeEnabled && !zoomRescale) {
     armDisplayJacobianTransition(morphFrom);
   }
 
@@ -3180,6 +3204,7 @@ function renderTiles(img, zoom) {
       if (revealGen !== imageRevealGen) return;
       // Crossfade done — drop outgoing freeze and settle everyone on the new main.
       transitionOutgoingMain = null;
+      clearZoomRescaleHold();
       layer._overlayPendingReveal = false;
       const area2 = document.getElementById('viewerArea');
       if (area2) {
@@ -3205,6 +3230,40 @@ function renderTiles(img, zoom) {
     };
     const runFade = () => {
       if (revealGen !== imageRevealGen) return;
+
+      if (zoomRescale) {
+        // Hard-swap: remove previous same-main history (wrong baked scale → “echo”),
+        // show new main + remounted neighbors at the new zoom immediately.
+        Array.from(area.children).forEach(el => {
+          if (el._overlayHistory && el !== layer) el.remove();
+        });
+        layer.style.visibility = '';
+        layer.style.opacity = '1';
+        layer._overlayPendingReveal = false;
+        if (neighborPrep) {
+          for (const el of (neighborPrep.obsolete || [])) {
+            if (el.isConnected) el.remove();
+          }
+          for (const n of (neighborPrep.newcomers || [])) {
+            if (!n.isConnected) continue;
+            n.style.transition = '';
+            n.style.visibility = '';
+            n.style.opacity = '1';
+            n._neighborPendingReveal = false;
+          }
+          // If prepare returned empty newcomers (already mounted), ensure opacity.
+          Array.from(area.children).forEach(el => {
+            if (el._overlayNeighborPreview) {
+              el.style.visibility = '';
+              el.style.opacity = '1';
+              el._neighborPendingReveal = false;
+            }
+          });
+        }
+        finishTransition();
+        return;
+      }
+
       // Keep transitionOutgoingMain through the fade so the old stack does not snap.
       syncOverlayLayersToMarker();
       layer.style.visibility = '';
@@ -3356,8 +3415,15 @@ function changeViewZoom(dir) {
   let idx = 0, best = Infinity;
   VZOOM_STEPS.forEach((v, i) => { const d = Math.abs(v - viewerZoom); if (d < best) { best = d; idx = i; } });
   idx = Math.max(0, Math.min(VZOOM_STEPS.length - 1, idx + dir));
-  viewerZoom = VZOOM_STEPS[idx];
+  const target = VZOOM_STEPS[idx];
+  if (target === viewerZoom) return;
+  beginZoomRescaleHold(viewerZoom);
+  viewerZoom = target;
   relockGroundScaleAfterUserZoom();
+  resetOrthoGlobeLayoutCache();
+  virtualGlobeImg = null;
+  globePoseLastTs = 0;
+  applyZoomRescaleHold();
 
   const lbl = viewerZoom >= 1
     ? (Number.isInteger(viewerZoom) ? viewerZoom + '×' : viewerZoom.toFixed(2).replace(/\.?0+$/,'') + '×')
@@ -3367,6 +3433,7 @@ function changeViewZoom(dir) {
   if (orbitVz) orbitVz.textContent = lbl;
 
   if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
+  else clearZoomRescaleHold();
 }
 
 let markerVisible  = true;
@@ -3963,6 +4030,11 @@ function syncOverlayLayersToMarker() {
   layers.forEach((layer) => {
     const img = layer._overlayImage;
     if (!img?.pToImage) return;
+    // During zoom wait: keep previous baked layers on a compensating scale hold —
+    // syncing them with the new viewerZoom made the old tiles look wrong-scale.
+    if (zoomRescaleHold && !layer._overlayPendingReveal && !layer._neighborPendingReveal) {
+      return;
+    }
     const isTop = layer === topHist;
     const pending = !!(layer._overlayPendingReveal || layer._neighborPendingReveal);
     const anchor = pending ? incoming : outgoing;
@@ -4023,7 +4095,11 @@ function syncOverlayLayersToMarker() {
     }
   });
 
-  syncOrthoUnderlayTransform();
+  if (zoomRescaleHold) {
+    applyZoomRescaleHold();
+  } else {
+    syncOrthoUnderlayTransform();
+  }
   // Do not updateOverlayBlur() here — rewriting filter/z-index every pointer move made layers jump.
 }
 
@@ -4923,8 +4999,55 @@ let pinchStartZoom = 1;
 let pinchLastRatio = 1;
 /** Overlay mode: { el, transform, transformOrigin }[] captured at pinch start so all stack layers zoom together. */
 let pinchOverlaySnapshots = null;
+/** Ortho underlay snapshot — keeps the live perspective homography, then wraps a viewport scale. */
+let pinchOrthoSnapshot = null;
+/**
+ * While remounting tiles after a zoom change, keep previous layers on a compensating
+ * viewport scale (fromZoom → viewerZoom) so they do not flash at the wrong warp.
+ */
+let zoomRescaleHold = null;
 
 function pinchDist(t) { return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
+
+/** Snapshot live transforms at `fromZoom` before viewerZoom changes. */
+function beginZoomRescaleHold(fromZoom) {
+  if (zoomRescaleHold || !(fromZoom > 0)) return;
+  const area = document.getElementById('viewerArea');
+  if (!area) return;
+  syncOverlayLayersToMarker();
+  const snaps = [];
+  for (const el of Array.from(area.children)) {
+    if (!el._overlayImage && el.id !== 'orthoUnderlay') continue;
+    snaps.push({
+      el,
+      transform: el.style.transform || '',
+      transformOrigin: el.style.transformOrigin || '0 0',
+    });
+  }
+  if (!snaps.length) return;
+  zoomRescaleHold = { fromZoom, snaps };
+}
+
+function applyZoomRescaleHold() {
+  if (!zoomRescaleHold || !viewerAreaEl) return;
+  const ratio = viewerZoom / zoomRescaleHold.fromZoom;
+  if (!(ratio > 0) || !Number.isFinite(ratio)) return;
+  const cx = (viewerAreaEl.clientWidth || 800) / 2;
+  const cy = (viewerAreaEl.clientHeight || 600) / 2;
+  const pre = Math.abs(ratio - 1) < 1e-6
+    ? ''
+    : `translate(${cx}px, ${cy}px) scale(${ratio}) translate(${-cx}px, ${-cy}px)`;
+  for (const s of zoomRescaleHold.snaps) {
+    if (!s.el.isConnected) continue;
+    if (s.el._overlayPendingReveal || s.el._neighborPendingReveal) continue;
+    s.el.style.transformOrigin = '0 0';
+    s.el.style.transform = pre && s.transform ? `${pre} ${s.transform}` : (s.transform || pre);
+  }
+}
+
+function clearZoomRescaleHold() {
+  zoomRescaleHold = null;
+}
 
 /** Top tile stack layer (single mode, or fallback when overlay stack has nothing to snapshot). */
 function getPinchLayerEl() {
@@ -4934,6 +5057,8 @@ function getPinchLayerEl() {
 function capturePinchOverlaySnapshots() {
   pinchOverlaySnapshots = null;
   if (!viewerAreaEl) return;
+  // Freeze live warps first so snapshots include the current perspective matrices.
+  syncOverlayLayersToMarker();
   const snaps = [];
   for (const el of Array.from(viewerAreaEl.children)) {
     if (!el._overlayImage) continue;
@@ -4975,57 +5100,53 @@ function restorePinchOverlaySnapshots() {
 }
 
 /**
- * During two-finger pinch preview, #orthoUnderlay must use the same translate+scale intent as #rotPadDiv
- * (marker-centred scale), but with transform-origin at the ortho marker in underlay local coords.
+ * Capture ortho’s current perspective warp (matrix3d), then preview pinch by wrapping the
+ * same viewport-centred scale used for oblique layers — not a flat translate+scale.
  */
-function setOrthoUnderlayPinchPreview(pinchRatio) {
-  const ortho = document.getElementById('orthoUnderlay');
-  const area = document.getElementById('viewerArea');
-  if (!ortho || !area) return;
-  const ox = ortho._orthoMarkerX;
-  const oy = ortho._orthoMarkerY;
-  if (typeof ox !== 'number' || typeof oy !== 'number' || !Number.isFinite(ox) || !Number.isFinite(oy)) return;
-  const viewW = area.clientWidth || 800;
-  const viewH = area.clientHeight || 600;
-  const pan = getPinchPanParts();
-  if (pan) {
-    ortho.style.transformOrigin = `${ox}px ${oy}px`;
-    ortho.style.transform = `translate(${viewW / 2 - ox}px, ${viewH / 2 - oy}px) scale(${pinchRatio})`;
-  } else {
-    ortho.style.transformOrigin = `${ox}px ${oy}px`;
-    ortho.style.transform = `scale(${pinchRatio})`;
-  }
-}
-
-function clearOrthoUnderlayPinchPreview() {
+function capturePinchOrthoSnapshot() {
+  pinchOrthoSnapshot = null;
   const ortho = document.getElementById('orthoUnderlay');
   if (!ortho) return;
-  ortho.style.transformOrigin = '';
-  ortho.style.transform = '';
+  syncOrthoUnderlayTransform();
+  pinchOrthoSnapshot = {
+    el: ortho,
+    transform: ortho.style.transform || '',
+    transformOrigin: ortho.style.transformOrigin || '0 0',
+  };
 }
 
-/** Match legacy pinch: ortho scale origin before the first touchmove. */
-function primeOrthoUnderlayForPinchStart() {
-  const ortho = document.getElementById('orthoUnderlay');
-  if (!ortho) return;
-  const pan = getPinchPanParts();
-  if (pan || markerVisualInPadPx()) {
-    const ox = ortho._orthoMarkerX;
-    const oy = ortho._orthoMarkerY;
-    if (typeof ox === 'number' && typeof oy === 'number' && Number.isFinite(ox) && Number.isFinite(oy)) {
-      ortho.style.transformOrigin = `${ox}px ${oy}px`;
-    }
-  } else {
-    ortho.style.transformOrigin = `${ortho.clientWidth / 2}px ${ortho.clientHeight / 2}px`;
+function applyPinchOrthoPreview(pinchRatio) {
+  if (!pinchOrthoSnapshot?.el?.isConnected || !viewerAreaEl) return;
+  const cx = (viewerAreaEl.clientWidth || 800) / 2;
+  const cy = (viewerAreaEl.clientHeight || 600) / 2;
+  const pre = `translate(${cx}px, ${cy}px) scale(${pinchRatio}) translate(${-cx}px, ${-cy}px)`;
+  const s = pinchOrthoSnapshot;
+  s.el.style.transformOrigin = '0 0';
+  s.el.style.transform = s.transform ? `${pre} ${s.transform}` : pre;
+}
+
+function restorePinchOrthoSnapshot() {
+  if (!pinchOrthoSnapshot) return;
+  const s = pinchOrthoSnapshot;
+  if (s.el.isConnected) {
+    s.el.style.transform = s.transform;
+    s.el.style.transformOrigin = s.transformOrigin;
   }
+  pinchOrthoSnapshot = null;
 }
 
 function setViewerZoomTo(z) {
-  viewerZoom = Math.max(VZOOM_STEPS[0], Math.min(VZOOM_STEPS[VZOOM_STEPS.length-1], z));
+  const target = Math.max(VZOOM_STEPS[0], Math.min(VZOOM_STEPS[VZOOM_STEPS.length-1], z));
+  if (!(target > 0)) return;
+  if (!zoomRescaleHold && target !== viewerZoom) {
+    beginZoomRescaleHold(viewerZoom);
+  }
+  viewerZoom = target;
   relockGroundScaleAfterUserZoom();
   resetOrthoGlobeLayoutCache();
   virtualGlobeImg = null;
   globePoseLastTs = 0;
+  applyZoomRescaleHold();
   const v = viewerZoom;
   const lbl = v >= 1
     ? (Number.isInteger(v) ? v+'×' : v.toFixed(2).replace(/\.?0+$/,'')+'×')
@@ -5034,6 +5155,7 @@ function setViewerZoomTo(z) {
   const orbitVz = document.getElementById('orbitVzoomLabel');
   if (orbitVz) orbitVz.textContent = lbl;
   if (currentImage) renderTiles(currentImage, getTileZoomIndex(currentImage));
+  else clearZoomRescaleHold();
 }
 
 viewerAreaEl.addEventListener('touchstart', e => {
@@ -5049,9 +5171,8 @@ viewerAreaEl.addEventListener('touchstart', e => {
     pinchStartZoom = viewerZoom;
     pinchLastRatio = 1;
     capturePinchOverlaySnapshots();
-    if (pinchOverlaySnapshots && pinchOverlaySnapshots.length) {
-      primeOrthoUnderlayForPinchStart();
-    } else {
+    capturePinchOrthoSnapshot();
+    if (!pinchOverlaySnapshots || !pinchOverlaySnapshots.length) {
       const el = getPinchLayerEl();
       if (el) {
         const pan = getPinchPanParts();
@@ -5086,24 +5207,25 @@ viewerAreaEl.addEventListener('touchmove', e => {
         el.style.transform = `scale(${pinchLastRatio})`;
       }
     }
-    setOrthoUnderlayPinchPreview(pinchLastRatio);
+    applyPinchOrthoPreview(pinchLastRatio);
   }
 }, { passive: false });
 
 function commitPinchPreview() {
   if (!isPinching) return;
-  if (pinchOverlaySnapshots) {
-    restorePinchOverlaySnapshots();
-  } else {
-    const el = getPinchLayerEl();
-    if (el) {
-      el.style.transform = '';
-      el.style.transformOrigin = '';
-    }
+  const targetZoom = pinchStartZoom * pinchLastRatio;
+  // Keep the pinch look continuous: hand base transforms to the zoom hold instead of
+  // restoring old-zoom warps (that flash) before remounting at the new scale.
+  const snaps = [];
+  if (pinchOverlaySnapshots) snaps.push(...pinchOverlaySnapshots);
+  if (pinchOrthoSnapshot) snaps.push(pinchOrthoSnapshot);
+  if (snaps.length) {
+    zoomRescaleHold = { fromZoom: pinchStartZoom, snaps };
   }
-  clearOrthoUnderlayPinchPreview();
-  setViewerZoomTo(pinchStartZoom * pinchLastRatio);
+  pinchOverlaySnapshots = null;
+  pinchOrthoSnapshot = null;
   isPinching = false;
+  setViewerZoomTo(targetZoom);
 }
 
 viewerAreaEl.addEventListener('touchend', e => {
