@@ -2315,10 +2315,79 @@ function lockNeighborsForMain(mainImg) {
   return overlayNeighborGen;
 }
 
+/** Whether a neighbor layer is still hidden (opacity/visibility). Pending alone does not count —
+ *  during a main crossfade, revealed layers keep _neighborPendingReveal until settle. */
+function neighborLayerIsUnrevealed(el) {
+  if (!el) return false;
+  if (el.style.visibility === 'hidden') return true;
+  const op = el.style.opacity;
+  return op === '0' || op === '0%';
+}
+
+/** Sort neighbor images far→near so insertBefore(hist) builds correct paint order (near on top). */
+function sortNeighborsFarToNear(neighbors) {
+  const mainImg = currentImage;
+  const [qx, qy] = (mainImg && mainImg.lookAtMgi)
+    || wgs84ToMgi.forward([searchLon, searchLat]);
+  return [...neighbors].sort((a, b) => {
+    const da = Math.hypot(qx - a.lookAtMgi[0], qy - a.lookAtMgi[1]);
+    const db = Math.hypot(qx - b.lookAtMgi[0], qy - b.lookAtMgi[1]);
+    return db - da;
+  });
+}
+
+/**
+ * Make the locked neighbor set match the DOM: mount any missing layers, force them
+ * visible, and re-stack far→near (near on top). Wrong order buried close images under far ones.
+ */
+function ensureLockedNeighborLayersVisible() {
+  const area = document.getElementById('viewerArea');
+  if (!area || !overlayEnabled) return;
+  if (!overlayNeighborsActive() || !lockedNeighborImages.length) return;
+
+  const mainName = neighborLayersMainName || currentImage?.name;
+  const wantList = lockedNeighborImages;
+  const want = new Set(wantList.map(ni => ni.name));
+  const byName = new Map();
+
+  for (const el of Array.from(area.children)) {
+    if (!el._overlayNeighborPreview || !el._overlayImage) continue;
+    const name = el._overlayImage.name;
+    if (mainName && name === mainName) continue;
+    if (!want.has(name)) continue;
+    if (byName.has(name)) {
+      el.remove();
+      continue;
+    }
+    byName.set(name, el);
+  }
+
+  const histAnchor = firstHistoryLayer(area);
+  const stacked = [];
+  for (const ni of sortNeighborsFarToNear(wantList)) {
+    let layer = byName.get(ni.name);
+    if (!layer) {
+      layer = buildNeighborLayerDOM(ni, 0);
+      byName.set(ni.name, layer);
+    }
+    layer.style.visibility = '';
+    layer.style.opacity = '1';
+    layer._neighborPendingReveal = false;
+    stacked.push(layer);
+  }
+
+  // Re-insert far→near before the first history layer (each insert lands on top of previous).
+  for (const layer of stacked) {
+    if (histAnchor) area.insertBefore(layer, histAnchor);
+    else area.appendChild(layer);
+  }
+  syncOverlayLayersToMarker();
+}
+
 /**
  * Decode + mount locked neighbors at opacity 0. Does not fade — caller reveals
  * together with the main image once everything is ready.
- * @returns {Promise<{gen:number, newcomers:Element[], obsolete:Element[], clearAll?:boolean}|null>}
+ * @returns {Promise<{gen:number, newcomers:Element[], obsolete:Element[], retainedForMain?:Element[], clearAll?:boolean}|null>}
  */
 function prepareLockedNeighborLayers(gen) {
   const area = document.getElementById('viewerArea');
@@ -2335,6 +2404,8 @@ function prepareLockedNeighborLayers(gen) {
   const z = 0;
   const fadeMs = IMAGE_CROSSFADE_MS;
   const waitMs = document.getElementById('waitFullTilesSwitchCb')?.checked ? 12000 : 2000;
+  // Don't block mounting the whole stack on the slowest of N images — warm cache with a budget.
+  const decodeBudgetMs = Math.min(waitMs, 2500);
 
   return new Promise(resolve => {
     let settled = false;
@@ -2344,7 +2415,13 @@ function prepareLockedNeighborLayers(gen) {
       resolve(result);
     };
 
-    Promise.all(neighbors.map(ni => waitForAllTilesDecoded(ni, z))).then(() => {
+    const decodeAll = Promise.all(neighbors.map(ni => waitForAllTilesDecoded(ni, z)));
+    const decodeWait = Promise.race([
+      decodeAll,
+      new Promise(r => setTimeout(r, decodeBudgetMs)),
+    ]);
+
+    decodeWait.then(() => {
       if (gen !== overlayNeighborGen) { done(null); return; }
       if (!overlayEnabled || neighborLayersMainName !== mainName) { done(null); return; }
       const area2 = document.getElementById('viewerArea');
@@ -2355,13 +2432,17 @@ function prepareLockedNeighborLayers(gen) {
       const existingNames = new Set(
         existing.map(el => el._overlayImage && el._overlayImage.name).filter(Boolean)
       );
+      const unrevealed = existing.filter(
+        el => wantNames.has(el._overlayImage?.name) && neighborLayerIsUnrevealed(el)
+      );
       if (
         wantNames.size === existingNames.size &&
-        [...wantNames].every(name => existingNames.has(name))
+        [...wantNames].every(name => existingNames.has(name)) &&
+        unrevealed.length === 0
       ) {
         neighbors.forEach(ni => preloadToCache(ni, z));
         syncOverlayLayersToMarker();
-        done({ gen, newcomers: [], obsolete: [] });
+        done({ gen, newcomers: [], obsolete: [], retainedForMain: [] });
         return;
       }
 
@@ -2384,13 +2465,7 @@ function prepareLockedNeighborLayers(gen) {
       }
 
       const mainImg = currentImage;
-      const [qx, qy] = (mainImg && mainImg.lookAtMgi)
-        || wgs84ToMgi.forward([searchLon, searchLat]);
-      const sorted = [...neighbors].sort((a, b) => {
-        const da = Math.hypot(qx - a.lookAtMgi[0], qy - a.lookAtMgi[1]);
-        const db = Math.hypot(qx - b.lookAtMgi[0], qy - b.lookAtMgi[1]);
-        return db - da;
-      });
+      const sorted = sortNeighborsFarToNear(neighbors);
 
       const histAnchor = firstHistoryLayer(area2);
       const newcomers = [];
@@ -2403,11 +2478,26 @@ function prepareLockedNeighborLayers(gen) {
           layer.style.transition = `opacity ${fadeMs}ms ease`;
           layer._neighborPendingReveal = true;
           newcomers.push(layer);
+          byName.set(ni.name, layer);
           if (histAnchor) area2.insertBefore(layer, histAnchor);
           else area2.appendChild(layer);
-        } else if (histAnchor && layer.nextSibling !== histAnchor) {
-          area2.insertBefore(layer, histAnchor);
+        } else if (neighborLayerIsUnrevealed(layer)) {
+          // Previously mounted but never revealed (stale gen / aborted fade) — treat as newcomer.
+          // Do not re-hide layers that are already visible (pending can still be set mid-crossfade).
+          layer.style.opacity = '0';
+          layer.style.visibility = 'hidden';
+          layer.style.transition = `opacity ${fadeMs}ms ease`;
+          layer._neighborPendingReveal = true;
+          newcomers.push(layer);
         }
+      }
+
+      // Stack far→near before history (near on top).
+      for (const ni of sorted) {
+        const layer = byName.get(ni.name);
+        if (!layer || !layer.isConnected) continue;
+        if (histAnchor) area2.insertBefore(layer, histAnchor);
+        else area2.appendChild(layer);
       }
 
       syncOverlayLayersToMarker();
@@ -2418,7 +2508,7 @@ function prepareLockedNeighborLayers(gen) {
 
       const finishMount = () => {
         if (gen !== overlayNeighborGen) {
-          newcomers.forEach(el => { if (el.isConnected) el.remove(); });
+          // Leave DOM as-is for the newer prepare to reconcile; do not strip layers.
           done(null);
           return;
         }
@@ -2442,7 +2532,11 @@ function prepareLockedNeighborLayers(gen) {
 
 /** Crossfade prepared neighbors (call in lockstep with main reveal). */
 function beginNeighborCrossfade(prep) {
-  if (!prep || prep.gen !== overlayNeighborGen) return;
+  if (!prep || prep.gen !== overlayNeighborGen) {
+    // Stale or missing prep — still force the current locked set on screen.
+    ensureLockedNeighborLayersVisible();
+    return;
+  }
   const fadeMs = IMAGE_CROSSFADE_MS;
   const { newcomers, obsolete, clearAll } = prep;
 
@@ -2467,16 +2561,32 @@ function beginNeighborCrossfade(prep) {
   // Ensure incoming neighbors are warped to the new main before they become visible.
   syncOverlayLayersToMarker();
 
+  const want = new Set(lockedNeighborImages.map(ni => ni.name));
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
-      if (prep.gen !== overlayNeighborGen) return;
-      for (const layer of newcomers) {
+      if (prep.gen !== overlayNeighborGen) {
+        ensureLockedNeighborLayersVisible();
+        return;
+      }
+      const area = document.getElementById('viewerArea');
+      // Reveal newcomers and any other wanted layer still stuck invisible.
+      const revealSet = new Set(newcomers);
+      if (area) {
+        for (const el of area.children) {
+          if (!el._overlayNeighborPreview) continue;
+          const name = el._overlayImage?.name;
+          if (name && want.has(name)) revealSet.add(el);
+        }
+      }
+      for (const layer of revealSet) {
         if (!layer.isConnected) continue;
         layer.style.visibility = '';
         layer.style.opacity = '1';
         // Settings-only rebuild: no outgoing freeze — clear pending immediately.
         if (!transitionOutgoingMain) layer._neighborPendingReveal = false;
       }
+      // Mount any locked neighbor still missing from the DOM.
+      ensureLockedNeighborLayersVisible();
     });
   });
   syncOrthoDimMainClass();
@@ -3261,6 +3371,7 @@ function renderTiles(img, zoom) {
         );
       }
       trimOverlayHistory();
+      ensureLockedNeighborLayersVisible();
       syncOverlayLayersToMarker();
       updateOverlayBlur();
       applyOverlayStitchedLayerVisibility();
@@ -3330,15 +3441,23 @@ function renderTiles(img, zoom) {
   Promise.all([mainReady, neighborPrepPromise]).then(([, prep]) => {
     if (revealGen !== imageRevealGen) return;
     neighborPrep = prep;
+    if (revealed) {
+      // Timeout already showed the main — still apply neighbor prep when it arrives.
+      if (prep) beginNeighborCrossfade(prep);
+      else ensureLockedNeighborLayersVisible();
+      return;
+    }
     reveal();
   });
   setTimeout(() => {
     if (revealed || revealGen !== imageRevealGen) return;
-    // Timeout: use whatever neighbor prep has finished; otherwise skip neighbor fade this frame.
+    // Budget exceeded: show main now; neighbor prep may still be running.
+    reveal();
     neighborPrepPromise.then(prep => {
-      if (revealed || revealGen !== imageRevealGen) return;
+      if (revealGen !== imageRevealGen) return;
       neighborPrep = prep;
-      reveal();
+      if (prep) beginNeighborCrossfade(prep);
+      else ensureLockedNeighborLayersVisible();
     });
   }, waitMs);
 }
