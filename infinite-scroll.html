@@ -4043,28 +4043,42 @@ function syncOverlayLayersToMarker() {
       : anchor;
     if (!displayCam?.pToImage) return;
 
-    const baseFitDisp = Math.min(viewW / displayCam.width, viewH / displayCam.height);
-    const vScale = baseFitDisp * viewerZoom;
     const scale = Math.min(viewW / img.width, viewH / img.height) * viewerZoom;
-    const A_main = pending ? A_in : A_out;
+    const A_stack = pending ? A_in : A_out;
 
     // Neighbors + history behind main: analytical plane H into that layer’s display camera.
-    const wantReproject = !isTop && reprojectToMain && img.name !== anchor.name;
+    const wantReproject = !isTop && reprojectToMain && img.name !== (globeModeEnabled ? anchor.name : incoming.name);
     const wantGlobe = globeModeEnabled;
 
     if (wantGlobe || wantReproject) {
-      const Hvp = homographyLayerPadToGlobeViewport(img, displayCam, Z, scale, vScale, viewW, viewH);
+      // Classic reproject: always warp into the live main; Jacobian morph (below) carries
+      // the stack through the camera switch — same as main/ortho. Freezing on outgoing
+      // then clearing transitionOutgoingMain was the globe-off snap regression.
+      const reprojectCam = globeModeEnabled ? displayCam : incoming;
+      if (!reprojectCam?.pToImage) return;
+      const baseFitDisp = Math.min(viewW / reprojectCam.width, viewH / reprojectCam.height);
+      const vScale = baseFitDisp * viewerZoom;
+      const Hvp = homographyLayerPadToGlobeViewport(img, reprojectCam, Z, scale, vScale, viewW, viewH);
       layer.style.transformOrigin = '0 0';
+      let inner = null;
       if (Hvp) {
         layer._lastGlobeH = Hvp;
-        layer.style.transform = homography3x3ToMatrix3dString(Hvp);
+        inner = homography3x3ToMatrix3dString(Hvp);
       } else if (layer._lastGlobeH) {
         // Keep last good warp — translate fallback made reprojected layers pop.
-        layer.style.transform = homography3x3ToMatrix3dString(layer._lastGlobeH);
+        inner = homography3x3ToMatrix3dString(layer._lastGlobeH);
       } else {
         const proj = projectToPixel(img, searchLat, searchLon, Z);
         if (!proj) return;
-        layer.style.transform = `translate(${viewW / 2 - proj[0] * scale}px, ${viewH / 2 - proj[1] * scale}px)`;
+        inner = `translate(${viewW / 2 - proj[0] * scale}px, ${viewH / 2 - proj[1] * scale}px)`;
+      }
+      // Classic reproject must share the main/ortho Jacobian morph; raw H alone snaps
+      // when the display camera identity changes (regression vs pre-crossfade-lock).
+      if (!globeModeEnabled && A_in) {
+        const M = morphMatrixForSourceJacobian(A_in);
+        layer.style.transform = wrapTransformWithMorphMatrix(inner, viewW, viewH, M);
+      } else {
+        layer.style.transform = inner;
       }
       return;
     }
@@ -4086,9 +4100,9 @@ function syncOverlayLayersToMarker() {
     }
     const pan = `translate(${viewW / 2 - vx}px, ${viewH / 2 - vy}px)`;
     layer.style.transformOrigin = '0 0';
-    if (!globeModeEnabled && A_main) {
-      const A_layer = (img.name === anchor.name) ? A_main : computeImageGroundJacobian(img, rotDeg);
-      const M = morphMatrixForSourceJacobian(A_layer || A_main);
+    if (!globeModeEnabled && A_stack) {
+      const A_layer = (img.name === anchor.name) ? A_stack : computeImageGroundJacobian(img, rotDeg);
+      const M = morphMatrixForSourceJacobian(A_layer || A_stack);
       layer.style.transform = wrapTransformWithMorphMatrix(pan, viewW, viewH, M);
     } else {
       layer.style.transform = pan;
