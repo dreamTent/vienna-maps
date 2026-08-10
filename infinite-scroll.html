@@ -92,6 +92,21 @@
     .tile-row { display: flex; }
     .tile-row img { display: block; flex-shrink: 0; /*background: #111;*/ }
 
+    /* Debug mode “border”: red inset outline on reprojected layers.
+       Class is on the sized clip child; tint/blur filters go on .tile-canvas-wrap so ::after stays red. */
+    .debug-reproject-outline {
+      position: relative;
+    }
+    .debug-reproject-outline::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      box-sizing: border-box;
+      border: 3px solid #ff0000;
+      pointer-events: none;
+      z-index: 30;
+    }
+
     /* visual zoom controls */
     .vzoom-ctrl { display: flex; align-items: center; gap: 3px; }
     .vzoom-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 4px; width: 22px; height: 22px; font-size: 1rem; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
@@ -450,6 +465,9 @@
         <option value="128">near 128</option>
         <option value="265">near 265</option>
       </select>
+      <button class="btn-sm" id="debugReprojectBtn" onclick="cycleDebugReprojectMode()" style="opacity:.5"
+              title="Debug reprojected layers: off → color tint → color + red inset border"
+              aria-pressed="false" data-debug-mode="off">🐞 Debug</button>
       <button class="btn-sm" id="lockImagesBtn"    onclick="toggleLockImages()">🔓 Lock image</button>
       <label class="filter-label" style="margin-left:4px"
              title="Decode every tile for the next view before swapping. Current image stays until the new one is ready.">
@@ -1882,6 +1900,9 @@ let neighborPreloadGen = 0;
 let overlayStitchedOnlyMain = false;
 /** User toggle for nadir ortho underlay / base layer. Hotkey: Shift+O */
 let orthoBackgroundVisible = true;
+/** Debug overlay for reprojected layers: 'off' | 'color' | 'border' (color + red inset ::after). */
+let debugReprojectMode = 'off';
+const DEBUG_REPROJECT_MODES = ['off', 'color', 'border'];
 let listPlayTimer    = null;
 let listPlayActive   = false;
 
@@ -2346,8 +2367,15 @@ function prepareLockedNeighborLayers(gen) {
 
       const byName = new Map();
       const obsolete = [];
+      const retainedForMain = [];
       for (const el of existing) {
         const name = el._overlayImage && el._overlayImage.name;
+        // Neighbor that is becoming the new main: keep it through the main crossfade
+        // so its footprint doesn’t vanish before the new main layer is visible.
+        if (name && name === mainName) {
+          retainedForMain.push(el);
+          continue;
+        }
         if (!name || !wantNames.has(name) || byName.has(name)) {
           obsolete.push(el);
           continue;
@@ -2395,7 +2423,7 @@ function prepareLockedNeighborLayers(gen) {
           return;
         }
         neighbors.forEach(ni => preloadToCache(ni, z));
-        done({ gen, newcomers, obsolete });
+        done({ gen, newcomers, obsolete, retainedForMain });
       };
 
       if (!newcomers.length) {
@@ -2500,6 +2528,7 @@ function onOverlayReprojectChange() {
   syncOverlayLayersToMarker();
   scheduleRebuildOverlayNeighborLayers(true);
   syncOrthoDimMainClass();
+  updateOverlayBlur(); // refresh debug tints when reproject on/off
 }
 
 /**
@@ -3211,6 +3240,15 @@ function renderTiles(img, zoom) {
         Array.from(area2.children).forEach(el => {
           if (el._neighborPendingReveal) el._neighborPendingReveal = false;
         });
+        // Remove neighbor that was held through the fade because it became the main.
+        for (const el of (neighborPrep?.retainedForMain || [])) {
+          if (el.isConnected) el.remove();
+        }
+        Array.from(area2.children).forEach(el => {
+          if (el._overlayNeighborPreview && el._overlayImage?.name === currentImage?.name) {
+            el.remove();
+          }
+        });
       }
       if (globeModeEnabled) updateVirtualGlobeCamera(currentImage);
       const orthoCam = getDisplayCameraImg() || currentImage;
@@ -3242,6 +3280,9 @@ function renderTiles(img, zoom) {
         layer._overlayPendingReveal = false;
         if (neighborPrep) {
           for (const el of (neighborPrep.obsolete || [])) {
+            if (el.isConnected) el.remove();
+          }
+          for (const el of (neighborPrep.retainedForMain || [])) {
             if (el.isConnected) el.remove();
           }
           for (const n of (neighborPrep.newcomers || [])) {
@@ -4047,14 +4088,26 @@ function syncOverlayLayersToMarker() {
     const A_stack = pending ? A_in : A_out;
 
     // Neighbors + history behind main: analytical plane H into that layer’s display camera.
-    const wantReproject = !isTop && reprojectToMain && img.name !== (globeModeEnabled ? anchor.name : incoming.name);
+    // Neighbor previews always reproject (even when name matches the incoming main during a
+    // handoff) — otherwise the promoted neighbor snaps to a native pan and vanishes early.
+    const wantReproject = !isTop && reprojectToMain && (
+      layer._overlayNeighborPreview ||
+      img.name !== (globeModeEnabled ? anchor.name : incoming.name)
+    );
     const wantGlobe = globeModeEnabled;
+    const isPromotedNeighbor = !!(
+      layer._overlayNeighborPreview && img.name === incoming.name
+    );
 
     if (wantGlobe || wantReproject) {
-      // Classic reproject: always warp into the live main; Jacobian morph (below) carries
-      // the stack through the camera switch — same as main/ortho. Freezing on outgoing
-      // then clearing transitionOutgoingMain was the globe-off snap regression.
-      const reprojectCam = globeModeEnabled ? displayCam : incoming;
+      // Promoted neighbor (becoming main): keep warping *live* into the outgoing camera so it
+      // continues to track the ground with the stack. Do not freeze a matrix (stops scrolling)
+      // and do not reproject into the incoming camera (identity-pops off the stitch).
+      const freezePromotedToOutgoing =
+        isPromotedNeighbor && !!transitionOutgoingMain && !pending;
+      const reprojectCam = globeModeEnabled
+        ? displayCam
+        : (freezePromotedToOutgoing ? outgoing : incoming);
       if (!reprojectCam?.pToImage) return;
       const baseFitDisp = Math.min(viewW / reprojectCam.width, viewH / reprojectCam.height);
       const vScale = baseFitDisp * viewerZoom;
@@ -4074,8 +4127,12 @@ function syncOverlayLayersToMarker() {
       }
       // Classic reproject must share the main/ortho Jacobian morph; raw H alone snaps
       // when the display camera identity changes (regression vs pre-crossfade-lock).
-      if (!globeModeEnabled && A_in) {
-        const M = morphMatrixForSourceJacobian(A_in);
+      // Promoted-on-outgoing uses A_out so morph matches the outgoing stitch, not the incoming main.
+      const A_morph = (!globeModeEnabled)
+        ? (freezePromotedToOutgoing ? A_out : (A_in || A_out))
+        : null;
+      if (A_morph) {
+        const M = morphMatrixForSourceJacobian(A_morph);
         layer.style.transform = wrapTransformWithMorphMatrix(inner, viewW, viewH, M);
       } else {
         layer.style.transform = inner;
@@ -4345,10 +4402,53 @@ function applyOverlayStitchedLayerVisibility() {
   });
 }
 
+/** Stable hue (0–360) from image name — golden-angle spaced for distinct neighbors. */
+function debugHueForImageName(name) {
+  let h = 2166136261;
+  const s = String(name || '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) * 137.508) % 360;
+}
+
+/** CSS filter that colorizes a layer to a unique hue (composes with blur). */
+function debugReprojectTintFilter(img) {
+  const hue = debugHueForImageName(img?.name);
+  // sepia→saturate→hue-rotate is the standard “solid tint” stack for photos
+  return `sepia(1) saturate(6) hue-rotate(${hue.toFixed(1)}deg) brightness(0.95)`;
+}
+
+function syncDebugReprojectButton() {
+  const btn = document.getElementById('debugReprojectBtn');
+  if (!btn) return;
+  const mode = debugReprojectMode;
+  btn.dataset.debugMode = mode;
+  btn.style.opacity = mode === 'off' ? '.5' : '';
+  btn.setAttribute('aria-pressed', mode === 'off' ? 'false' : 'true');
+  btn.textContent =
+    mode === 'color' ? '🐞 Color' :
+    mode === 'border' ? '🐞 Border' :
+    '🐞 Debug';
+  btn.title =
+    mode === 'color' ? 'Debug: color tint (click → color + red inset border)' :
+    mode === 'border' ? 'Debug: color + red inset border (click → off)' :
+    'Debug reprojected layers: off → color tint → color + red inset border';
+}
+
+function cycleDebugReprojectMode() {
+  const i = DEBUG_REPROJECT_MODES.indexOf(debugReprojectMode);
+  debugReprojectMode = DEBUG_REPROJECT_MODES[(i + 1) % DEBUG_REPROJECT_MODES.length];
+  syncDebugReprojectButton();
+  updateOverlayBlur();
+}
+
 /** Apply blur to all overlay layers: top layer is sharp; each layer behind gets
  *  overlayBlurFixed + stepsBack * overlayBlurStep (px).
  *  Explicit z-index keeps paint order correct when transform + filter both create stacking contexts
- *  (otherwise blurred layers can paint above the sharp top layer, especially with stacked transforms). */
+ *  (otherwise blurred layers can paint above the sharp top layer, especially with stacked transforms).
+ *  Debug modes tint non-main reprojected layers; “border” also draws a red inset ::after. */
 function updateOverlayBlur() {
   if (!overlayEnabled) return;
   const area = document.getElementById('viewerArea');
@@ -4356,11 +4456,42 @@ function updateOverlayBlur() {
   // Only count image layers (skip ortho) so blur steps stay stable.
   const imageLayers = Array.from(area.children).filter(el => el._overlayImage);
   const n = imageLayers.length;
+  let topHist = null;
+  for (let i = imageLayers.length - 1; i >= 0; i--) {
+    if (imageLayers[i]._overlayHistory) { topHist = imageLayers[i]; break; }
+  }
+  const reprojectOn = !!document.getElementById('overlayStretchToMainCb')?.checked;
+  const debugOn = debugReprojectMode !== 'off' && (globeModeEnabled || reprojectOn);
+  const outlineOn = debugOn && debugReprojectMode === 'border';
   imageLayers.forEach((layer, i) => {
     layer.style.zIndex = String(i + 1);
     const stepsBack = n - 1 - i;   // 0 for current top layer
     const blurPx = (stepsBack > 0 ? overlayBlurFixed : 0) + stepsBack * overlayBlurStep;
-    layer.style.filter = blurPx > 0 ? `blur(${blurPx}px)` : '';
+    const parts = [];
+    if (blurPx > 0) parts.push(`blur(${blurPx}px)`);
+    // Tint every warped layer behind / beside main (neighbors + history), not the live main.
+    const isMain = layer === topHist;
+    const tintThis = debugOn && !isMain && layer._overlayImage;
+    if (tintThis) parts.push(debugReprojectTintFilter(layer._overlayImage));
+    const filterStr = parts.length ? parts.join(' ') : '';
+
+    // Clip div has the image box size (layer itself does not) — outline ::after goes there.
+    // Tint/blur go on .tile-canvas-wrap so the red ::after is not hue-shifted.
+    const clip = layer.firstElementChild;
+    const wrap = layer.querySelector('.tile-canvas-wrap');
+    if (outlineOn && tintThis) {
+      if (clip) clip.classList.add('debug-reproject-outline');
+      layer.style.filter = '';
+      if (wrap) wrap.style.filter = filterStr;
+      else if (clip) clip.style.filter = filterStr;
+    } else {
+      if (clip) {
+        clip.classList.remove('debug-reproject-outline');
+        if (clip.style.filter) clip.style.filter = '';
+      }
+      if (wrap && wrap.style.filter) wrap.style.filter = '';
+      layer.style.filter = filterStr;
+    }
   });
   applyOverlayStitchedLayerVisibility();
 }
