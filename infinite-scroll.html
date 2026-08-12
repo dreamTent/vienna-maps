@@ -407,9 +407,11 @@
         <span class="vzoom-label" id="vzoomLabel">1×</span>
         <button class="vzoom-btn" onclick="changeViewZoom(+1)">+</button>
       </div>
-      <!-- height control for dot projection -->
-      <div class="height-ctrl" title="Ground elevation (Z) used for coordinate projection onto image">
+      <!-- height: with DGM, model Z = absolute terrain height (+ optional Δ). Absolute Z is what keeps stitches stable across image swaps. -->
+      <div class="height-ctrl" title="With DGM loaded: model Z = DGM height at the marker + Δ. Stitching uses a local tilted plane from 4 DGM samples around the marker. Without DGM, the number is absolute model Z.">
         <span>Z:</span>
+        <span id="dgmZLabel" style="font-variant-numeric:tabular-nums;color:var(--accent2);display:none" title="Effective model Z at marker (DGM + Δ)"></span>
+        <span id="heightDeltaLabel" style="color:var(--text-dim);display:none">Δ</span>
         <input type="range" id="heightSlider" min="-100" max="400" step="1" value="0"
                oninput="document.getElementById('heightNum').value=this.value; onHeightChange()">
         <input type="number" id="heightNum" value="0" min="-100" max="400"
@@ -449,7 +451,7 @@
              style="width:46px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.73rem;padding:2px 5px;"
              oninput="onOverlayBlurChange()">
       <span id="overlayBlurUnit" style="font-size:.73rem;color:var(--text-dim);opacity:.4">px/layer</span>
-      <label class="filter-label" title="Off: per-camera pan offset only. On: back layers are warped with a perspective homography from the ground plane (fixed Z) into the active image’s view — correct for pinhole cameras on a flat slice; not a full spherical/terrain reprojection.">
+      <label class="filter-label" title="Off: per-camera pan offset only. On: back layers are warped with a perspective homography from a local DGM ground plane (4 samples around the marker → tilted plane) into the active view. Still one plane — not a full DEM mesh.">
         <input type="checkbox" id="overlayStretchToMainCb" disabled onchange="onOverlayReprojectChange()">
         Reproject to main
       </label>
@@ -571,6 +573,18 @@ const ORTHO_SOURCE = {
   imageBaseUrl: 'orthofotos/2023/',
 };
 
+/**
+ * Compact DGM mosaic for terrain-aware stitching (see build_dgm_ground_offsets.py).
+ * Model Z uses *absolute* DGM height (+ optional Δ). A local tilted plane is fit from
+ * 4 samples around the marker so reproject/globe warps share one terrain slice.
+ */
+const GROUND_SOURCE = {
+  metaUrl: 'sources/ground/heightmap.json',
+  binUrl: 'sources/ground/heightmap.bin',
+  /** Optional per-image lookAt/corner Z (large); not required at runtime when heightmap is present. */
+  imageOffsetsUrl: 'sources/ground/image-offsets.json',
+};
+
 /** Rewrite tile previewUrl paths to ORTHO_SOURCE.imageBaseUrl. */
 function applyOrthoSourceUrls(data) {
   if (!data || !data.tiles) return data;
@@ -608,6 +622,189 @@ const DIR_TAG    = { 1:'tag-n', 2:'tag-e', 3:'tag-s', 4:'tag-w', 5:'tag-x' };
 // ═══════════════════════════════════════════════════════════════
 proj4.defs('MGI', MGI_PROJ_FALLBACK);
 let wgs84ToMgi = proj4('EPSG:4326', 'MGI');
+
+// ═══════════════════════════════════════════════════════════════
+//  DGM GROUND HEIGHTS  (relative terrain for stitch / reproject)
+// ═══════════════════════════════════════════════════════════════
+let dgmMeta = null;
+let dgmGrid = null; // Int16Array, decimetres
+let dgmReady = false;
+let _groundPlaneCacheKey = '';
+let _groundPlaneCache = null;
+
+async function loadGroundHeightmap() {
+  try {
+    const metaResp = await fetch(GROUND_SOURCE.metaUrl);
+    if (!metaResp.ok) throw new Error(`${GROUND_SOURCE.metaUrl}: ${metaResp.status}`);
+    dgmMeta = await metaResp.json();
+    const binResp = await fetch(GROUND_SOURCE.binUrl);
+    if (!binResp.ok) throw new Error(`${GROUND_SOURCE.binUrl}: ${binResp.status}`);
+    const buf = await binResp.arrayBuffer();
+    dgmGrid = new Int16Array(buf);
+    if (dgmGrid.length !== dgmMeta.width * dgmMeta.height) {
+      throw new Error(`heightmap size mismatch ${dgmGrid.length} vs ${dgmMeta.width * dgmMeta.height}`);
+    }
+    dgmReady = true;
+    invalidateGroundPlaneCache();
+    syncDgmZLabel();
+    console.info(`DGM heightmap ready ${dgmMeta.width}×${dgmMeta.height} @ ${dgmMeta.res}m`);
+  } catch (e) {
+    console.warn('DGM heightmap not loaded — stitching uses flat Z from slider only.', e);
+    dgmReady = false;
+    dgmMeta = null;
+    dgmGrid = null;
+    invalidateGroundPlaneCache();
+    syncDgmZLabel();
+  }
+}
+
+/** Absolute DGM elevation (m) at MGI metres, or null. */
+function sampleDgmZ(X, Y) {
+  if (!dgmReady || !dgmMeta || !dgmGrid) return null;
+  const col = (X - dgmMeta.originX) / dgmMeta.res;
+  const row = (dgmMeta.originY - Y) / dgmMeta.res;
+  const c0 = Math.floor(col);
+  const r0 = Math.floor(row);
+  const w = dgmMeta.width;
+  const h = dgmMeta.height;
+  if (c0 < 0 || r0 < 0 || c0 + 1 >= w || r0 + 1 >= h) return null;
+  const nodata = dgmMeta.nodata;
+  const i00 = r0 * w + c0;
+  const z00 = dgmGrid[i00], z10 = dgmGrid[i00 + 1];
+  const z01 = dgmGrid[i00 + w], z11 = dgmGrid[i00 + w + 1];
+  if (z00 === nodata || z10 === nodata || z01 === nodata || z11 === nodata) return null;
+  const fx = col - c0, fy = row - r0;
+  const z =
+    z00 * (1 - fx) * (1 - fy) +
+    z10 * fx * (1 - fy) +
+    z01 * (1 - fx) * fy +
+    z11 * fx * fy;
+  return z / 10; // decimetres → metres
+}
+
+function getManualHeightOffset() {
+  const hVal = document.getElementById('heightNum')?.value;
+  return hVal === '' || hVal == null ? 0 : Number(hVal);
+}
+
+/**
+ * Model Z at (X,Y): use *absolute* DGM elevation (+ slider Δ).
+ * Relative-to-marker Z≈0 looked wrong empirically — entering the absolute DGM
+ * value (e.g. 45) is what stops ground shift when the main image swaps.
+ */
+function modelZAtMgi(X, Y) {
+  const off = getManualHeightOffset();
+  if (!dgmReady) return off;
+  const z = sampleDgmZ(X, Y);
+  if (z == null) return getActiveGroundZ();
+  return z + off;
+}
+
+/** Model Z at the search marker: absolute DGM + Δ (or slider alone if no DGM). */
+function getActiveGroundZ() {
+  const off = getManualHeightOffset();
+  if (!dgmReady) return off;
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const z = sampleDgmZ(mx, my);
+  return z == null ? off : z + off;
+}
+
+function getActiveGroundZAtLatLon(lat, lon) {
+  const [X, Y] = wgs84ToMgi.forward([lon, lat]);
+  return modelZAtMgi(X, Y);
+}
+
+/**
+ * Shared local tilted plane Z = aX + bY + c from 4 absolute DGM samples around the marker.
+ * Used for all stitch/reproject homographies so layers share one terrain slice.
+ */
+function getLocalGroundPlane() {
+  const zMark = getActiveGroundZ();
+  const off = getManualHeightOffset();
+  const key = `${searchLat.toFixed(6)},${searchLon.toFixed(6)},${off},${dgmReady ? 1 : 0}`;
+  if (key === _groundPlaneCacheKey && _groundPlaneCache) return _groundPlaneCache;
+
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const half = (typeof GLOBE_PATCH_M === 'number' && GLOBE_PATCH_M > 0) ? GLOBE_PATCH_M : 160;
+  const corners = [
+    [mx - half, my - half],
+    [mx + half, my - half],
+    [mx + half, my + half],
+    [mx - half, my + half],
+  ];
+  const pts = [];
+  for (const [x, y] of corners) {
+    pts.push([x, y, modelZAtMgi(x, y)]);
+  }
+  // Pin plane to effective marker Z.
+  pts.push([mx, my, zMark]);
+
+  let plane = fitGroundPlaneLS(pts);
+  if (!plane) plane = { a: 0, b: 0, c: zMark };
+  _groundPlaneCacheKey = key;
+  _groundPlaneCache = plane;
+  return plane;
+}
+
+/** Least-squares Z = aX + bY + c. */
+function fitGroundPlaneLS(points) {
+  if (!points || points.length < 3) return null;
+  let sxx = 0, syy = 0, sxy = 0, sx = 0, sy = 0, sz = 0, sxz = 0, syz = 0, n = 0;
+  for (const [x, y, z] of points) {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    sxx += x * x; syy += y * y; sxy += x * y;
+    sx += x; sy += y; sz += z; sxz += x * z; syz += y * z; n += 1;
+  }
+  if (n < 3) return null;
+  const A = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, n]];
+  const b = [sxz, syz, sz];
+  const det3 = (M) =>
+    M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) -
+    M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
+    M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+  const det = det3(A);
+  if (Math.abs(det) < 1e-12) return null;
+  const a = det3([[b[0], A[0][1], A[0][2]], [b[1], A[1][1], A[1][2]], [b[2], A[2][1], A[2][2]]]) / det;
+  const bb = det3([[A[0][0], b[0], A[0][2]], [A[1][0], b[1], A[1][2]], [A[2][0], b[2], A[2][2]]]) / det;
+  const c = det3([[A[0][0], A[0][1], b[0]], [A[1][0], A[1][1], b[1]], [A[2][0], A[2][1], b[2]]]) / det;
+  if (![a, bb, c].every(Number.isFinite)) return null;
+  return { a, b: bb, c };
+}
+
+function syncDgmZLabel() {
+  const el = document.getElementById('dgmZLabel');
+  const deltaEl = document.getElementById('heightDeltaLabel');
+  if (!el) return;
+  if (!dgmReady) {
+    el.style.display = 'none';
+    el.textContent = '';
+    if (deltaEl) deltaEl.style.display = 'none';
+    return;
+  }
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const zAbs = sampleDgmZ(mx, my);
+  if (zAbs == null) {
+    el.style.display = 'none';
+    if (deltaEl) deltaEl.style.display = 'none';
+    return;
+  }
+  const zEff = getActiveGroundZ();
+  const off = getManualHeightOffset();
+  el.style.display = '';
+  el.textContent = off === 0 ? `${zEff.toFixed(0)}` : `${zAbs.toFixed(0)}${off >= 0 ? '+' : ''}${off}→${zEff.toFixed(0)}`;
+  if (deltaEl) deltaEl.style.display = '';
+}
+
+function invalidateGroundPlaneCache() {
+  _groundPlaneCacheKey = '';
+  _groundPlaneCache = null;
+}
+
+/** Call after searchLat/Lon change so DGM plane + label stay in sync. */
+function noteSearchPositionChanged() {
+  invalidateGroundPlaneCache();
+  syncDgmZLabel();
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  PLANAR GEOMETRY (MGI ground plane, metres)
@@ -800,19 +997,36 @@ function computeInvJacobian(img, lat, lon, Z) {
   return { dXdPx: d/det, dXdPy: -b/det, dYdPx: -c/det, dYdPy: a/det };
 }
 
+/** Normalize planeOrZ → {a,b,c} for Z = aX + bY + c (number ⇒ horizontal). */
+function planeCoeffs(planeOrZ) {
+  if (planeOrZ != null && typeof planeOrZ === 'object') {
+    return {
+      a: Number(planeOrZ.a) || 0,
+      b: Number(planeOrZ.b) || 0,
+      c: Number(planeOrZ.c) || 0,
+    };
+  }
+  return { a: 0, b: 0, c: Number(planeOrZ) || 0 };
+}
+
+function evalPlaneZ(planeOrZ, X, Y) {
+  const { a, b, c } = planeCoeffs(planeOrZ);
+  return a * X + b * Y + c;
+}
+
 /**
- * Ray–ground-plane intersection in MGI: image pixel (px,py) at fixed ground Z (metres).
- * Inverts the same pinhole model as projectToPixel (single planar Z slice).
+ * Ray–ground-plane intersection in MGI: image pixel (px,py) on Z=aX+bY+c
+ * (or constant Z if planeOrZ is a number).
  */
-function pixelToGroundMgi(img, px, py, Z) {
+function pixelToGroundMgi(img, px, py, planeOrZ) {
   if (!img.pToImage) return null;
-  const P = img.pToImage;
-  const a11 = P[0][0] - px * P[2][0];
-  const a12 = P[0][1] - px * P[2][1];
-  const b1 = px * (P[2][2] * Z + P[2][3]) - P[0][2] * Z - P[0][3];
-  const a21 = P[1][0] - py * P[2][0];
-  const a22 = P[1][1] - py * P[2][1];
-  const b2 = py * (P[2][2] * Z + P[2][3]) - P[1][2] * Z - P[1][3];
+  const M = planeMapMgiToImage(img.pToImage, planeOrZ);
+  const a11 = M[0][0] - px * M[2][0];
+  const a12 = M[0][1] - px * M[2][1];
+  const b1 = px * M[2][2] - M[0][2];
+  const a21 = M[1][0] - py * M[2][0];
+  const a22 = M[1][1] - py * M[2][1];
+  const b2 = py * M[2][2] - M[1][2];
   const det = a11 * a22 - a12 * a21;
   if (Math.abs(det) < 1e-18) return null;
   const X = (b1 * a22 - b2 * a12) / det;
@@ -820,9 +1034,10 @@ function pixelToGroundMgi(img, px, py, Z) {
   return [X, Y];
 }
 
-function groundMgiToPixel(img, X, Y, Z) {
+function groundMgiToPixel(img, X, Y, planeOrZ) {
   if (!img.pToImage) return null;
   const P = img.pToImage;
+  const Z = evalPlaneZ(planeOrZ, X, Y);
   const u = P[0][0] * X + P[0][1] * Y + P[0][2] * Z + P[0][3];
   const v = P[1][0] * X + P[1][1] * Y + P[1][2] * Z + P[1][3];
   const w = P[2][0] * X + P[2][1] * Y + P[2][2] * Z + P[2][3];
@@ -954,8 +1169,7 @@ function computeVirtualGlobeCamera(anchorImg) {
   const src = anchorImg;
   if (!globeModeEnabled || !src?.pToImage) return null;
 
-  const hVal = document.getElementById('heightNum').value;
-  const Z = hVal === '' ? 0 : Number(hVal);
+  const Z = getActiveGroundZ();
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
   const dir = src.viewDirection;
   const W = src.width;
@@ -1091,12 +1305,13 @@ function globePatchHalfExtentM() {
   return GLOBE_PATCH_M;
 }
 
-/** 3×3: ground [X, Y, 1] → image homogeneous [u, v, w] on plane Z. */
-function planeMapMgiToImage(P, Z) {
+/** 3×3: ground [X, Y, 1] → image homogeneous [u, v, w] on Z=aX+bY+c (or const Z). */
+function planeMapMgiToImage(P, planeOrZ) {
+  const { a, b, c } = planeCoeffs(planeOrZ);
   return [
-    [P[0][0], P[0][1], P[0][2] * Z + P[0][3]],
-    [P[1][0], P[1][1], P[1][2] * Z + P[1][3]],
-    [P[2][0], P[2][1], P[2][2] * Z + P[2][3]],
+    [P[0][0] + P[0][2] * a, P[0][1] + P[0][2] * b, P[0][2] * c + P[0][3]],
+    [P[1][0] + P[1][2] * a, P[1][1] + P[1][2] * b, P[1][2] * c + P[1][3]],
+    [P[2][0] + P[2][2] * a, P[2][1] + P[2][2] * b, P[2][2] * c + P[2][3]],
   ];
 }
 
@@ -1112,15 +1327,17 @@ function normalizeHomography3(H) {
 
 /**
  * Analytical plane-induced homography: layer pad → viewport via virt camera.
- * No 4-point DLT — that refit every frame was the main/reprojected stutter.
+ * planeOrZ may be a tilted local DGM plane {a,b,c}. No 4-point DLT — that
+ * refit every frame was the main/reprojected stutter.
  */
-function homographyLayerPadToGlobeViewport(img, virt, Z, scale, vScale, viewW, viewH) {
+function homographyLayerPadToGlobeViewport(img, virt, planeOrZ, scale, vScale, viewW, viewH) {
   if (!img?.pToImage || !virt?.pToImage || !(scale > 0) || !(vScale > 0)) return null;
-  const markerVirt = projectToPixel(virt, searchLat, searchLon, Z);
+  const Zmark = getActiveGroundZ();
+  const markerVirt = projectToPixel(virt, searchLat, searchLon, Zmark);
   if (!markerVirt) return null;
 
-  const M_layer = planeMapMgiToImage(img.pToImage, Z);
-  const M_virt = planeMapMgiToImage(virt.pToImage, Z);
+  const M_layer = planeMapMgiToImage(img.pToImage, planeOrZ);
+  const M_virt = planeMapMgiToImage(virt.pToImage, planeOrZ);
   const invLayer = invert3x3(M_layer);
   if (!invLayer) return null;
 
@@ -1143,10 +1360,11 @@ function homographyLayerPadToGlobeViewport(img, virt, Z, scale, vScale, viewW, v
   return normalizeHomography3(multiply3x3(S_virt_to_vp, multiply3x3(H_nv, S_pad_to_native)));
 }
 
-/** Analytical: ortho metric-local pad → globe viewport (same plane Z). */
-function homographyOrthoMetricToGlobeViewport(virt, Z, s, originX, originY, minLeft, minTop, vScale, viewW, viewH) {
+/** Analytical: ortho metric-local pad → globe viewport (same ground plane). */
+function homographyOrthoMetricToGlobeViewport(virt, planeOrZ, s, originX, originY, minLeft, minTop, vScale, viewW, viewH) {
   if (!virt?.pToImage || !(s > 0) || !(vScale > 0)) return null;
-  const markerVirt = projectToPixel(virt, searchLat, searchLon, Z);
+  const Zmark = getActiveGroundZ();
+  const markerVirt = projectToPixel(virt, searchLat, searchLon, Zmark);
   if (!markerVirt) return null;
 
   // local (x_l,y_l) → MGI (X,Y): x_l = s(X-ox)-minLeft, y_l = s(oy-Y)-minTop
@@ -1155,7 +1373,7 @@ function homographyOrthoMetricToGlobeViewport(virt, Z, s, originX, originY, minL
     [0, -1 / s, originY - minTop / s],
     [0, 0, 1],
   ];
-  const M_virt = planeMapMgiToImage(virt.pToImage, Z);
+  const M_virt = planeMapMgiToImage(virt.pToImage, planeOrZ);
   const cx = viewW / 2 - markerVirt[0] * vScale;
   const cy = viewH / 2 - markerVirt[1] * vScale;
   const S_virt_to_vp = [
@@ -1294,20 +1512,19 @@ function homographyFrom4Points2D(srcPts, dstPts) {
 }
 
 /**
- * Two perspective views of the same ground plane (fixed Z) are related by a plane homography.
- * This matches the “ball” / perspective field of view better than uniform scale; it is still
- * a planar slice — very large footprints need terrain + ellipsoid for strict spherical mapping.
+ * Two perspective views of the same ground plane are related by a plane homography.
+ * planeOrZ may be a local DGM tilted plane — still one planar slice (CSS matrix3d limit).
  */
-function homographyLayerNativeToMainNative(imgLayer, imgMain, Z) {
+function homographyLayerNativeToMainNative(imgLayer, imgMain, planeOrZ) {
   const W = imgLayer.width, H = imgLayer.height;
   const corners = [[0, 0], [W, 0], [W, H], [0, H]];
   const src = [];
   const dst = [];
   for (let i = 0; i < 4; i++) {
     const px = corners[i][0], py = corners[i][1];
-    const g = pixelToGroundMgi(imgLayer, px, py, Z);
+    const g = pixelToGroundMgi(imgLayer, px, py, planeOrZ);
     if (!g) return null;
-    const m = groundMgiToPixel(imgMain, g[0], g[1], Z);
+    const m = groundMgiToPixel(imgMain, g[0], g[1], planeOrZ);
     if (!m) return null;
     src.push([px, py]);
     dst.push([m[0], m[1]]);
@@ -1544,6 +1761,7 @@ function doSearch(opts) {
     return;
   }
   [searchLat, searchLon] = parts;
+  noteSearchPositionChanged();
 
   const radiusM = Math.max(1, Number(document.getElementById('radiusInput').value) || 200);
   const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
@@ -1602,7 +1820,7 @@ function computeHorizAngle(img, lat, lon, Z) {
 
 function applySort() {
   const key     = document.getElementById('sortSelect').value;
-  const Z       = Number(document.getElementById('heightNum').value) || 0;
+  const Z       = getActiveGroundZ();
   const radiusM = Math.max(0, Number(document.getElementById('frameRadiusM')?.value) || 0);
 
   // Pre-compute the 4 cardinal MGI offsets once (same for every image).
@@ -2150,8 +2368,7 @@ function computeAutoRotDegForImage(img) {
   if (!img || !img.pToImage) return 0;
   if (rotateMode === 'horizon') return computeHorizonLevelRotDeg(img);
   if (rotateMode === 'marker') {
-    const hVal = document.getElementById('heightNum').value;
-    const Z = hVal === '' ? 0 : Number(hVal);
+    const Z = getActiveGroundZ();
     const proj = projectToPixel(img, searchLat, searchLon, Z);
     if (!proj) return 0;
     const fx = Math.hypot(img.pToImage[0][0], img.pToImage[0][1], img.pToImage[0][2]);
@@ -2673,8 +2890,7 @@ function computeOrthoLayoutGlobeMetric(virt) {
   if (!orthoTilesData || !orthoTilesData.tiles || !orthoTilesData.tiles.length) return null;
   if (!virt?.pToImage) return null;
 
-  const hVal = document.getElementById('heightNum').value;
-  const Z = hVal === '' ? 0 : Number(hVal);
+  const Z = getActiveGroundZ();
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
   const area = document.getElementById('viewerArea');
   const viewW = area?.clientWidth || 800;
@@ -2815,8 +3031,7 @@ function computeOrthoLayout(img, rotDeg, contentW, contentH) {
     return computeOrthoLayoutGlobeMetric(img);
   }
 
-  const hVal = document.getElementById('heightNum').value;
-  const Z = hVal === '' ? 0 : Number(hVal);
+  const Z = getActiveGroundZ();
 
   const proj = projectToPixel(img, searchLat, searchLon, Z);
   if (!proj) return null;
@@ -3469,8 +3684,14 @@ function renderTiles(img, zoom) {
  *  Refreshes the dot projection AND re-evaluates the inFrame filter so the
  *  "Hide ⚠ outside" checkbox reflects the new elevation immediately. */
 function onHeightChange() {
+  invalidateGroundPlaneCache();
+  syncDgmZLabel();
   refreshDot();
   if (searchResults.length) applySort();
+  if (zoomToMarker) {
+    syncOverlayLayersToMarker();
+    syncOrthoUnderlayTransform();
+  }
 }
 
 function refreshDot() {
@@ -3478,8 +3699,7 @@ function refreshDot() {
   if (!svgEl || !currentImage) return;
 
   // Z=0 is the valid ground datum for this dataset — do not fall back to 170.
-  const hVal = document.getElementById('heightNum').value;
-  const groundHeight = hVal === '' ? 0 : Number(hVal);
+  const groundHeight = getActiveGroundZ();
   const result = projectToPixel(currentImage, searchLat, searchLon, groundHeight);
 
   svgEl.style.display = markerVisible ? '' : 'none';
@@ -3975,8 +4195,7 @@ function computeImageGroundJacobian(img, rotDeg) {
   if (!area) return null;
   const viewW = area.clientWidth || 800;
   const viewH = area.clientHeight || 600;
-  const hVal = document.getElementById('heightNum').value;
-  const Z = hVal === '' ? 0 : Number(hVal);
+  const Z = getActiveGroundZ();
   return groundToScreenJacobian(img, searchLat, searchLon, Z, viewW, viewH, rotDeg || 0);
 }
 
@@ -4158,8 +4377,8 @@ function syncOverlayLayersToMarker() {
   const viewW = area.clientWidth || 800;
   const viewH = area.clientHeight || 600;
   const layers = Array.from(area.children);
-  const hVal = document.getElementById('heightNum').value;
-  const Z = hVal === '' ? 0 : Number(hVal);
+  const Z = getActiveGroundZ();
+  const groundPlane = getLocalGroundPlane();
 
   const incoming = currentImage;
   if (!incoming) return;
@@ -4230,7 +4449,7 @@ function syncOverlayLayersToMarker() {
       if (!reprojectCam?.pToImage) return;
       const baseFitDisp = Math.min(viewW / reprojectCam.width, viewH / reprojectCam.height);
       const vScale = baseFitDisp * viewerZoom;
-      const Hvp = homographyLayerPadToGlobeViewport(img, reprojectCam, Z, scale, vScale, viewW, viewH);
+      const Hvp = homographyLayerPadToGlobeViewport(img, reprojectCam, groundPlane, scale, vScale, viewW, viewH);
       layer.style.transformOrigin = '0 0';
       let inner = null;
       if (Hvp) {
@@ -4321,8 +4540,7 @@ function syncOrthoUnderlayTransform() {
       return;
     }
 
-    const hVal = document.getElementById('heightNum').value;
-    const Z = hVal === '' ? 0 : Number(hVal);
+    const groundPlane = getLocalGroundPlane();
     const originX = orthoUnderlay._orthoOriginX;
     const originY = orthoUnderlay._orthoOriginY;
     if (!Number.isFinite(originX) || !Number.isFinite(originY)) {
@@ -4335,7 +4553,7 @@ function syncOrthoUnderlayTransform() {
     const baseFit = Math.min(viewW / virt.width, viewH / virt.height);
     const vScale = baseFit * viewerZoom;
     const Hvp = homographyOrthoMetricToGlobeViewport(
-      virt, Z, s, originX, originY, minLeft, minTop, vScale, viewW, viewH,
+      virt, groundPlane, s, originX, originY, minLeft, minTop, vScale, viewW, viewH,
     );
     orthoUnderlay.style.transformOrigin = '0 0';
     if (Hvp) {
@@ -4432,6 +4650,7 @@ function moveMarker(dxM, dyM) {
   searchLat = newLat;
   searchLon = newLon;
   document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  noteSearchPositionChanged();
   refreshDot();
   if (document.getElementById('autoSwitchWhileMovingCb')?.checked !== false) scheduleAutoSwitch();
   schedulePositionSearch();
@@ -4862,6 +5081,7 @@ function setMarkerMgi(mx, my) {
   searchLon = newLon;
   const coords = document.getElementById('coordsInput');
   if (coords) coords.value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  noteSearchPositionChanged();
   refreshDot();
   if (document.getElementById('autoSwitchWhileMovingCb')?.checked !== false) scheduleAutoSwitch();
   schedulePositionSearch();
@@ -5178,8 +5398,7 @@ if (typeof ResizeObserver !== 'undefined' && viewerAreaEl) {
 function beginDrag(clientX, clientY) {
   if (!currentImage) return false;
   if (autoTourActive) stopAutoTour();
-  const hVal = document.getElementById('heightNum').value;
-  const Z    = hVal === '' ? 0 : Number(hVal);
+  const Z    = getActiveGroundZ();
   if (globeModeEnabled) updateVirtualGlobeCamera();
   const dragImg = getDisplayCameraImg() || currentImage;
   const invJ = computeInvJacobian(dragImg, searchLat, searchLon, Z);
@@ -5202,8 +5421,7 @@ function applyDrag(clientX, clientY) {
   // Globe: incremental steps with a fresh virtual-camera Jacobian each frame
   // so along-view motion tracks the moving semi-globe pose.
   if (globeModeEnabled) {
-    const hVal = document.getElementById('heightNum').value;
-    const Z = hVal === '' ? 0 : Number(hVal);
+    const Z = getActiveGroundZ();
     updateVirtualGlobeCamera();
     const invJ = computeInvJacobian(getDisplayCameraImg() || currentImage, searchLat, searchLon, Z);
     if (!invJ) return;
@@ -5219,6 +5437,7 @@ function applyDrag(clientX, clientY) {
     searchLat = newLat;
     searchLon = newLon;
     document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+    noteSearchPositionChanged();
     refreshDot();
     if (document.getElementById('autoSwitchWhileMovingCb')?.checked !== false) scheduleAutoSwitch();
     schedulePositionSearch();
@@ -5234,6 +5453,7 @@ function applyDrag(clientX, clientY) {
   searchLat = newLat;
   searchLon = newLon;
   document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  noteSearchPositionChanged();
   refreshDot();
   if (document.getElementById('autoSwitchWhileMovingCb')?.checked !== false) scheduleAutoSwitch();
   schedulePositionSearch();
@@ -5686,6 +5906,13 @@ document.getElementById('viewerArea').addEventListener('wheel', e => {
   changeViewZoom(e.deltaY < 0 ? 1 : -1);
 }, { passive: false });
 
+loadGroundHeightmap().then(() => {
+  if (currentImage && zoomToMarker) {
+    syncOverlayLayersToMarker();
+    syncOrthoUnderlayTransform();
+    refreshDot();
+  }
+});
 loadIndex();
 </script>
 <!-- Hidden container that keeps tile <img> elements alive so their decoded bitmaps

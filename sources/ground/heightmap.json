@@ -1,0 +1,13 @@
+{
+  "crs": "MGI / Austria Gauss-Krueger M34 (same as oblique image.json)",
+  "originX": -11280.0,
+  "originY": 353940.0,
+  "res": 20.0,
+  "width": 1483,
+  "height": 1151,
+  "dtype": "int16",
+  "unit": "decimetres",
+  "nodata": -32768,
+  "zMetres": "value / 10",
+  "note": "North-up: row 0 is originY; col 0 is originX. Sample: col=(X-originX)/res, row=(originY-Y)/res."
+}
