@@ -700,13 +700,15 @@ function modelZAtMgi(X, Y) {
   return z + off;
 }
 
-/** Model Z at the search marker: absolute DGM + Δ (or slider alone if no DGM). */
+/** Model Z at the search marker: absolute DGM + Δ (or slider alone if no DGM).
+ *  Quantized to 0.25 m so tiny DGM/sample noise does not jitter virt pose + warps. */
 function getActiveGroundZ() {
   const off = getManualHeightOffset();
   if (!dgmReady) return off;
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
   const z = sampleDgmZ(mx, my);
-  return z == null ? off : z + off;
+  if (z == null) return off;
+  return Math.round((z + off) * 4) / 4;
 }
 
 function getActiveGroundZAtLatLon(lat, lon) {
@@ -1254,7 +1256,8 @@ function updateVirtualGlobeCamera(anchorImg) {
   }
 
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
-  const markerKey = `${mx.toFixed(3)},${my.toFixed(3)},${src.viewDirection},${src.width},${src.name}`;
+  const Z = getActiveGroundZ();
+  const markerKey = `${mx.toFixed(2)},${my.toFixed(2)},${Z.toFixed(2)},${src.viewDirection},${src.width},${src.name}`;
   const now = performance.now();
   if (virtualGlobeImg && globePoseLastTs && (now - globePoseLastTs) < 6 &&
       globePoseMarkerKey === markerKey) {
@@ -2912,7 +2915,9 @@ function computeOrthoLayoutGlobeMetric(virt) {
   ) / 20 * disp;
   if (!(targetS > 1e-6)) return null;
 
-  if (!(orthoGlobeLockedScale > 0) || Math.abs(orthoGlobeLockedScale - targetS) / targetS > 0.12) {
+  // Lock metres→layout scale until zoom resets it. Retargeting when the virt camera
+  // FOV changes (image swap / DGM Z) rebuilt the pad at a new s and made ortho swim.
+  if (!(orthoGlobeLockedScale > 0)) {
     orthoGlobeLockedScale = targetS;
   }
   const s = orthoGlobeLockedScale;
@@ -3222,7 +3227,9 @@ function refreshOrthoUnderlayLive() {
   }
   const el = document.getElementById('orthoUnderlay');
   if (!el) return;
-  if (globeModeEnabled) updateVirtualGlobeCamera();
+  // When ⊕ Zoom-to-marker is on, syncOverlayLayersToMarker owns virt + ortho H.
+  // Do not recompute virt here — it desynced the basemap from the photo stack.
+  if (!zoomToMarker && globeModeEnabled) updateVirtualGlobeCamera();
 
   if (globeModeEnabled && el._orthoGlobeMetric &&
       Number.isFinite(el._orthoOriginX) && Number.isFinite(el._orthoOriginY) &&
@@ -3238,7 +3245,9 @@ function refreshOrthoUnderlayLive() {
     }
   }
 
-  const cam = getDisplayCameraImg() || currentImage;
+  const cam = (zoomToMarker && virtualGlobeImg)
+    ? virtualGlobeImg
+    : (getDisplayCameraImg() || currentImage);
   const layout = computeOrthoLayout(cam, globeModeEnabled ? 0 : currentRotDeg, currentContentW, currentContentH);
   if (!layout) return;
   applyOrthoLayoutToUnderlay(el, layout);
@@ -4377,8 +4386,9 @@ function syncOverlayLayersToMarker() {
   const viewW = area.clientWidth || 800;
   const viewH = area.clientHeight || 600;
   const layers = Array.from(area.children);
+  // Same horizontal Z for oblique + ortho warps. A tilted DGM plane improved photo↔photo
+  // slope fit but made the nadir basemap swim under the stack (ortho is already horizontal).
   const Z = getActiveGroundZ();
-  const groundPlane = getLocalGroundPlane();
 
   const incoming = currentImage;
   if (!incoming) return;
@@ -4449,7 +4459,7 @@ function syncOverlayLayersToMarker() {
       if (!reprojectCam?.pToImage) return;
       const baseFitDisp = Math.min(viewW / reprojectCam.width, viewH / reprojectCam.height);
       const vScale = baseFitDisp * viewerZoom;
-      const Hvp = homographyLayerPadToGlobeViewport(img, reprojectCam, groundPlane, scale, vScale, viewW, viewH);
+      const Hvp = homographyLayerPadToGlobeViewport(img, reprojectCam, Z, scale, vScale, viewW, viewH);
       layer.style.transformOrigin = '0 0';
       let inner = null;
       if (Hvp) {
@@ -4507,17 +4517,18 @@ function syncOverlayLayersToMarker() {
   if (zoomRescaleHold) {
     applyZoomRescaleHold();
   } else {
-    syncOrthoUnderlayTransform();
+    // Same virt as the oblique stack (virtOut already stored in virtualGlobeImg).
+    syncOrthoUnderlayTransform(virtualGlobeImg);
   }
   // Do not updateOverlayBlur() here — rewriting filter/z-index every pointer move made layers jump.
 }
 
 /**
  * Centre the ortho underlay on the viewport.
- * Globe metric mode: one local-patch homography from the north-up ground plane → virt view
- * (same conditioning trick as the oblique layers). Classic: pan + optional Jacobian morph.
+ * Globe metric mode: one local-patch homography from the north-up ground plane → virt view.
+ * Uses the *same* horizontal marker Z as the oblique stack so the basemap cannot drift.
  */
-function syncOrthoUnderlayTransform() {
+function syncOrthoUnderlayTransform(virtOpt) {
   const area = document.getElementById('viewerArea');
   const orthoUnderlay = document.getElementById('orthoUnderlay');
   if (!area || !orthoUnderlay) return;
@@ -4525,8 +4536,11 @@ function syncOrthoUnderlayTransform() {
   const viewH = area.clientHeight || 600;
 
   if (globeModeEnabled && orthoUnderlay._orthoGlobeMetric) {
-    updateVirtualGlobeCamera();
-    const virt = virtualGlobeImg || currentImage;
+    // Prefer the virt camera already chosen by syncOverlayLayersToMarker.
+    const virt = virtOpt
+      || virtualGlobeImg
+      || (globeModeEnabled ? updateVirtualGlobeCamera(transitionOutgoingMain || currentImage) : null)
+      || currentImage;
     const s = orthoUnderlay._orthoMetricScale;
     const minLeft = orthoUnderlay._orthoMinLeft;
     const minTop = orthoUnderlay._orthoMinTop;
@@ -4540,7 +4554,7 @@ function syncOrthoUnderlayTransform() {
       return;
     }
 
-    const groundPlane = getLocalGroundPlane();
+    const Zmark = getActiveGroundZ();
     const originX = orthoUnderlay._orthoOriginX;
     const originY = orthoUnderlay._orthoOriginY;
     if (!Number.isFinite(originX) || !Number.isFinite(originY)) {
@@ -4553,7 +4567,7 @@ function syncOrthoUnderlayTransform() {
     const baseFit = Math.min(viewW / virt.width, viewH / virt.height);
     const vScale = baseFit * viewerZoom;
     const Hvp = homographyOrthoMetricToGlobeViewport(
-      virt, groundPlane, s, originX, originY, minLeft, minTop, vScale, viewW, viewH,
+      virt, Zmark, s, originX, originY, minLeft, minTop, vScale, viewW, viewH,
     );
     orthoUnderlay.style.transformOrigin = '0 0';
     if (Hvp) {
