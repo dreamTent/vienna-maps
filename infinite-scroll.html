@@ -451,7 +451,7 @@
              style="width:46px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.73rem;padding:2px 5px;"
              oninput="onOverlayBlurChange()">
       <span id="overlayBlurUnit" style="font-size:.73rem;color:var(--text-dim);opacity:.4">px/layer</span>
-      <label class="filter-label" title="Off: per-camera pan offset only. On: back layers are warped with a perspective homography from a local DGM ground plane (4 samples around the marker → tilted plane) into the active view. Still one plane — not a full DEM mesh.">
+      <label class="filter-label" title="Off: per-camera pan offset only. On: back layers are warped so each image’s corners sit on consensus ground height (DGM + overlapping images’ terrain planes at that point), then into the active view.">
         <input type="checkbox" id="overlayStretchToMainCb" disabled onchange="onOverlayReprojectChange()">
         Reproject to main
       </label>
@@ -688,9 +688,7 @@ function getManualHeightOffset() {
 }
 
 /**
- * Model Z at (X,Y): use *absolute* DGM elevation (+ slider Δ).
- * Relative-to-marker Z≈0 looked wrong empirically — entering the absolute DGM
- * value (e.g. 45) is what stops ground shift when the main image swaps.
+ * Model Z at (X,Y): absolute DGM elevation (+ slider Δ).
  */
 function modelZAtMgi(X, Y) {
   const off = getManualHeightOffset();
@@ -700,15 +698,13 @@ function modelZAtMgi(X, Y) {
   return z + off;
 }
 
-/** Model Z at the search marker: absolute DGM + Δ (or slider alone if no DGM).
- *  Quantized to 0.25 m so tiny DGM/sample noise does not jitter virt pose + warps. */
+/** Model Z at the search marker: absolute DGM + Δ (or slider alone if no DGM). */
 function getActiveGroundZ() {
   const off = getManualHeightOffset();
   if (!dgmReady) return off;
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
   const z = sampleDgmZ(mx, my);
-  if (z == null) return off;
-  return Math.round((z + off) * 4) / 4;
+  return z == null ? off : z + off;
 }
 
 function getActiveGroundZAtLatLon(lat, lon) {
@@ -716,14 +712,156 @@ function getActiveGroundZAtLatLon(lat, lon) {
   return modelZAtMgi(X, Y);
 }
 
+/** Bump when Δ/DGM changes so per-image terrain corner caches refresh. */
+let _terrainCacheGen = 0;
+
 /**
- * Shared local tilted plane Z = aX + bY + c from 4 absolute DGM samples around the marker.
- * Used for all stitch/reproject homographies so layers share one terrain slice.
+ * Images that may overlap the current view — used to consensus-average ground Z.
+ */
+function getOverlapHeightCandidates() {
+  const seen = new Set();
+  const out = [];
+  const add = (img) => {
+    if (!img?.name || !img.pToImage || seen.has(img.name)) return;
+    seen.add(img.name);
+    out.push(img);
+  };
+  add(currentImage);
+  add(transitionOutgoingMain);
+  const results = searchResults || [];
+  for (let i = 0; i < results.length && out.length < 24; i++) add(results[i]);
+  const area = document.getElementById('viewerArea');
+  if (area) {
+    for (const el of area.children) {
+      if (out.length >= 32) break;
+      if (el._overlayImage) add(el._overlayImage);
+    }
+  }
+  return out;
+}
+
+/**
+ * Per-image terrain plane Z=aX+bY+c from footprint corners + look-at (DGM sampled).
+ * Used so overlapping photos can vote on height at a shared ground point.
+ */
+function ensureImageTerrainPlane(img) {
+  if (!img) return null;
+  if (img._terrainPlaneGen === _terrainCacheGen && img._terrainPlane) return img._terrainPlane;
+  const pts = [];
+  const ring = img.footprintMgi;
+  if (ring && ring.length >= 3) {
+    for (const p of ring) {
+      const z = modelZAtMgi(p[0], p[1]);
+      if (Number.isFinite(z)) pts.push([p[0], p[1], z]);
+    }
+  }
+  if (img.lookAtMgi) {
+    const z = modelZAtMgi(img.lookAtMgi[0], img.lookAtMgi[1]);
+    if (Number.isFinite(z)) pts.push([img.lookAtMgi[0], img.lookAtMgi[1], z]);
+  }
+  let plane = fitGroundPlaneLS(pts);
+  if (!plane) plane = { a: 0, b: 0, c: getActiveGroundZ() };
+  img._terrainPlane = plane;
+  img._terrainPlaneGen = _terrainCacheGen;
+  return plane;
+}
+
+/**
+ * Ground height at (X,Y): DGM plus planes of overlapping images that cover this point.
+ * Keeps stacked photos from floating when their footprints share terrain.
+ */
+function consensusZAtMgi(X, Y) {
+  const off = getManualHeightOffset();
+  let sum = 0;
+  let w = 0;
+  const zDgm = dgmReady ? sampleDgmZ(X, Y) : null;
+  if (zDgm != null) {
+    sum += 2.5 * (zDgm + off);
+    w += 2.5;
+  }
+  for (const img of getOverlapHeightCandidates()) {
+    const ring = img.footprintMgi;
+    if (!ring || ring.length < 3) continue;
+    if (!pointInPolygon2D(X, Y, ring)) continue;
+    const pl = ensureImageTerrainPlane(img);
+    if (!pl) continue;
+    const zImg = pl.a * X + pl.b * Y + pl.c;
+    if (!Number.isFinite(zImg)) continue;
+    sum += zImg;
+    w += 1;
+  }
+  if (w < 1e-6) return getActiveGroundZ();
+  return sum / w;
+}
+
+/**
+ * Ray from image pixel → terrain: iterate horizontal-plane hits with consensus Z.
+ * Returns [X, Y, Z] or null.
+ */
+function rayHitTerrain(img, px, py) {
+  if (!img?.pToImage) return null;
+  let Z = getActiveGroundZ();
+  let X = 0;
+  let Y = 0;
+  for (let i = 0; i < 5; i++) {
+    const g = pixelToGroundMgi(img, px, py, Z);
+    if (!g) return null;
+    X = g[0];
+    Y = g[1];
+    const zNew = consensusZAtMgi(X, Y);
+    if (!Number.isFinite(zNew)) return [X, Y, Z];
+    if (Math.abs(zNew - Z) < 0.08) {
+      Z = zNew;
+      break;
+    }
+    Z = zNew;
+  }
+  return [X, Y, Z];
+}
+
+/**
+ * Four terrain hits for image corners (pull toward centre if a corner is above the horizon).
+ * Cached per image until DGM/Δ generation changes.
+ */
+function ensureTerrainCornerHits(img) {
+  if (!img?.pToImage) return null;
+  if (img._terrainHitsGen === _terrainCacheGen && img._terrainHits?.length === 4) {
+    return img._terrainHits;
+  }
+  const W = img.width;
+  const H = img.height;
+  const seeds = [[0, 0], [W, 0], [W, H], [0, H]];
+  const hits = [];
+  for (const [sx, sy] of seeds) {
+    let px = sx;
+    let py = sy;
+    let hit = null;
+    for (let k = 0; k < 10; k++) {
+      hit = rayHitTerrain(img, px, py);
+      if (hit) break;
+      px = px * 0.65 + (W * 0.5) * 0.35;
+      py = py * 0.65 + (H * 0.5) * 0.35;
+    }
+    if (!hit) {
+      img._terrainHits = null;
+      img._terrainHitsGen = _terrainCacheGen;
+      return null;
+    }
+    hits.push({ px, py, X: hit[0], Y: hit[1], Z: hit[2] });
+  }
+  img._terrainHits = hits;
+  img._terrainHitsGen = _terrainCacheGen;
+  return hits;
+}
+
+/**
+ * Shared local tilted plane from consensus DGM (+ overlap) samples around the marker.
+ * Fallback when corner hits fail; also used for ortho-stable horizontal-ish blends.
  */
 function getLocalGroundPlane() {
   const zMark = getActiveGroundZ();
   const off = getManualHeightOffset();
-  const key = `${searchLat.toFixed(6)},${searchLon.toFixed(6)},${off},${dgmReady ? 1 : 0}`;
+  const key = `${searchLat.toFixed(6)},${searchLon.toFixed(6)},${off},${dgmReady ? 1 : 0},${_terrainCacheGen}`;
   if (key === _groundPlaneCacheKey && _groundPlaneCache) return _groundPlaneCache;
 
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
@@ -736,9 +874,8 @@ function getLocalGroundPlane() {
   ];
   const pts = [];
   for (const [x, y] of corners) {
-    pts.push([x, y, modelZAtMgi(x, y)]);
+    pts.push([x, y, consensusZAtMgi(x, y)]);
   }
-  // Pin plane to effective marker Z.
   pts.push([mx, my, zMark]);
 
   let plane = fitGroundPlaneLS(pts);
@@ -800,11 +937,18 @@ function syncDgmZLabel() {
 function invalidateGroundPlaneCache() {
   _groundPlaneCacheKey = '';
   _groundPlaneCache = null;
+  _terrainCacheGen++;
 }
 
-/** Call after searchLat/Lon change so DGM plane + label stay in sync. */
+/** Soft invalidate: marker moved — shared patch plane changes, corner hits stay. */
+function invalidateLocalGroundPlaneOnly() {
+  _groundPlaneCacheKey = '';
+  _groundPlaneCache = null;
+}
+
+/** Call after searchLat/Lon change so DGM label stays in sync. */
 function noteSearchPositionChanged() {
-  invalidateGroundPlaneCache();
+  invalidateLocalGroundPlaneOnly();
   syncDgmZLabel();
 }
 
@@ -1149,7 +1293,7 @@ const GLOBE_SIGMA_M = 280;
 const GLOBE_PATCH_M = 160;
 /** Ortho metric plane: snap origin & rebuild tiles only after moving this far. */
 const ORTHO_ORIGIN_SNAP_M = 40;
-const ORTHO_REBUILD_DIST_M = 100;
+const ORTHO_REBUILD_DIST_M = 220;
 let orthoGlobeLockedScale = null;
 let orthoGlobeLockedZoom = null;
 
@@ -1163,6 +1307,8 @@ function ensureCameraExtras(img) {
 function noteOutgoingMainBeforeSwitch(nextImg) {
   if (currentImage && nextImg && currentImage.name !== nextImg.name) {
     transitionOutgoingMain = currentImage;
+    // Visible overlap set changes with the main photo.
+    _terrainCacheGen++;
   }
 }
 
@@ -1257,7 +1403,8 @@ function updateVirtualGlobeCamera(anchorImg) {
 
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
   const Z = getActiveGroundZ();
-  const markerKey = `${mx.toFixed(2)},${my.toFixed(2)},${Z.toFixed(2)},${src.viewDirection},${src.width},${src.name}`;
+  // Fine key — coarse toFixed(2) held the virt pose then snapped (looked like low-precision stutter).
+  const markerKey = `${mx.toFixed(4)},${my.toFixed(4)},${Z.toFixed(3)},${src.viewDirection},${src.width},${src.name}`;
   const now = performance.now();
   if (virtualGlobeImg && globePoseLastTs && (now - globePoseLastTs) < 6 &&
       globePoseMarkerKey === markerKey) {
@@ -1329,9 +1476,9 @@ function normalizeHomography3(H) {
 }
 
 /**
- * Analytical plane-induced homography: layer pad → viewport via virt camera.
- * planeOrZ may be a tilted local DGM plane {a,b,c}. No 4-point DLT — that
- * refit every frame was the main/reprojected stutter.
+ * Layer pad → viewport via virt camera, warping each image corner onto consensus
+ * terrain height (DGM + overlapping images’ planes at that ground point).
+ * Falls back to a shared flat/tilted plane if corner rays fail.
  */
 function homographyLayerPadToGlobeViewport(img, virt, planeOrZ, scale, vScale, viewW, viewH) {
   if (!img?.pToImage || !virt?.pToImage || !(scale > 0) || !(vScale > 0)) return null;
@@ -1339,20 +1486,39 @@ function homographyLayerPadToGlobeViewport(img, virt, planeOrZ, scale, vScale, v
   const markerVirt = projectToPixel(virt, searchLat, searchLon, Zmark);
   if (!markerVirt) return null;
 
-  const M_layer = planeMapMgiToImage(img.pToImage, planeOrZ);
-  const M_virt = planeMapMgiToImage(virt.pToImage, planeOrZ);
+  const hits = ensureTerrainCornerHits(img);
+  if (hits && hits.length === 4) {
+    const src = [];
+    const dst = [];
+    for (const h of hits) {
+      const m = groundMgiToPixel(virt, h.X, h.Y, h.Z);
+      if (!m) break;
+      src.push([h.px * scale, h.py * scale]);
+      dst.push([
+        viewW / 2 + (m[0] - markerVirt[0]) * vScale,
+        viewH / 2 + (m[1] - markerVirt[1]) * vScale,
+      ]);
+    }
+    if (src.length === 4) {
+      const H = homographyFrom4Points2D(src, dst);
+      if (H) return H;
+    }
+  }
+
+  // Fallback: shared plane (marker patch / caller-provided).
+  const plane = (planeOrZ != null && typeof planeOrZ === 'object')
+    ? planeOrZ
+    : (getLocalGroundPlane() || Zmark);
+  const M_layer = planeMapMgiToImage(img.pToImage, plane);
+  const M_virt = planeMapMgiToImage(virt.pToImage, plane);
   const invLayer = invert3x3(M_layer);
   if (!invLayer) return null;
-
-  // layer native → virt homogeneous
   const H_nv = multiply3x3(M_virt, invLayer);
-  // pad → native
   const S_pad_to_native = [
     [1 / scale, 0, 0],
     [0, 1 / scale, 0],
     [0, 0, 1],
   ];
-  // virt homogeneous → centred viewport (works before /w)
   const cx = viewW / 2 - markerVirt[0] * vScale;
   const cy = viewH / 2 - markerVirt[1] * vScale;
   const S_virt_to_vp = [
@@ -1363,20 +1529,20 @@ function homographyLayerPadToGlobeViewport(img, virt, planeOrZ, scale, vScale, v
   return normalizeHomography3(multiply3x3(S_virt_to_vp, multiply3x3(H_nv, S_pad_to_native)));
 }
 
-/** Analytical: ortho metric-local pad → globe viewport (same ground plane). */
+/** Analytical: ortho metric-local pad → globe viewport (horizontal Z — ortho is nadir-rectified). */
 function homographyOrthoMetricToGlobeViewport(virt, planeOrZ, s, originX, originY, minLeft, minTop, vScale, viewW, viewH) {
   if (!virt?.pToImage || !(s > 0) || !(vScale > 0)) return null;
   const Zmark = getActiveGroundZ();
   const markerVirt = projectToPixel(virt, searchLat, searchLon, Zmark);
   if (!markerVirt) return null;
 
-  // local (x_l,y_l) → MGI (X,Y): x_l = s(X-ox)-minLeft, y_l = s(oy-Y)-minTop
   const M_local_to_mgi = [
     [1 / s, 0, minLeft / s + originX],
     [0, -1 / s, originY - minTop / s],
     [0, 0, 1],
   ];
-  const M_virt = planeMapMgiToImage(virt.pToImage, planeOrZ);
+  // Keep ortho on horizontal marker Z (stable); photos use corner terrain warps separately.
+  const M_virt = planeMapMgiToImage(virt.pToImage, Zmark);
   const cx = viewW / 2 - markerVirt[0] * vScale;
   const cy = viewH / 2 - markerVirt[1] * vScale;
   const S_virt_to_vp = [
@@ -1515,19 +1681,34 @@ function homographyFrom4Points2D(srcPts, dstPts) {
 }
 
 /**
- * Two perspective views of the same ground plane are related by a plane homography.
- * planeOrZ may be a local DGM tilted plane — still one planar slice (CSS matrix3d limit).
+ * Native layer → native main using terrain corner hits (consensus Z per corner).
  */
 function homographyLayerNativeToMainNative(imgLayer, imgMain, planeOrZ) {
+  const hits = ensureTerrainCornerHits(imgLayer);
+  if (hits && hits.length === 4) {
+    const src = [];
+    const dst = [];
+    for (const h of hits) {
+      const m = groundMgiToPixel(imgMain, h.X, h.Y, h.Z);
+      if (!m) break;
+      src.push([h.px, h.py]);
+      dst.push([m[0], m[1]]);
+    }
+    if (src.length === 4) {
+      const H = homographyFrom4Points2D(src, dst);
+      if (H) return H;
+    }
+  }
+  const plane = planeOrZ != null ? planeOrZ : (getLocalGroundPlane() || getActiveGroundZ());
   const W = imgLayer.width, H = imgLayer.height;
   const corners = [[0, 0], [W, 0], [W, H], [0, H]];
   const src = [];
   const dst = [];
   for (let i = 0; i < 4; i++) {
     const px = corners[i][0], py = corners[i][1];
-    const g = pixelToGroundMgi(imgLayer, px, py, planeOrZ);
+    const g = pixelToGroundMgi(imgLayer, px, py, plane);
     if (!g) return null;
-    const m = groundMgiToPixel(imgMain, g[0], g[1], planeOrZ);
+    const m = groundMgiToPixel(imgMain, g[0], g[1], plane);
     if (!m) return null;
     src.push([px, py]);
     dst.push([m[0], m[1]]);
@@ -1792,7 +1973,9 @@ function doSearch(opts) {
 
   document.getElementById('resultsHeader').style.display = 'flex';
   applySort();   // applySort sets resultCount (supports "X / Y" when filtered)
-  // Moving/searching only preloads neighbors — visible layers swap on main-image change.
+  // Overlap set used for terrain consensus — refresh caches on explicit search, not every drag silent search.
+  if (!silent) _terrainCacheGen++;
+  // Moving/searching only preloads neighbors — visible layers only swap on main-image change.
   if (overlayEnabled && document.getElementById('overlayStretchToMainCb')?.checked && overlayNeighborCount > 0 && currentImage) {
     schedulePreloadNeighborTiles();
   }
@@ -3210,14 +3393,29 @@ function applyOrthoLayoutToUnderlay(el, layout) {
   el._orthoOriginX = layout.originX;
   el._orthoOriginY = layout.originY;
   applyOrthoTileSpecsToContainer(el, layout);
-  el.style.cssText =
-    `position:absolute;left:0;top:0;width:${layout.unionW}px;height:${layout.unionH}px;`
-    + 'z-index:0;pointer-events:none;will-change:transform;filter:saturate(0.88) brightness(0.92);';
+  // Preserve transform — assigning cssText cleared matrix3d and caused a one-frame
+  // identity pop (“move then snap back”) before syncOrthoUnderlayTransform ran.
+  const keepTx = el.style.transform;
+  const keepOrigin = el.style.transformOrigin;
+  el.style.position = 'absolute';
+  el.style.left = '0';
+  el.style.top = '0';
+  el.style.width = `${layout.unionW}px`;
+  el.style.height = `${layout.unionH}px`;
+  el.style.zIndex = '0';
+  el.style.pointerEvents = 'none';
+  el.style.willChange = 'transform';
+  el.style.filter = 'saturate(0.88) brightness(0.92)';
+  if (keepTx) {
+    el.style.transform = keepTx;
+    el.style.transformOrigin = keepOrigin || '0 0';
+  }
 }
 
 /**
  * Recompute ortho geometry after marker / auto-rotate moves without a full renderTiles (overlay mode).
- * Globe metric: skip tile rebuild while inside the origin cell — only marker coords change.
+ * Globe + ⊕ Zoom-to-marker: do not rebuild tiles here — syncOverlayLayersToMarker owns the warp.
+ * Rebuilding mid-pan cleared/replaced layout while the old H was still applied → stutter/snap.
  */
 function refreshOrthoUnderlayLive() {
   if (!currentImage) return;
@@ -3227,9 +3425,21 @@ function refreshOrthoUnderlayLive() {
   }
   const el = document.getElementById('orthoUnderlay');
   if (!el) return;
-  // When ⊕ Zoom-to-marker is on, syncOverlayLayersToMarker owns virt + ortho H.
-  // Do not recompute virt here — it desynced the basemap from the photo stack.
-  if (!zoomToMarker && globeModeEnabled) updateVirtualGlobeCamera();
+
+  // Marker-centred globe stack: only update the container H via syncOverlayLayersToMarker.
+  // Tile/origin rebuilds happen in maybeRebuildOrthoGlobeLayout() (idle / far from origin).
+  if (zoomToMarker && globeModeEnabled && el._orthoGlobeMetric) {
+    if (Number.isFinite(el._orthoOriginX) && Number.isFinite(el._orthoOriginY) &&
+        el._orthoMetricScale > 0) {
+      const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+      const s = el._orthoMetricScale;
+      el._orthoMarkerX = (mx - el._orthoOriginX) * s - el._orthoMinLeft;
+      el._orthoMarkerY = (el._orthoOriginY - my) * s - el._orthoMinTop;
+    }
+    return;
+  }
+
+  if (globeModeEnabled) updateVirtualGlobeCamera();
 
   if (globeModeEnabled && el._orthoGlobeMetric &&
       Number.isFinite(el._orthoOriginX) && Number.isFinite(el._orthoOriginY) &&
@@ -3240,18 +3450,33 @@ function refreshOrthoUnderlayLive() {
       const s = el._orthoMetricScale;
       el._orthoMarkerX = (mx - el._orthoOriginX) * s - el._orthoMinLeft;
       el._orthoMarkerY = (el._orthoOriginY - my) * s - el._orthoMinTop;
-      if (!zoomToMarker) syncOrthoUnderlayTransform();
+      syncOrthoUnderlayTransform();
       return;
     }
   }
 
-  const cam = (zoomToMarker && virtualGlobeImg)
-    ? virtualGlobeImg
-    : (getDisplayCameraImg() || currentImage);
+  const cam = getDisplayCameraImg() || currentImage;
   const layout = computeOrthoLayout(cam, globeModeEnabled ? 0 : currentRotDeg, currentContentW, currentContentH);
   if (!layout) return;
   applyOrthoLayoutToUnderlay(el, layout);
-  if (!zoomToMarker) syncOrthoUnderlayTransform();
+  syncOrthoUnderlayTransform(virtualGlobeImg || cam);
+}
+
+/** Rebuild globe ortho tiles when the marker has left the locked origin cell (not while dragging). */
+function maybeRebuildOrthoGlobeLayout() {
+  if (!globeModeEnabled || !zoomToMarker || isDragging) return;
+  const el = document.getElementById('orthoUnderlay');
+  if (!el?._orthoGlobeMetric) return;
+  if (!(el._orthoMetricScale > 0) || !Number.isFinite(el._orthoOriginX)) return;
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const dist = Math.hypot(mx - el._orthoOriginX, my - el._orthoOriginY);
+  if (dist < ORTHO_REBUILD_DIST_M && orthoGlobeLockedZoom === viewerZoom) return;
+
+  const cam = virtualGlobeImg || getDisplayCameraImg() || currentImage;
+  const layout = computeOrthoLayout(cam, 0, currentContentW, currentContentH);
+  if (!layout) return;
+  applyOrthoLayoutToUnderlay(el, layout);
+  syncOrthoUnderlayTransform(cam);
 }
 
 /** Single-image mode: same live ortho update as overlay (marker drag without renderTiles). */
@@ -4386,8 +4611,7 @@ function syncOverlayLayersToMarker() {
   const viewW = area.clientWidth || 800;
   const viewH = area.clientHeight || 600;
   const layers = Array.from(area.children);
-  // Same horizontal Z for oblique + ortho warps. A tilted DGM plane improved photo↔photo
-  // slope fit but made the nadir basemap swim under the stack (ortho is already horizontal).
+  // Marker Z for centring; photo warps use per-corner consensus terrain heights.
   const Z = getActiveGroundZ();
 
   const incoming = currentImage;
@@ -4519,6 +4743,7 @@ function syncOverlayLayersToMarker() {
   } else {
     // Same virt as the oblique stack (virtOut already stored in virtualGlobeImg).
     syncOrthoUnderlayTransform(virtualGlobeImg);
+    maybeRebuildOrthoGlobeLayout();
   }
   // Do not updateOverlayBlur() here — rewriting filter/z-index every pointer move made layers jump.
 }
@@ -5437,10 +5662,17 @@ function applyDrag(clientX, clientY) {
   if (globeModeEnabled) {
     const Z = getActiveGroundZ();
     updateVirtualGlobeCamera();
-    const invJ = computeInvJacobian(getDisplayCameraImg() || currentImage, searchLat, searchLon, Z);
-    if (!invJ) return;
-    const ddxImg = -(clientX - dragLastCX) / (currentDispScale || 1);
-    const ddyImg = -(clientY - dragLastCY) / (currentDispScale || 1);
+    const virt = getDisplayCameraImg() || currentImage;
+    const invJ = computeInvJacobian(virt, searchLat, searchLon, Z);
+    if (!invJ || !virt) return;
+    const area = document.getElementById('viewerArea');
+    const viewW = area?.clientWidth || 800;
+    const viewH = area?.clientHeight || 600;
+    // Must match syncOverlayLayersToMarker / ortho vScale — currentDispScale drift
+    // made slow pans feel like a move-then-snap rubber band.
+    const vScale = Math.min(viewW / virt.width, viewH / virt.height) * viewerZoom;
+    const ddxImg = -(clientX - dragLastCX) / (vScale || 1);
+    const ddyImg = -(clientY - dragLastCY) / (vScale || 1);
     dragLastCX = clientX;
     dragLastCY = clientY;
     if (Math.abs(ddxImg) < 1e-9 && Math.abs(ddyImg) < 1e-9) return;
@@ -5478,6 +5710,7 @@ function endDrag() {
   dragInvJ   = null;
   viewerAreaEl.style.cursor = 'grab';
   if (document.getElementById('autoSwitchWhileMovingCb')?.checked === false) scheduleAutoSwitch();
+  maybeRebuildOrthoGlobeLayout();
 }
 
 viewerAreaEl.addEventListener('mousedown', e => {
