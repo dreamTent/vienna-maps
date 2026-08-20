@@ -408,15 +408,25 @@
         <button class="vzoom-btn" onclick="changeViewZoom(+1)">+</button>
       </div>
       <!-- height: with DGM, model Z = absolute terrain height (+ optional Δ). Absolute Z is what keeps stitches stable across image swaps. -->
-      <div class="height-ctrl" title="With DGM loaded: model Z = DGM height at the marker + Δ. Stitching uses a local tilted plane from 4 DGM samples around the marker. Without DGM, the number is absolute model Z.">
+      <div class="height-ctrl"
+           title="Ground elevation (model Z) for marker projection, globe look-at, and flat-plane fallbacks. With Heightmap on: live DGM height at the marker + slider Δ (shown as DGM±Δ→effective). With Heightmap off (or no DGM loaded): the slider alone is absolute model Z. Separate from per-image corner terrain used for warps — see Heightmap.">
         <span>Z:</span>
-        <span id="dgmZLabel" style="font-variant-numeric:tabular-nums;color:var(--accent2);display:none" title="Effective model Z at marker (DGM + Δ)"></span>
-        <span id="heightDeltaLabel" style="color:var(--text-dim);display:none">Δ</span>
+        <span id="dgmZLabel" style="font-variant-numeric:tabular-nums;color:var(--accent2);display:none"
+              title="Live DGM sample at the current marker. Format DGM±Δ→Z means heightmap elevation, plus slider offset Δ, equals effective model Z used for the marker / globe look-at / shared local plane. Updates as you move. Not the four cached corner heights used to warp each photo."></span>
+        <span id="heightDeltaLabel" style="color:var(--text-dim);display:none"
+              title="Δ = manual offset (m) added to the live DGM sample at the marker. Controlled by the slider/number.">Δ</span>
         <input type="range" id="heightSlider" min="-100" max="400" step="1" value="0"
+               title="Manual Δ (m). With Heightmap on: added to live DGM at the marker. With Heightmap off: absolute flat model Z."
                oninput="document.getElementById('heightNum').value=this.value; onHeightChange()">
         <input type="number" id="heightNum" value="0" min="-100" max="400"
+               title="Manual Δ (m). With Heightmap on: added to live DGM at the marker. With Heightmap off: absolute flat model Z."
                oninput="document.getElementById('heightSlider').value=this.value; onHeightChange()">
         <span>m</span>
+        <label class="filter-label" style="margin-left:2px"
+               title="DGM heightmap (applies with Globe on or off). On: (1) live Z at the marker for projection, globe look-at, and a shared local tilted plane around the marker; (2) cached per-image terrain — four corner ground hits per photo (main + each reprojected/overlay layer) used to warp layers onto uneven ground; corner caches stay fixed while panning and refresh mainly on main-image / Δ / search changes. Off: ignore DGM entirely; use flat Z from the slider only for both roles.">
+          <input type="checkbox" id="heightmapCb" checked onchange="onHeightmapToggle()">
+          Heightmap
+        </label>
       </div>
       <button class="btn-sm" id="markerToggleBtn"  onclick="toggleMarker()">● Marker</button>
       <button class="btn-sm" id="zoomMarkerBtn"   onclick="toggleZoomToMarker()">⊕ Zoom to</button>
@@ -479,6 +489,11 @@
       <label class="filter-label" title="When off, auto-switch runs after you release keys or finish dragging (not every frame).">
         <input type="checkbox" id="autoSwitchWhileMovingCb" checked>
         Switch while moving
+      </label>
+      <label class="filter-label"
+             title="Fade between main images (and ease foreshortening when Globe is off). Off = instant swap. Default on.">
+        <input type="checkbox" id="imageCrossfadeCb" checked onchange="onImageCrossfadeChange()">
+        Smooth switch
       </label>
       <button class="btn-sm" id="autoRotateBtn" onclick="toggleAutoRotate()" style="opacity:.5"
               title="Rotate the image so the ground marker sits on the vertical centre line">↻ Rotate to marker</button>
@@ -629,8 +644,20 @@ let wgs84ToMgi = proj4('EPSG:4326', 'MGI');
 let dgmMeta = null;
 let dgmGrid = null; // Int16Array, decimetres
 let dgmReady = false;
+/** When false, ignore loaded DGM and use flat Z from the slider (globe + non-globe). */
+let heightmapEnabled = true;
 let _groundPlaneCacheKey = '';
 let _groundPlaneCache = null;
+
+/** True when the heightmap is loaded and the Heightmap toggle is on. */
+function heightmapActive() {
+  return dgmReady && heightmapEnabled;
+}
+
+function onHeightmapToggle() {
+  heightmapEnabled = !!document.getElementById('heightmapCb')?.checked;
+  onHeightChange();
+}
 
 async function loadGroundHeightmap() {
   try {
@@ -692,7 +719,7 @@ function getManualHeightOffset() {
  */
 function modelZAtMgi(X, Y) {
   const off = getManualHeightOffset();
-  if (!dgmReady) return off;
+  if (!heightmapActive()) return off;
   const z = sampleDgmZ(X, Y);
   if (z == null) return getActiveGroundZ();
   return z + off;
@@ -701,7 +728,7 @@ function modelZAtMgi(X, Y) {
 /** Model Z at the search marker: absolute DGM + Δ (or slider alone if no DGM). */
 function getActiveGroundZ() {
   const off = getManualHeightOffset();
-  if (!dgmReady) return off;
+  if (!heightmapActive()) return off;
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
   const z = sampleDgmZ(mx, my);
   return z == null ? off : z + off;
@@ -774,7 +801,7 @@ function consensusZAtMgi(X, Y) {
   const off = getManualHeightOffset();
   let sum = 0;
   let w = 0;
-  const zDgm = dgmReady ? sampleDgmZ(X, Y) : null;
+  const zDgm = heightmapActive() ? sampleDgmZ(X, Y) : null;
   if (zDgm != null) {
     sum += 2.5 * (zDgm + off);
     w += 2.5;
@@ -861,7 +888,7 @@ function ensureTerrainCornerHits(img) {
 function getLocalGroundPlane() {
   const zMark = getActiveGroundZ();
   const off = getManualHeightOffset();
-  const key = `${searchLat.toFixed(6)},${searchLon.toFixed(6)},${off},${dgmReady ? 1 : 0},${_terrainCacheGen}`;
+  const key = `${searchLat.toFixed(6)},${searchLon.toFixed(6)},${off},${heightmapActive() ? 1 : 0},${_terrainCacheGen}`;
   if (key === _groundPlaneCacheKey && _groundPlaneCache) return _groundPlaneCache;
 
   const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
@@ -914,9 +941,10 @@ function syncDgmZLabel() {
   const el = document.getElementById('dgmZLabel');
   const deltaEl = document.getElementById('heightDeltaLabel');
   if (!el) return;
-  if (!dgmReady) {
+  if (!heightmapActive()) {
     el.style.display = 'none';
     el.textContent = '';
+    el.removeAttribute('title');
     if (deltaEl) deltaEl.style.display = 'none';
     return;
   }
@@ -924,6 +952,7 @@ function syncDgmZLabel() {
   const zAbs = sampleDgmZ(mx, my);
   if (zAbs == null) {
     el.style.display = 'none';
+    el.removeAttribute('title');
     if (deltaEl) deltaEl.style.display = 'none';
     return;
   }
@@ -931,6 +960,15 @@ function syncDgmZLabel() {
   const off = getManualHeightOffset();
   el.style.display = '';
   el.textContent = off === 0 ? `${zEff.toFixed(0)}` : `${zAbs.toFixed(0)}${off >= 0 ? '+' : ''}${off}→${zEff.toFixed(0)}`;
+  const tipParts = [
+    `Live DGM at marker: ${zAbs.toFixed(1)} m.`,
+    off === 0
+      ? 'Slider Δ is 0, so effective model Z equals that sample.'
+      : `Slider Δ ${off >= 0 ? '+' : ''}${off} m → effective model Z ${zEff.toFixed(1)} m.`,
+    'Used for marker projection, globe look-at, and the shared local plane around the marker (updates as you move).',
+    'Not the four cached corner ground hits used to warp each photo (main + overlays).',
+  ];
+  el.title = tipParts.join(' ');
   if (deltaEl) deltaEl.style.display = '';
 }
 
@@ -2528,6 +2566,16 @@ let imageRevealGen = 0;
 const IMAGE_CROSSFADE_MS = 220;
 /** Ground-Jacobian morph duration when switching cameras (squeeze/stretch into the new view). */
 const IMAGE_MORPH_MS = 360;
+/** Opacity crossfade + Jacobian morph on main-image switch. Default on. */
+let imageCrossfadeEnabled = true;
+
+function imageSwitchFadeMs() {
+  return imageCrossfadeEnabled ? IMAGE_CROSSFADE_MS : 0;
+}
+
+function onImageCrossfadeChange() {
+  imageCrossfadeEnabled = !!document.getElementById('imageCrossfadeCb')?.checked;
+}
 
 /**
  * CSS rotate (deg) that makes the ground-plane horizon horizontal.
@@ -2805,7 +2853,7 @@ function prepareLockedNeighborLayers(gen) {
   const neighbors = lockedNeighborImages;
   const mainName = neighborLayersMainName;
   const z = 0;
-  const fadeMs = IMAGE_CROSSFADE_MS;
+  const fadeMs = imageSwitchFadeMs();
   const waitMs = document.getElementById('waitFullTilesSwitchCb')?.checked ? 12000 : 2000;
   // Don't block mounting the whole stack on the slowest of N images — warm cache with a budget.
   const decodeBudgetMs = Math.min(waitMs, 2500);
@@ -2878,7 +2926,7 @@ function prepareLockedNeighborLayers(gen) {
           layer = buildNeighborLayerDOM(ni, z);
           layer.style.opacity = '0';
           layer.style.visibility = 'hidden'; // hide until first correct warp (avoids place-jump)
-          layer.style.transition = `opacity ${fadeMs}ms ease`;
+          layer.style.transition = fadeMs > 0 ? `opacity ${fadeMs}ms ease` : '';
           layer._neighborPendingReveal = true;
           newcomers.push(layer);
           byName.set(ni.name, layer);
@@ -2889,7 +2937,7 @@ function prepareLockedNeighborLayers(gen) {
           // Do not re-hide layers that are already visible (pending can still be set mid-crossfade).
           layer.style.opacity = '0';
           layer.style.visibility = 'hidden';
-          layer.style.transition = `opacity ${fadeMs}ms ease`;
+          layer.style.transition = fadeMs > 0 ? `opacity ${fadeMs}ms ease` : '';
           layer._neighborPendingReveal = true;
           newcomers.push(layer);
         }
@@ -2940,25 +2988,27 @@ function beginNeighborCrossfade(prep) {
     ensureLockedNeighborLayersVisible();
     return;
   }
-  const fadeMs = IMAGE_CROSSFADE_MS;
+  const fadeMs = imageSwitchFadeMs();
+  const fadeCss = fadeMs > 0 ? `opacity ${fadeMs}ms ease` : '';
+  const removeDelay = fadeMs > 0 ? fadeMs + 40 : 0;
   const { newcomers, obsolete, clearAll } = prep;
 
   if (clearAll) {
     for (const el of obsolete) {
-      el.style.transition = `opacity ${fadeMs}ms ease`;
+      el.style.transition = fadeCss;
       el.style.opacity = '0';
       const capt = el;
-      setTimeout(() => { if (capt.isConnected) capt.remove(); }, fadeMs + 40);
+      setTimeout(() => { if (capt.isConnected) capt.remove(); }, removeDelay);
     }
     syncOrthoDimMainClass();
     return;
   }
 
   for (const el of obsolete) {
-    el.style.transition = `opacity ${fadeMs}ms ease`;
+    el.style.transition = fadeCss;
     el.style.opacity = '0';
     const capt = el;
-    setTimeout(() => { if (capt.isConnected) capt.remove(); }, fadeMs + 40);
+    setTimeout(() => { if (capt.isConnected) capt.remove(); }, removeDelay);
   }
 
   // Ensure incoming neighbors are warped to the new main before they become visible.
@@ -3749,16 +3799,17 @@ function renderTiles(img, zoom) {
   // Hold new main (and later neighbors) invisible until main + reprojected set are ready.
   // Zoom rescale also remounts neighbors at the new baked scale.
   const jointNeighborReveal = overlayEnabled && (mainChanged || zoomRescale);
+  const fadeMs = imageSwitchFadeMs();
   if (hadPrev || jointNeighborReveal) {
     layer.style.opacity = '0';
     layer.style.visibility = 'hidden';
-    layer.style.transition = zoomRescale ? '' : `opacity ${IMAGE_CROSSFADE_MS}ms ease`;
+    layer.style.transition = (zoomRescale || fadeMs <= 0) ? '' : `opacity ${fadeMs}ms ease`;
     layer._overlayPendingReveal = true;
   }
   area.appendChild(layer);
 
   // Arm Jacobian morph before the first sync so the new view starts matching the old foreshortening.
-  if (hadPrev && morphFrom && !globeModeEnabled && !zoomRescale) {
+  if (hadPrev && morphFrom && !globeModeEnabled && !zoomRescale && imageCrossfadeEnabled) {
     armDisplayJacobianTransition(morphFrom);
   }
 
@@ -3870,7 +3921,9 @@ function renderTiles(img, zoom) {
       layer.style.visibility = '';
       layer.style.opacity = '1';
       if (jointNeighborReveal) beginNeighborCrossfade(neighborPrep);
-      setTimeout(finishTransition, IMAGE_CROSSFADE_MS + 40);
+      const settleMs = fadeMs > 0 ? fadeMs + 40 : 0;
+      if (settleMs > 0) setTimeout(finishTransition, settleMs);
+      else finishTransition();
     };
     if (hadPrev || jointNeighborReveal) {
       // Double rAF so opacity:0 is committed before fading in.
