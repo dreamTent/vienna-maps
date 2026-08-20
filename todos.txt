@@ -1,0 +1,7 @@
+- smooth switch while globe is off and scrolling around with the mouse instead of arrow keys when zoomed out is awfull it skips images and the transition cant keep up an. it currently also doesn't look that good when wait full tiles is turned off.
+	- potential solution, when skiping more than 2 images, do transitions to the latest image even when it isn't loaded yet
+- basemap wobbles when moving (this is separate from the changing height map offset when moving). Especially noticalbe when moving fast and zoomed out.
+- basemap breaks when some main images are selected, at some zoom levels
+- basemap undershoots when switching between main images when globe mode is deactivated and smooth switch is active
+- mobile compatability
+- better layering of overlay images and dedecision making to stop small patches from being covered by images that shouldnt cover those areas

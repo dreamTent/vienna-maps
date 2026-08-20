@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Vienna Oblique – 4 Directions</title>
+  <link rel="icon" href="logos/favicon.ico" type="image/x-icon">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.0/proj4.js"></script>
   <style>
     :root {
@@ -24,6 +25,19 @@
       padding: 6px 16px; display: flex; align-items: center; gap: 10px; flex-shrink: 0; flex-wrap: wrap;
     }
     .topbar h1 { font-size: .88rem; font-weight: 600; flex-shrink: 0; }
+    .dev-credit {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: .72rem; color: var(--text-dim); white-space: nowrap;
+    }
+    .dev-credit a {
+      display: inline-flex; align-items: center; gap: 6px;
+      color: var(--accent2); text-decoration: none; font-weight: 500;
+    }
+    .dev-credit a:hover { text-decoration: underline; }
+    .dev-credit img {
+      width: 16px; height: 16px; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.65), 0 0 2px rgba(0, 0, 0, 0.4);
+    }
     .badge { display: flex; align-items: center; gap: 5px; font-size: .72rem; color: var(--text-dim);
              background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 3px 9px; }
     .spinner { width: 9px; height: 9px; border: 2px solid var(--border); border-top-color: var(--accent2);
@@ -116,6 +130,14 @@
 <div class="topbar">
   <h1>Vienna Oblique – 4 Directions</h1>
 
+  <span class="dev-credit">
+    Developed by
+    <a href="https://dreamtent.dev" target="_blank" rel="noopener noreferrer">
+      <img src="logos/163280227_64px.png" alt="" width="16" height="16">
+      dreamtent.dev
+    </a>
+  </span>
+
   <div class="badge" id="badge">
     <div class="spinner" id="spinner"></div>
     <span id="badgeText">Loading…</span>
@@ -133,7 +155,7 @@
     <div class="sep"></div>
 
     <input class="coord-input" id="coordsInput" type="text"
-           value="48.2767386234921, 16.44324030796789" placeholder="lat, lon">
+           value="48.2108258, 16.3586364" placeholder="lat, lon">
     <button class="btn" id="searchBtn" onclick="doSearch()" disabled>Find</button>
 
     <div class="sep"></div>
@@ -449,6 +471,7 @@ async function loadIndex() {
     setBadgeReady(allImages.length);
     document.getElementById('progressFill').style.display = 'none';
     document.getElementById('searchBtn').disabled = false;
+    doSearch();
   } finally {
     if (setSel) setSel.disabled = false;
   }

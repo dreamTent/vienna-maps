@@ -1,7 +1,7 @@
 # Vienna Maps
 A Birds eye view of vienna in high resolution.
 
-This project uses aerial photography created and distributed by the city of vienna and available over their open data platform under the CC BY 4.0 license.
+This project uses aerial photography created and distributed by the city of vienna and available over their open data platform under the CC BY 4.0 license. See below for the exact data used.
 
 ## Disclaimer
 
