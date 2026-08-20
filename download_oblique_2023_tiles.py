@@ -24,7 +24,7 @@ from typing import Iterable, List, Tuple
 
 import requests
 
-# Same remote root as download_oblique.py
+# Same remote root as download_oblique_by_coordinates.py
 REMOTE_BASE_URL = (
     "https://www.wien.gv.at/stadtplan3d/datasource-data/Oblique/"
     "91bf9860-34d7-4f9a-b841-32be753b09e5"
@@ -65,7 +65,7 @@ def iter_images_from_tile(tile_file: Path) -> Iterable[dict]:
 
 
 def tile_grid_shape(width: int, height: int, resolution_factor: int) -> Tuple[int, int]:
-    """Match pyramid_canvas_layout / reconstruct_image_at_zoom in download_oblique.py."""
+    """Match pyramid_canvas_layout / reconstruct_image_at_zoom in download_oblique_by_coordinates.py."""
     cols = math.ceil(width / (TILE_SIZE * resolution_factor))
     rows = math.ceil(height / (TILE_SIZE * resolution_factor))
     return cols, rows

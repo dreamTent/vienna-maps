@@ -67,7 +67,7 @@ def iter_images_from_tile(tile_file: Path) -> Iterable[dict]:
 
 
 def tile_grid_shape(width: int, height: int, resolution_factor: int) -> Tuple[int, int]:
-    """Match pyramid_canvas_layout / reconstruct_image_at_zoom in download_oblique.py."""
+    """Match pyramid_canvas_layout / reconstruct_image_at_zoom in download_oblique_by_coordinates.py."""
     cols = math.ceil(width / (TILE_SIZE * resolution_factor))
     rows = math.ceil(height / (TILE_SIZE * resolution_factor))
     return cols, rows
