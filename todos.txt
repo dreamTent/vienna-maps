@@ -6,3 +6,4 @@
 - mobile compatability
 - better layering of overlay images and dedecision making to stop small patches from being covered by images that shouldnt cover those areas
 - cant scroll that far to the left for some reason, scroling to the right seem to be very far
+- download broken

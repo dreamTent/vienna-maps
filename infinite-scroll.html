@@ -160,6 +160,8 @@
     body.chrome-hidden .left-panel { display: none !important; }
     body.chrome-hidden #viewerHeader { display: none !important; }
     body.chrome-hidden .app { height: 100vh; height: 100dvh; }
+    /* Hide only the dense viewer toolbar (header + search stay) */
+    body.toolbar-hidden #viewerHeader { display: none !important; }
     .orbit-tool.chrome-toggle[aria-pressed="true"] {
       border-color: var(--accent2);
       color: var(--accent2);
@@ -287,6 +289,121 @@
       color: var(--text-dim);
       font-family: monospace;
     }
+
+    /* Help modal */
+    .help-overlay {
+      position: fixed; inset: 0; z-index: 2147483647;
+      background: rgba(1, 4, 9, 0.72);
+      display: flex; align-items: center; justify-content: center;
+      padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+               max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+      opacity: 0; visibility: hidden; pointer-events: none;
+      transition: opacity .18s ease, visibility .18s ease;
+    }
+    .help-overlay.open {
+      opacity: 1; visibility: visible; pointer-events: auto;
+    }
+    .help-dialog {
+      width: min(560px, 100%);
+      max-height: min(88vh, 820px);
+      display: flex; flex-direction: column;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+      overflow: hidden;
+    }
+    .help-dialog-header {
+      display: flex; align-items: center; gap: 10px;
+      padding: 14px 16px; border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .help-dialog-header h2 {
+      flex: 1; font-size: 1rem; font-weight: 600; margin: 0;
+    }
+    .help-close-btn {
+      background: var(--surface2); border: 1px solid var(--border);
+      color: var(--text); border-radius: 6px;
+      width: 32px; height: 32px; padding: 0;
+      font-size: 1.1rem; line-height: 1;
+      align-self: center; flex-shrink: 0;
+    }
+    .help-body {
+      overflow-y: auto; padding: 14px 16px 18px;
+      font-size: .84rem; line-height: 1.45; color: var(--text);
+    }
+    .help-body p { margin: 0 0 10px; color: var(--text-dim); }
+    .help-body p:last-child { margin-bottom: 0; }
+    .help-lead {
+      color: var(--text) !important;
+      font-size: .9rem; margin-bottom: 12px !important;
+    }
+    .help-warn {
+      background: rgba(210, 153, 34, 0.12);
+      border: 1px solid rgba(210, 153, 34, 0.45);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 0 0 14px;
+      color: var(--text);
+      font-size: .82rem;
+    }
+    .help-warn strong { color: var(--warning); }
+    .help-section {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface2);
+      margin-bottom: 8px;
+      overflow: hidden;
+    }
+    .help-section > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 12px;
+      font-weight: 600;
+      font-size: .84rem;
+      color: var(--text);
+      display: flex; align-items: center; gap: 8px;
+      user-select: none;
+    }
+    .help-section > summary::-webkit-details-marker { display: none; }
+    .help-section > summary::before {
+      content: '▸';
+      color: var(--accent2);
+      font-size: .75rem;
+      width: 1em;
+      flex-shrink: 0;
+      transition: transform .12s ease;
+    }
+    .help-section[open] > summary::before { transform: rotate(90deg); }
+    .help-section > summary:hover { background: rgba(88, 166, 255, 0.06); }
+    .help-section-body {
+      padding: 0 12px 12px;
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+    .help-section-body ul {
+      margin: 0 0 8px; padding-left: 1.15em;
+      color: var(--text-dim);
+    }
+    .help-section-body li { margin-bottom: 5px; }
+    .help-section-body li strong { color: var(--text); font-weight: 600; }
+    .help-kbd {
+      display: inline-block;
+      font-family: monospace;
+      font-size: .75rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0 5px;
+      color: var(--accent2);
+      white-space: nowrap;
+    }
+    .help-footer-hint {
+      margin-top: 12px;
+      font-size: .75rem;
+      color: var(--text-dim);
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -310,8 +427,10 @@
     <div class="spinner" id="spinner"></div>
     <span id="badgeText">Loading index…</span>
   </div>
-  <button type="button" class="btn-sm" id="chromeToggleHeaderBtn" onclick="toggleChromeUi()"
-          title="Hide search list and toolbars">Hide UI</button>
+  <button type="button" class="btn-sm" id="helpOpenBtn" onclick="openHelp()"
+          title="How to use this app">? Help</button>
+  <button type="button" class="btn-sm" id="toolbarToggleBtn" onclick="toggleViewerToolbar()"
+          title="Show or hide the full viewer toolbar" aria-pressed="true">Hide toolbar</button>
 </div>
 
 <div class="app">
@@ -564,7 +683,153 @@
             title="Arrow keys: move along view (↑↓←→, Shift=×10). + / # visual zoom (DE layout). , / . list.">⌨ ↑↓←→ +# · , .</span>
     </div>
     <div class="viewer-area" id="viewerArea">
-      <div class="empty-viewer">← Select an image from the list</div>
+      <div class="empty-viewer" id="viewerLoadingMsg">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<!-- Help / first-start guide -->
+<div class="help-overlay" id="helpOverlay" role="dialog" aria-modal="true" aria-labelledby="helpTitle" hidden>
+  <div class="help-dialog" role="document">
+    <div class="help-dialog-header">
+      <h2 id="helpTitle">How to use Vienna Oblique Explorer</h2>
+      <button type="button" class="help-close-btn" onclick="closeHelp()" title="Close" aria-label="Close help">×</button>
+    </div>
+    <div class="help-body">
+      <p class="help-lead">
+        Explore Vienna from oblique aerial photos. Search a place, then move around —
+        the viewer picks nearby images so the ground under the marker stays in view.
+      </p>
+      <div class="help-warn">
+        <strong>Heavy on your machine.</strong>
+        This app can use a lot of RAM and CPU, benefits from a decent GPU, and downloads large amounts of image tile data (especially with overlay, preload, and globe mode). Use smaller cache / “near” preload counts if things get slow or memory-hungry.
+      </div>
+
+      <details class="help-section" open>
+        <summary>Moving around (most important)</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><strong>Arrow keys</strong> — move along the current view direction on the ground. Hold <span class="help-kbd">Shift</span> for ~10× speed.</li>
+            <li><strong>Drag</strong> in the viewer — pan the marker over the ground (same idea as arrows).</li>
+            <li><strong>Mouse wheel</strong> / <span class="help-kbd">+</span> <span class="help-kbd">#</span> — visual zoom (keeps the marker centred).</li>
+            <li><strong>N / E / S / W</strong> (orbit pad) — jump to the nearest photo facing that direction.</li>
+            <li><strong>,</strong> / <strong>.</strong> — previous / next image in the sorted result list.</li>
+            <li><strong>☰ Hide UI</strong> — hide search list and toolbars for a full-screen view; reopen controls from the orbit pad.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="help-section">
+        <summary>Orbit pad (always visible)</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><strong>N E S W</strong> — nearest north / east / south / west facing view.</li>
+            <li><strong>− / +</strong> — visual zoom out / in.</li>
+            <li><strong>▣</strong> — show or hide the nadir orthophoto underlay (<span class="help-kbd">Shift+O</span>).</li>
+            <li><strong>🌐</strong> — globe mode: smoother camera when images swap while you move.</li>
+            <li><strong>✈</strong> — random tour along curved paths (drag or arrows stop it).</li>
+            <li><strong>☰</strong> — show or hide search list and all toolbars (full-screen).</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="help-section">
+        <summary>Header buttons</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><strong>? Help</strong> — open this guide.</li>
+            <li><strong>Hide / Show toolbar</strong> — toggle the full viewer toolbar (marker, overlay, globe, and related controls) while keeping the search list.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="help-section">
+        <summary>Search &amp; result list</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><strong>Image set</strong> — capture year (e.g. Wien 2023 / 2020).</li>
+            <li><strong>Latitude, Longitude</strong> + <strong>Radius</strong> — find images whose ground footprint is near that point.</li>
+            <li><strong>Search</strong> — run the query. <strong>Auto-search on move</strong> re-runs when coordinates change.</li>
+            <li><strong>Sort</strong> — by distance, heading, direction, centred framing, or full orbit.</li>
+            <li><strong>Hide ⚠ outside</strong> / angle filters — drop images where the marker is poorly framed.</li>
+            <li>Click a list row to open that photo in the viewer.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="help-section">
+        <summary>Cache &amp; preload (RAM / downloads)</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><strong>Keep images in memory</strong> — retain decoded tiles for faster revisits; higher counts use more RAM.</li>
+            <li><strong>Preload list</strong> — download tiles for the current result list ahead of time (lots of data).</li>
+            <li><strong>Auto-preload</strong> — preload after each search or sort.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="help-section">
+        <summary>Viewer toolbar — marker &amp; framing</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><strong>● Marker</strong> — show or hide the ground marker.</li>
+            <li><strong>⊕ Zoom to</strong> — keep the view framed on the marker while you move.</li>
+            <li><strong>⊙ Pin centre</strong> — lock the marker to the viewport centre; the image slides under it.</li>
+            <li><strong>Z / Heightmap</strong> — ground elevation for projection (DGM + optional offset Δ).</li>
+            <li><strong>Zoom pills</strong> — tile quality / pyramid level (Auto picks a level for you).</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="help-section">
+        <summary>Overlay, reproject &amp; ortho</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><strong>⧉ Overlay</strong> — stack recent / nearby images aligned on the marker (best with Pin centre).</li>
+            <li><strong>×N layers</strong> — how many stacked layers to keep.</li>
+            <li><strong>base / px/layer blur</strong> — soften layers behind the current image.</li>
+            <li><strong>Reproject to main</strong> — warp back layers onto shared ground so they line up better.</li>
+            <li><strong>near N</strong> — preload N nearest neighbors for reproject (heavy on RAM and downloads).</li>
+            <li><strong>🐞 Debug</strong> — tint / outline reprojected layers.</li>
+            <li><strong>▣ Ortho</strong> — nadir basemap under the oblique photos.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="help-section">
+        <summary>Globe, rotation &amp; playback</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><strong>🌐 Globe</strong> — continuous semi-globe camera so motion doesn’t jump when the photo swaps.</li>
+            <li><strong>⬆ N·45°</strong> — warp to a fixed north-facing 45° look-down camera.</li>
+            <li><strong>↻ Rotate to marker</strong> — rotate so the marker sits on the vertical centre line.</li>
+            <li><strong>⇄ Horizon stable</strong> — keep the ground-plane horizon horizontal.</li>
+            <li><strong>Wait full tiles</strong> — don’t swap until the next view’s tiles are decoded.</li>
+            <li><strong>Switch while moving</strong> — auto-pick a better image every frame vs. only after you stop.</li>
+            <li><strong>Smooth switch</strong> — fade between main images.</li>
+            <li><strong>🔓 Lock image</strong> — stay on the current photo instead of auto-switching.</li>
+            <li><strong>▶</strong> — auto-advance through the sorted list; <strong>✈ Tour</strong> — random waypoint tour.</li>
+            <li><strong>⬇ Download</strong> — download the current image.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="help-section">
+        <summary>Keyboard shortcuts</summary>
+        <div class="help-section-body">
+          <ul>
+            <li><span class="help-kbd">↑</span> <span class="help-kbd">↓</span> <span class="help-kbd">←</span> <span class="help-kbd">→</span> — move on the ground (view-relative).</li>
+            <li><span class="help-kbd">Shift</span> + arrows — faster movement.</li>
+            <li><span class="help-kbd">+</span> / <span class="help-kbd">#</span> (or <span class="help-kbd">=</span> / <span class="help-kbd">−</span>) — visual zoom in / out.</li>
+            <li><span class="help-kbd">,</span> / <span class="help-kbd">.</span> — previous / next in the result list.</li>
+            <li><span class="help-kbd">Shift+O</span> — toggle ortho underlay.</li>
+            <li><span class="help-kbd">Shift+S</span> — (overlay on) show only the main layer, hide stacked neighbors.</li>
+            <li><span class="help-kbd">Esc</span> — close this help window.</li>
+          </ul>
+        </div>
+      </details>
+
+      <p class="help-footer-hint">You can reopen this anytime with <strong>? Help</strong> in the header.</p>
     </div>
   </div>
 </div>
@@ -1881,7 +2146,7 @@ async function onImageSetChange() {
       va.classList.remove('has-ortho-dim-main');
       va.classList.remove('ortho-bg-hidden');
       orthoBackgroundVisible = true;
-      va.innerHTML = '<div class="empty-viewer">← Select an image from the list</div>';
+      va.innerHTML = '<div class="empty-viewer" id="viewerLoadingMsg">Loading...</div>';
     }
   }
   currentImage = null;
@@ -1907,7 +2172,7 @@ async function loadIndex() {
         va.classList.remove('has-ortho-dim-main');
         va.classList.remove('ortho-bg-hidden');
         orthoBackgroundVisible = true;
-        va.innerHTML = '<div class="empty-viewer">Loading index…</div>';
+        va.innerHTML = '<div class="empty-viewer" id="viewerLoadingMsg">Loading</div>';
       }
     }
 
@@ -1987,6 +2252,8 @@ async function loadIndex() {
     document.getElementById('progressFill').style.display = 'none';
     document.getElementById('searchBtn').disabled = false;
     updateCacheSizeDropdownLabels();
+    // Drop the Loading placeholder now that manifests / tile indexes are ready.
+    document.getElementById('viewerLoadingMsg')?.remove();
     if (typeof initInfiniteScrollMode === 'function') initInfiniteScrollMode();
   } finally {
     if (setSel) setSel.disabled = false;
@@ -5617,6 +5884,14 @@ let   shiftHeld  = false;
 let   keyRafId   = null, lastKeyTs = null;
 
 document.addEventListener('keydown', e => {
+  // Help dialog: Esc closes; block other app shortcuts while open
+  if (isHelpOpen()) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeHelp();
+    }
+    return;
+  }
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
   if (e.key === 'Shift') { shiftHeld = true; return; }
 
@@ -6125,20 +6400,32 @@ function orbitToDirection(dir) {
 function setChromeUiVisible(visible) {
   document.body.classList.toggle('chrome-hidden', !visible);
   const fab = document.getElementById('chromeToggleFabBtn');
-  const hdr = document.getElementById('chromeToggleHeaderBtn');
   if (fab) {
     fab.setAttribute('aria-pressed', visible ? 'true' : 'false');
     fab.title = visible ? 'Hide search list and toolbars' : 'Show search list and toolbars';
-  }
-  if (hdr) {
-    hdr.textContent = visible ? 'Hide UI' : 'Show UI';
-    hdr.title = fab ? fab.title : '';
   }
   try { localStorage.setItem('infChromeVisible', visible ? '1' : '0'); } catch (_) {}
 }
 
 function toggleChromeUi() {
   setChromeUiVisible(document.body.classList.contains('chrome-hidden'));
+}
+
+/** Show/hide only the dense viewer toolbar (#viewerHeader). Preference in localStorage. */
+function setViewerToolbarVisible(visible) {
+  document.body.classList.toggle('toolbar-hidden', !visible);
+  const btn = document.getElementById('toolbarToggleBtn');
+  if (btn) {
+    btn.setAttribute('aria-pressed', visible ? 'true' : 'false');
+    btn.textContent = visible ? 'Hide toolbar' : 'Show toolbar';
+    btn.title = visible ? 'Hide the full viewer toolbar' : 'Show the full viewer toolbar';
+    btn.style.opacity = visible ? '' : '.7';
+  }
+  try { localStorage.setItem('infToolbarVisible', visible ? '1' : '0'); } catch (_) {}
+}
+
+function toggleViewerToolbar() {
+  setViewerToolbarVisible(document.body.classList.contains('toolbar-hidden'));
 }
 
 function initInfiniteScrollMode() {
@@ -6154,6 +6441,15 @@ function initInfiniteScrollMode() {
     if (stored === '1') chromeVisible = true;
   } catch (_) {}
   setChromeUiVisible(chromeVisible);
+
+  // Viewer toolbar (dense controls): default visible; restore last choice.
+  let toolbarVisible = true;
+  try {
+    const ts = localStorage.getItem('infToolbarVisible');
+    if (ts === '0') toolbarVisible = false;
+    if (ts === '1') toolbarVisible = true;
+  } catch (_) {}
+  setViewerToolbarVisible(toolbarVisible);
 
   const coords = document.getElementById('coordsInput');
   if (coords) coords.value = '48.2297801, 16.4137043';
@@ -6251,6 +6547,48 @@ loadGroundHeightmap().then(() => {
   }
 });
 loadIndex();
+
+// ── Help window (first visit + toolbar / FAB) ─────────────────
+const HELP_SEEN_KEY = 'infHelpSeen';
+
+function isHelpOpen() {
+  return document.getElementById('helpOverlay')?.classList.contains('open');
+}
+
+function openHelp() {
+  const el = document.getElementById('helpOverlay');
+  if (!el) return;
+  el.hidden = false;
+  // Force reflow so the open transition runs after removing hidden
+  void el.offsetWidth;
+  el.classList.add('open');
+  document.getElementById('helpOpenBtn')?.setAttribute('aria-expanded', 'true');
+}
+
+function closeHelp() {
+  const el = document.getElementById('helpOverlay');
+  if (!el) return;
+  el.classList.remove('open');
+  document.getElementById('helpOpenBtn')?.setAttribute('aria-expanded', 'false');
+  const finish = () => { el.hidden = true; };
+  el.addEventListener('transitionend', finish, { once: true });
+  // Fallback if transition doesn't fire
+  setTimeout(finish, 250);
+  try { localStorage.setItem(HELP_SEEN_KEY, '1'); } catch (_) {}
+}
+
+document.getElementById('helpOverlay')?.addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeHelp();
+});
+
+(function maybeOpenHelpOnFirstVisit() {
+  let seen = false;
+  try { seen = localStorage.getItem(HELP_SEEN_KEY) === '1'; } catch (_) {}
+  if (!seen) {
+    // Defer so layout / chrome init can settle first
+    requestAnimationFrame(() => openHelp());
+  }
+})();
 </script>
 <!-- Hidden container that keeps tile <img> elements alive so their decoded bitmaps
      remain in the browser's image cache between image switches. -->
