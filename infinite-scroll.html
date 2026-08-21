@@ -1501,13 +1501,25 @@ function resetOrthoGlobeLayoutCache() {
   }
 }
 
+function syncGlobeModeUi() {
+  const pressed = globeModeEnabled ? 'true' : 'false';
+  const opacity = globeModeEnabled ? '' : '.5';
+  const hdr = document.getElementById('globeModeBtn');
+  if (hdr) {
+    hdr.style.opacity = opacity;
+    hdr.setAttribute('aria-pressed', pressed);
+  }
+  const fab = document.getElementById('globeModeFabBtn');
+  if (fab) {
+    fab.style.opacity = opacity;
+    fab.setAttribute('aria-pressed', pressed);
+    fab.title = globeModeEnabled ? 'Turn off globe mode' : 'Turn on globe mode';
+  }
+}
+
 function toggleGlobeMode() {
   globeModeEnabled = !globeModeEnabled;
-  const btn = document.getElementById('globeModeBtn');
-  if (btn) {
-    btn.style.opacity = globeModeEnabled ? '' : '.5';
-    btn.setAttribute('aria-pressed', globeModeEnabled ? 'true' : 'false');
-  }
+  syncGlobeModeUi();
   virtualGlobeImg = null;
   globePoseLastTs = 0;
   resetOrthoGlobeLayoutCache();
@@ -6134,7 +6146,8 @@ function initInfiniteScrollMode() {
   infiniteScrollModeInitialized = true;
   document.body.classList.add('infinite-scroll');
 
-  let chromeVisible = true;
+  // Default: search list + toolbars hidden; restore last choice from localStorage.
+  let chromeVisible = false;
   try {
     const stored = localStorage.getItem('infChromeVisible');
     if (stored === '0') chromeVisible = false;
@@ -6157,11 +6170,7 @@ function initInfiniteScrollMode() {
   if (nsel) nsel.value = '64';
 
   globeModeEnabled = true;
-  const globeBtn = document.getElementById('globeModeBtn');
-  if (globeBtn) {
-    globeBtn.style.opacity = '';
-    globeBtn.setAttribute('aria-pressed', 'true');
-  }
+  syncGlobeModeUi();
 
   try {
     const bf = localStorage.getItem('infOverlayBlurFixed');
@@ -6261,6 +6270,8 @@ loadIndex();
     <button type="button" class="orbit-tool" onclick="changeViewZoom(+1)">+</button>
     <button type="button" class="orbit-tool" id="orthoToggleFabBtn" onclick="toggleOrthoBackground()"
             title="Show/hide nadir orthophoto underlay (Shift+O)">▣</button>
+    <button type="button" class="orbit-tool" id="globeModeFabBtn" onclick="toggleGlobeMode()"
+            aria-pressed="true" title="Turn off globe mode">🌐</button>
     <button type="button" class="orbit-tool" id="autoTourFabBtn" onclick="toggleAutoTour()"
             aria-pressed="false" title="Start random tour">✈</button>
     <button type="button" class="orbit-tool chrome-toggle" id="chromeToggleFabBtn" onclick="toggleChromeUi()"
