@@ -2678,7 +2678,10 @@ let displayJacobianTransition = null;
 /** Captured before currentImage changes; consumed in renderTiles. */
 let pendingDisplayJFrom = null;
 let viewPadX = 0, viewPadY = 0;  // centering padding so marker-scroll math is correct
-let markerDX = -1, markerDY = -1; // last marker display position (px), -1 = no marker
+/** Last marker position in display px (image/pad space). May be negative when the
+ *  projection sits left/above the image origin — that is valid, not “missing”. */
+let markerDX = 0, markerDY = 0;
+let markerProjValid = false;
 const IMAGE_EDGE_TRIM_SOURCE_PX = 6;
 
 /** Loaded via ORTHO_SOURCE — nadir orthophoto previews aligned in MGI. */
@@ -4299,83 +4302,89 @@ function refreshDot() {
   svgEl.style.display = markerVisible ? '' : 'none';
   svgEl.innerHTML = '';
 
-  // Always compute display position — needed by scrollToMarker even when hidden.
-  if (!result) { markerDX = markerDY = -1; return; }
-  const [px, py] = result;
+  // Projection onto the *current photo* can fail (behind camera) or land outside the
+  // frame with negative px/py (left/top). Neither must stop zoom-to-marker sync —
+  // searchLat/Lon still move, and globe/ortho warps use the search point, not pad px.
+  if (!result) {
+    markerProjValid = false;
+    markerDX = markerDY = 0;
+  } else {
+    const [px, py] = result;
 
-  const scale = currentDispScale;
-  const dx = px * scale;
-  const dy = py * scale - currentEdgeTrimDisp;
-  markerDX = dx;
-  markerDY = dy;
+    const scale = currentDispScale;
+    const dx = px * scale;
+    const dy = py * scale - currentEdgeTrimDisp;
+    markerDX = dx;
+    markerDY = dy;
+    markerProjValid = true;
 
-  // Draw the marker only when visible.
-  if (markerVisible) {
-    const W = Math.max(1, Math.floor(currentImage.width  * scale) - currentEdgeTrimDisp);
-    const H = Math.max(1, Math.floor(currentImage.height * scale) - currentEdgeTrimDisp);
+    // Draw the marker only when visible.
+    if (markerVisible) {
+      const W = Math.max(1, Math.floor(currentImage.width  * scale) - currentEdgeTrimDisp);
+      const H = Math.max(1, Math.floor(currentImage.height * scale) - currentEdgeTrimDisp);
 
-    const stroke = currentImage.coversPoint ? '#ff3333' : '#ffaa00';
-    const warn = currentImage.coversPoint ? '' : `
+      const stroke = currentImage.coversPoint ? '#ff3333' : '#ffaa00';
+      const warn = currentImage.coversPoint ? '' : `
       <rect x="0" y="0" width="${W}" height="22" fill="#000" fill-opacity=".55"/>
       <text x="6" y="15" fill="#ffaa00" font-size="11" font-family="sans-serif">
         Point outside ground footprint — marker is extrapolated, not reliable
       </text>`;
 
-    const inFrame = dx >= 0 && dx <= W && dy >= 0 && dy <= H;
-    if (inFrame) {
-      svgEl.innerHTML = warn + `
+      const inFrame = dx >= 0 && dx <= W && dy >= 0 && dy <= H;
+      if (inFrame) {
+        svgEl.innerHTML = warn + `
         <line x1="${dx-24}" y1="${dy}" x2="${dx+24}" y2="${dy}" stroke="${stroke}" stroke-width="1.5" opacity=".85"/>
         <line x1="${dx}" y1="${dy-24}" x2="${dx}" y2="${dy+24}" stroke="${stroke}" stroke-width="1.5" opacity=".85"/>
         <circle cx="${dx}" cy="${dy}" r="14" fill="none" stroke="${stroke}" stroke-width="2" opacity=".85"/>
         <circle cx="${dx}" cy="${dy}" r="3" fill="${stroke}" opacity=".95"/>`;
-    } else {
-      const cx = W/2, cy = H/2;
-      const angle = Math.atan2(dy - cy, dx - cx);
-      const ex = cx + Math.cos(angle) * Math.min(cx, cy) * 0.85;
-      const ey = cy + Math.sin(angle) * Math.min(cx, cy) * 0.85;
-      svgEl.innerHTML = warn + `
+      } else {
+        const cx = W/2, cy = H/2;
+        const angle = Math.atan2(dy - cy, dx - cx);
+        const ex = cx + Math.cos(angle) * Math.min(cx, cy) * 0.85;
+        const ey = cy + Math.sin(angle) * Math.min(cx, cy) * 0.85;
+        svgEl.innerHTML = warn + `
         <circle cx="${ex}" cy="${ey}" r="8" fill="none" stroke="${stroke}" stroke-width="2" opacity=".7"/>
         <line x1="${cx}" y1="${cy}" x2="${ex}" y2="${ey}" stroke="${stroke}" stroke-width="1.5" stroke-dasharray="4,3" opacity=".6"/>
         <text x="${ex}" y="${ey}" text-anchor="middle" dominant-baseline="middle" fill="${stroke}" font-size="11">→</text>`;
+      }
     }
-  }
 
-  // Live rotation update while moving: only “rotate to marker” depends on the marker.
-  if (!globeModeEnabled && rotateMode === 'marker' && currentImage.pToImage && result) {
-    const fx = Math.hypot(
-      currentImage.pToImage[0][0],
-      currentImage.pToImage[0][1],
-      currentImage.pToImage[0][2]
-    );
-    const newRot = (fx >= 1)
-      ? -Math.atan((px - currentImage.width / 2) / fx) * (180 / Math.PI)
-      : 0;
-    if (Math.abs(newRot - currentRotDeg) > 0.15) {
-      currentRotDeg = newRot;
-      updateRotateModeButtons(newRot);
-      const clipDiv = document.getElementById('rotClipDiv');
-      if (clipDiv) clipDiv.style.transform = `rotate(${newRot}deg)`;
-      // Absolute layers use CSS translate for centring — do not rewrite scroll padding.
-      const padDiv = document.getElementById('rotPadDiv');
-      if (padDiv && !padDiv._overlayImage && !pinMarkerCenter) {
-        const area2  = document.getElementById('viewerArea');
-        const vW2    = area2.clientWidth  || 800;
-        const vH2    = area2.clientHeight || 600;
-        const rRad   = Math.abs(newRot) * Math.PI / 180;
-        const exW    = Math.round((currentContentW * (1 - Math.cos(rRad)) + currentContentH * Math.sin(rRad)) / 2);
-        const exH    = Math.round((currentContentH * (1 - Math.cos(rRad)) + currentContentW * Math.sin(rRad)) / 2);
-        viewPadX = Math.max(0, Math.floor((vW2 - currentContentW) / 2)) + exW;
-        viewPadY = Math.max(0, Math.floor((vH2 - currentContentH) / 2)) + exH;
-        padDiv.style.padding = `${viewPadY}px ${viewPadX}px`;
+    // Live rotation update while moving: only “rotate to marker” depends on the marker.
+    if (!globeModeEnabled && rotateMode === 'marker' && currentImage.pToImage) {
+      const fx = Math.hypot(
+        currentImage.pToImage[0][0],
+        currentImage.pToImage[0][1],
+        currentImage.pToImage[0][2]
+      );
+      const newRot = (fx >= 1)
+        ? -Math.atan((px - currentImage.width / 2) / fx) * (180 / Math.PI)
+        : 0;
+      if (Math.abs(newRot - currentRotDeg) > 0.15) {
+        currentRotDeg = newRot;
+        updateRotateModeButtons(newRot);
+        const clipDiv = document.getElementById('rotClipDiv');
+        if (clipDiv) clipDiv.style.transform = `rotate(${newRot}deg)`;
+        // Absolute layers use CSS translate for centring — do not rewrite scroll padding.
+        const padDiv = document.getElementById('rotPadDiv');
+        if (padDiv && !padDiv._overlayImage && !pinMarkerCenter) {
+          const area2  = document.getElementById('viewerArea');
+          const vW2    = area2.clientWidth  || 800;
+          const vH2    = area2.clientHeight || 600;
+          const rRad   = Math.abs(newRot) * Math.PI / 180;
+          const exW    = Math.round((currentContentW * (1 - Math.cos(rRad)) + currentContentH * Math.sin(rRad)) / 2);
+          const exH    = Math.round((currentContentH * (1 - Math.cos(rRad)) + currentContentW * Math.sin(rRad)) / 2);
+          viewPadX = Math.max(0, Math.floor((vW2 - currentContentW) / 2)) + exW;
+          viewPadY = Math.max(0, Math.floor((vH2 - currentContentH) / 2)) + exH;
+          padDiv.style.padding = `${viewPadY}px ${viewPadX}px`;
+        }
       }
     }
   }
 
-  // Keep ortho aligned with the marker / auto-rotate before layer translate (avoids lag and innerHTML blink).
-  if (markerDX >= 0 && markerDY >= 0) {
-    if (document.getElementById('orthoUnderlay')) refreshOrthoUnderlayLive();
-    else if (document.getElementById('orthoUnionWrap')) refreshOrthoSingleModeLive();
-  }
+  // Keep ortho + layers aligned with the search point (even when photo projection failed
+  // or landed left/top of the image with negative pad coordinates).
+  if (document.getElementById('orthoUnderlay')) refreshOrthoUnderlayLive();
+  else if (document.getElementById('orthoUnionWrap')) refreshOrthoSingleModeLive();
 
   // Scroll to marker if that option is on (independent of marker visibility).
   scrollToMarker();
@@ -4623,7 +4632,7 @@ function onCacheSizeChange() {
  * Marker position (px) in rotPadDiv / scroll space, including clip rotation — same math as scroll/pinch.
  */
 function markerVisualInPadPx() {
-  if (markerDX < 0 || markerDY < 0) return null;
+  if (!markerProjValid) return null;
   let vx = markerDX, vy = markerDY;
   if (currentRotDeg !== 0 && currentContentW > 0) {
     const cx = currentContentW / 2, cy = currentContentH / 2;
@@ -5182,7 +5191,10 @@ function syncOrthoUnderlayTransform(virtOpt) {
 
 /** Position the viewer so the marker is centred (absolute translate — same for overlay on/off). */
 function scrollToMarker() {
-  if (!zoomToMarker || markerDX < 0 || markerDY < 0) return;
+  // Do not gate on markerDX/DY sign: left/top of the image are negative and still valid.
+  // Globe / reproject sync uses searchLat/Lon; classic pan needs a successful photo projection.
+  if (!zoomToMarker) return;
+  if (!globeModeEnabled && !markerProjValid) return;
   const area = document.getElementById('viewerArea');
   if (!area) return;
   updateGroundScaleCompensation();
