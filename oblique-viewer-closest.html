@@ -105,7 +105,11 @@
     .zoom-pill { padding: 1px 7px; border-radius: 10px; font-size: .7rem; background: var(--surface2);
                  border: 1px solid var(--border); color: var(--text-dim); cursor: pointer; }
     .zoom-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .zoom-pill:hover:not(.active) { border-color: var(--accent); color: var(--text); }
+    /* In auto mode: which pyramid level is actually loaded */
+    .zoom-pill.auto-loaded { border: 2px solid var(--accent2); color: var(--accent2); background: var(--surface2);
+                             box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.25); }
+    .zoom-pill:hover:not(.active):not(.auto-loaded) { border-color: var(--accent); color: var(--text); }
+    .zoom-pill.auto-loaded:hover { border-color: var(--accent2); color: #79c0ff; }
 
     .card-lock-btn { background: none; border: 1px solid transparent; border-radius: 4px;
                      padding: 1px 5px; font-size: .78rem; cursor: pointer; margin-left: auto;
@@ -191,11 +195,13 @@
     <!-- Tile quality (shared across all 4 cards) -->
     <span class="lbl">Quality:</span>
     <div class="zoom-pills" id="shared-pills">
-      <span class="zoom-pill active" data-z="0" onclick="changeTileZoom(0)">z0</span>
-      <span class="zoom-pill" data-z="1" onclick="changeTileZoom(1)">z1</span>
-      <span class="zoom-pill" data-z="2" onclick="changeTileZoom(2)">z2</span>
-      <span class="zoom-pill" data-z="3" onclick="changeTileZoom(3)">z3</span>
-      <span class="zoom-pill" data-z="4" onclick="changeTileZoom(4)">z4</span>
+      <span class="zoom-pill active" data-z="auto"
+            title="Fit pyramid level to each card viewport, visual zoom (×), image size, and display density">auto</span>
+      <span class="zoom-pill" data-z="0">z0</span>
+      <span class="zoom-pill" data-z="1">z1</span>
+      <span class="zoom-pill" data-z="2">z2</span>
+      <span class="zoom-pill" data-z="3">z3</span>
+      <span class="zoom-pill" data-z="4">z4</span>
     </div>
   </div>
 </div>
@@ -505,11 +511,9 @@ function doSearch() {
     if (!best[d] || dist < best[d].distM) best[d] = {...img, distM: Math.round(dist)};
   }
 
-  // Store result in cardState; clamp shared tileZoom to minimum maxZ across found images
+  // Clamp manual zoom to minimum maxZ across found images
   const minMaxZ = Math.min(...[1,2,3,4].filter(d=>best[d]).map(d=>best[d].tileResolution.length-1));
-  if (isFinite(minMaxZ)) tileZoom = Math.min(tileZoom, minMaxZ);
-  document.querySelectorAll('#shared-pills .zoom-pill')
-    .forEach(p => p.classList.toggle('active', Number(p.dataset.z) === tileZoom));
+  if (isFinite(minMaxZ) && !tileZoomAuto) currentZoom = Math.min(currentZoom, minMaxZ);
 
   for (let d = 1; d <= 4; d++) {
     cardState[d].img = best[d] || null;
@@ -534,6 +538,8 @@ function tileDims(width, height, zoom, tileResolution) {
 // ═══════════════════════════════════════════════════════
 function renderAll() {
   for (let d = 1; d <= 4; d++) renderCard(d);
+  for (let d = 1; d <= 4; d++) renderTiles(d);
+  updateZoomPillClasses();
 }
 
 function renderCard(d) {
@@ -573,8 +579,6 @@ function renderCard(d) {
       >${isLocked?'🔒':'🔓'}</button>
     </div>
     <div class="card-viewer" id="viewer-${d}"></div>`;
-
-  renderTiles(d);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -586,7 +590,7 @@ function renderTiles(d) {
   const area = document.getElementById(`viewer-${d}`);
   if (!area || !img) return;
 
-  const zoom = Math.min(tileZoom, img.tileResolution.length - 1);
+  const zoom = Math.min(getSharedTileZoomIndex(), img.tileResolution.length - 1);
   const {cols, rows} = tileDims(img.width, img.height, zoom, img.tileResolution);
   const res = img.tileResolution[zoom];
 
@@ -697,14 +701,77 @@ function refreshAllDots() {
 // ═══════════════════════════════════════════════════════
 //  TILE QUALITY ZOOM  (shared across all 4 cards)
 // ═══════════════════════════════════════════════════════
-let tileZoom = 1;
+/** When true, tile zoom follows each card viewport, visual zoom, image size, and DPR. */
+let tileZoomAuto = true;
+let currentZoom = 1;
 
-function changeTileZoom(z) {
-  tileZoom = z;
-  document.querySelectorAll('#shared-pills .zoom-pill')
-    .forEach(p => p.classList.toggle('active', Number(p.dataset.z) === z));
-  renderAll();
+/** Device pixels per source image pixel for a given card viewport (fit × visual zoom × DPR). */
+function viewPxPerImagePx(img, viewW, viewH) {
+  const baseScale = Math.min(viewW / img.width, viewH / img.height);
+  return baseScale * viewerZoom * (window.devicePixelRatio || 1);
 }
+
+/**
+ * Auto tile zoom: coarsest pyramid level z where decoded tile pixels are not upsampled past
+ * ~1 device pixel per source pixel.
+ */
+function computeAutoTileZoom(img, viewW, viewH) {
+  const scale = viewPxPerImagePx(img, viewW, viewH);
+  const tr = img.tileResolution;
+  const maxZ = tr.length - 1;
+  const eps = 1e-9;
+  for (let zi = 0; zi <= maxZ; zi++) {
+    if (tr[zi] * scale <= 1 + eps) return zi;
+  }
+  return maxZ;
+}
+
+/** Shared tile zoom across all cards; auto mode uses the finest level any card viewport needs. */
+function getSharedTileZoomIndex() {
+  if (tileZoomAuto) {
+    let z = 0;
+    for (let d = 1; d <= 4; d++) {
+      const img = cardState[d].img;
+      if (!img) continue;
+      const area = document.getElementById(`viewer-${d}`);
+      const viewW = area?.clientWidth || 400;
+      const viewH = area?.clientHeight || 300;
+      z = Math.max(z, computeAutoTileZoom(img, viewW, viewH));
+    }
+    return z;
+  }
+  const maxZs = [1, 2, 3, 4].filter(d => cardState[d].img)
+    .map(d => cardState[d].img.tileResolution.length - 1);
+  const cap = maxZs.length ? Math.min(...maxZs) : 4;
+  return Math.max(0, Math.min(cap, currentZoom));
+}
+
+function updateZoomPillClasses() {
+  const zEff = getSharedTileZoomIndex();
+  document.querySelectorAll('#shared-pills .zoom-pill').forEach(p => {
+    const dz = p.dataset.z;
+    if (dz === 'auto') {
+      p.classList.toggle('active', tileZoomAuto);
+      p.classList.remove('auto-loaded');
+      return;
+    }
+    const zi = Number(dz);
+    p.classList.toggle('active', !tileZoomAuto && zi === currentZoom);
+    p.classList.toggle('auto-loaded', tileZoomAuto && zi === zEff);
+  });
+}
+
+document.getElementById('shared-pills').onclick = e => {
+  const pill = e.target.closest('.zoom-pill');
+  if (!pill) return;
+  if (pill.dataset.z === 'auto') {
+    tileZoomAuto = true;
+  } else {
+    tileZoomAuto = false;
+    currentZoom = Number(pill.dataset.z);
+  }
+  renderAll();
+};
 
 // ═══════════════════════════════════════════════════════
 //  VISUAL ZOOM  (shared, same steps as oblique-viewer.html)
@@ -825,6 +892,8 @@ function switchCardBg(d, img, qx, qy) {
     cardState[d].img = img;
     cardState[d].dx  = cardState[d].dy = -1;
     renderCard(d);
+    renderTiles(d);
+    updateZoomPillClasses();
   };
   const probe = new Image();
   probe.onload  = commit;
@@ -876,6 +945,15 @@ let   dragStartMX = 0, dragStartMY = 0;
 let   dragInvJ    = null, dragScale = 1;
 
 const gridEl = document.getElementById('grid');
+
+if (typeof ResizeObserver !== 'undefined' && gridEl) {
+  let gridResizeRaf = 0;
+  new ResizeObserver(() => {
+    if (!tileZoomAuto) return;
+    cancelAnimationFrame(gridResizeRaf);
+    gridResizeRaf = requestAnimationFrame(() => renderAll());
+  }).observe(gridEl);
+}
 
 function getViewerCard(el) {
   const v = el.closest('[id^="viewer-"]');
