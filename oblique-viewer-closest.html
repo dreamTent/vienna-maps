@@ -70,6 +70,8 @@
     input[type=number] { width: 52px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
                          color: var(--text); padding: 2px 5px; font-size: .76rem; outline: none; }
     input[type=number]:focus { border-color: var(--accent); }
+    .hm-label { display: inline-flex; align-items: center; gap: 4px; font-size: .72rem; cursor: pointer; white-space: nowrap; color: var(--text-dim); }
+    .hm-label input { accent-color: var(--accent); }
 
     /* ── progress ── */
     .progress-wrap { height: 3px; background: var(--border); flex-shrink: 0; }
@@ -165,12 +167,21 @@
     <div class="sep"></div>
 
     <!-- Z height for projection -->
-    <span class="lbl">Z:</span>
+    <span class="lbl" title="Ground elevation (model Z) for marker projection. With Heightmap on: live DGM height at the marker + slider Δ. With Heightmap off: slider alone is absolute model Z.">Z:</span>
+    <span id="dgmZLabel" style="font-variant-numeric:tabular-nums;color:var(--accent2);display:none;font-size:.76rem;font-family:monospace"
+          title="Live DGM sample at the current marker. Format DGM±Δ→Z means heightmap elevation plus slider offset equals effective model Z."></span>
+    <span id="heightDeltaLabel" style="color:var(--text-dim);display:none;font-size:.72rem" title="Δ = manual offset (m) added to live DGM at the marker.">Δ</span>
     <input type="range" id="heightSlider" min="-100" max="400" step="1" value="0"
-           oninput="document.getElementById('heightNum').value=this.value; refreshAllDots()">
+           title="Manual Δ (m). With Heightmap on: added to live DGM at the marker. With Heightmap off: absolute flat model Z."
+           oninput="document.getElementById('heightNum').value=this.value; onHeightChange()">
     <input type="number" id="heightNum" value="0" min="-100" max="400"
-           oninput="document.getElementById('heightSlider').value=this.value; refreshAllDots()">
+           title="Manual Δ (m). With Heightmap on: added to live DGM at the marker. With Heightmap off: absolute flat model Z."
+           oninput="document.getElementById('heightSlider').value=this.value; onHeightChange()">
     <span class="lbl">m</span>
+    <label class="hm-label" title="DGM heightmap. On: live terrain height at the marker for projection. Off: use flat Z from the slider only.">
+      <input type="checkbox" id="heightmapCb" checked onchange="onHeightmapToggle()">
+      Heightmap
+    </label>
 
     <div class="sep"></div>
 
@@ -243,6 +254,11 @@ const IMAGE_SETS = [
   },
 ];
 
+const GROUND_SOURCE = {
+  metaUrl: 'sources/ground/heightmap.json',
+  binUrl: 'sources/ground/heightmap.bin',
+};
+
 let tileSize = 1024;
 let activeRemoteBaseUrl = IMAGE_SETS[0].remoteBaseUrl;
 let activeSetId = IMAGE_SETS[0].id;
@@ -265,6 +281,121 @@ const DIR_CLASS = { 1:'card-n', 2:'card-e', 3:'card-s', 4:'card-w', 5:'card-x' }
 // ═══════════════════════════════════════════════════════
 proj4.defs('MGI', MGI_PROJ_FALLBACK);
 let wgs84ToMgi = proj4('EPSG:4326', 'MGI');
+
+// ═══════════════════════════════════════════════════════
+//  DGM GROUND HEIGHTS
+// ═══════════════════════════════════════════════════════
+let dgmMeta = null;
+let dgmGrid = null; // Int16Array, decimetres
+let dgmReady = false;
+let heightmapEnabled = true;
+
+function heightmapActive() {
+  return dgmReady && heightmapEnabled;
+}
+
+function onHeightmapToggle() {
+  heightmapEnabled = !!document.getElementById('heightmapCb')?.checked;
+  onHeightChange();
+}
+
+async function loadGroundHeightmap() {
+  try {
+    const metaResp = await fetch(GROUND_SOURCE.metaUrl);
+    if (!metaResp.ok) throw new Error(`${GROUND_SOURCE.metaUrl}: ${metaResp.status}`);
+    dgmMeta = await metaResp.json();
+    const binResp = await fetch(GROUND_SOURCE.binUrl);
+    if (!binResp.ok) throw new Error(`${GROUND_SOURCE.binUrl}: ${binResp.status}`);
+    const buf = await binResp.arrayBuffer();
+    dgmGrid = new Int16Array(buf);
+    if (dgmGrid.length !== dgmMeta.width * dgmMeta.height) {
+      throw new Error(`heightmap size mismatch ${dgmGrid.length} vs ${dgmMeta.width * dgmMeta.height}`);
+    }
+    dgmReady = true;
+    syncDgmZLabel();
+    console.info(`DGM heightmap ready ${dgmMeta.width}×${dgmMeta.height} @ ${dgmMeta.res}m`);
+  } catch (e) {
+    console.warn('DGM heightmap not loaded — projection uses flat Z from slider only.', e);
+    dgmReady = false;
+    dgmMeta = null;
+    dgmGrid = null;
+    syncDgmZLabel();
+  }
+}
+
+/** Absolute DGM elevation (m) at MGI metres, or null. */
+function sampleDgmZ(X, Y) {
+  if (!dgmReady || !dgmMeta || !dgmGrid) return null;
+  const col = (X - dgmMeta.originX) / dgmMeta.res;
+  const row = (dgmMeta.originY - Y) / dgmMeta.res;
+  const c0 = Math.floor(col);
+  const r0 = Math.floor(row);
+  const w = dgmMeta.width;
+  const h = dgmMeta.height;
+  if (c0 < 0 || r0 < 0 || c0 + 1 >= w || r0 + 1 >= h) return null;
+  const nodata = dgmMeta.nodata;
+  const i00 = r0 * w + c0;
+  const z00 = dgmGrid[i00], z10 = dgmGrid[i00 + 1];
+  const z01 = dgmGrid[i00 + w], z11 = dgmGrid[i00 + w + 1];
+  if (z00 === nodata || z10 === nodata || z01 === nodata || z11 === nodata) return null;
+  const fx = col - c0, fy = row - r0;
+  const z =
+    z00 * (1 - fx) * (1 - fy) +
+    z10 * fx * (1 - fy) +
+    z01 * (1 - fx) * fy +
+    z11 * fx * fy;
+  return z / 10;
+}
+
+function getManualHeightOffset() {
+  const hVal = document.getElementById('heightNum')?.value;
+  return hVal === '' || hVal == null ? 0 : Number(hVal);
+}
+
+/** Model Z at the search marker: absolute DGM + Δ (or slider alone if no DGM). */
+function getActiveGroundZ() {
+  const off = getManualHeightOffset();
+  if (!heightmapActive()) return off;
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const z = sampleDgmZ(mx, my);
+  return z == null ? off : z + off;
+}
+
+function syncDgmZLabel() {
+  const el = document.getElementById('dgmZLabel');
+  const deltaEl = document.getElementById('heightDeltaLabel');
+  if (!el) return;
+  if (!heightmapActive()) {
+    el.style.display = 'none';
+    el.textContent = '';
+    el.removeAttribute('title');
+    if (deltaEl) deltaEl.style.display = 'none';
+    return;
+  }
+  const [mx, my] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const zAbs = sampleDgmZ(mx, my);
+  if (zAbs == null) {
+    el.style.display = 'none';
+    el.removeAttribute('title');
+    if (deltaEl) deltaEl.style.display = 'none';
+    return;
+  }
+  const zEff = getActiveGroundZ();
+  const off = getManualHeightOffset();
+  el.style.display = '';
+  el.textContent = off === 0 ? `${zEff.toFixed(0)}` : `${zAbs.toFixed(0)}${off >= 0 ? '+' : ''}${off}→${zEff.toFixed(0)}`;
+  el.title = `Live DGM at marker: ${zAbs.toFixed(1)} m. Effective model Z: ${zEff.toFixed(1)} m.`;
+  if (deltaEl) deltaEl.style.display = '';
+}
+
+function noteSearchPositionChanged() {
+  syncDgmZLabel();
+}
+
+function onHeightChange() {
+  syncDgmZLabel();
+  refreshAllDots();
+}
 
 // ═══════════════════════════════════════════════════════
 //  GEOMETRY HELPERS  (identical to oblique-viewer.html)
@@ -520,6 +651,7 @@ function doSearch() {
     cardState[d].dx = cardState[d].dy = -1;
   }
 
+  noteSearchPositionChanged();
   renderAll();
 }
 
@@ -645,8 +777,7 @@ function refreshDot(d) {
   svgEl.style.display = markerVisible ? '' : 'none';
   svgEl.innerHTML = '';
 
-  const hVal = document.getElementById('heightNum').value;
-  const Z    = hVal === '' ? 0 : Number(hVal);
+  const Z = getActiveGroundZ();
   const result = projectToPixel(img, searchLat, searchLon, Z);
 
   if (!result) { st.dx = st.dy = -1; return; }
@@ -776,7 +907,7 @@ document.getElementById('shared-pills').onclick = e => {
 // ═══════════════════════════════════════════════════════
 //  VISUAL ZOOM  (shared, same steps as oblique-viewer.html)
 // ═══════════════════════════════════════════════════════
-const VZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 6, 8, 12, 16, 20, 24, 30];
+const VZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 6, 8, 12, 16, 20, 24, 30, 40, 50, 60 ,70, 80];
 let viewerZoom = 1;
 
 function changeVZoom(dir) {
@@ -842,6 +973,7 @@ function moveMarker(dxM, dyM) {
   searchLat = newLat;
   searchLon = newLon;
   document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  noteSearchPositionChanged();
   refreshAllDots();
   scheduleAutoSwitch();
 }
@@ -963,8 +1095,7 @@ function getViewerCard(el) {
 function beginDrag(clientX, clientY, d) {
   const img = cardState[d].img;
   if (!img) return false;
-  const hVal = document.getElementById('heightNum').value;
-  const Z    = hVal === '' ? 0 : Number(hVal);
+  const Z = getActiveGroundZ();
   const invJ = computeInvJacobian(img, searchLat, searchLon, Z);
   if (!invJ) return false;
   isDragging  = true;
@@ -987,6 +1118,7 @@ function applyDrag(clientX, clientY) {
   searchLat = newLat;
   searchLon = newLon;
   document.getElementById('coordsInput').value = `${newLat.toFixed(7)}, ${newLon.toFixed(7)}`;
+  noteSearchPositionChanged();
   refreshAllDots();
   scheduleAutoSwitch();
 }
@@ -1083,6 +1215,7 @@ gridEl.addEventListener('touchend', e => {
 // ═══════════════════════════════════════════════════════
 //  BOOT
 // ═══════════════════════════════════════════════════════
+loadGroundHeightmap().then(() => refreshAllDots());
 loadIndex();
 </script>
 </body>
