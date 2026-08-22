@@ -348,6 +348,16 @@
       font-size: .82rem;
     }
     .help-warn strong { color: var(--warning); }
+    .help-notice {
+      background: rgba(56, 139, 253, 0.1);
+      border: 1px solid rgba(56, 139, 253, 0.4);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 0 0 14px;
+      color: var(--text);
+      font-size: .82rem;
+    }
+    .help-notice strong { color: var(--accent2); }
     .help-section {
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -700,6 +710,10 @@
         Explore Vienna from oblique aerial photos. Search a place, then move around —
         the viewer picks nearby images so the ground under the marker stays in view.
       </p>
+      <div class="help-notice">
+        <strong>Early development.</strong>
+        This application is still in the early stages of development — features may change, break, or be incomplete.
+      </div>
       <div class="help-warn">
         <strong>Heavy on your machine.</strong>
         This app can use a lot of RAM and CPU, benefits from a decent GPU, and downloads large amounts of image tile data (especially with overlay, preload, and globe mode). Use smaller cache / “near” preload counts if things get slow or memory-hungry.
