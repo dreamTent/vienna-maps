@@ -5501,11 +5501,8 @@ function updateAutoRotateLabel(deg) {
 
 const AUTO_SWITCH_MS = 120;
 
-/** Find best same-direction image and switch if closer than current. */
-function performAutoSwitch() {
-  if (!currentImage) return;
-  const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
-  const dir = currentImage.viewDirection;
+/** Closest image of `dir` (1–4) to MGI point (qx, qy) by look-at. */
+function nearestImageForDirection(dir, qx, qy) {
   let best = null, bestDist = Infinity;
   for (const img of allImages) {
     if (img.viewDirection !== dir) continue;
@@ -5513,6 +5510,14 @@ function performAutoSwitch() {
     const dist = Math.hypot(qx - cx, qy - cy);
     if (dist < bestDist) { bestDist = dist; best = img; }
   }
+  return best;
+}
+
+/** Find best same-direction image and switch if closer than current. */
+function performAutoSwitch() {
+  if (!currentImage) return;
+  const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const best = nearestImageForDirection(currentImage.viewDirection, qx, qy);
   if (best && best.name !== currentImage.name) {
     switchToImageBg(best, qx, qy);
   }
@@ -6389,37 +6394,26 @@ function updateOrbitDirectionHighlight() {
 }
 
 function orbitToDirection(dir) {
-  if (![1, 2, 3, 4].includes(dir) || !searchResults.length) return;
-  let best = null;
-  for (const img of searchResults) {
-    if (img.viewDirection !== dir) continue;
-    if (!best || img.distCenter < best.distCenter) best = img;
-  }
+  if (![1, 2, 3, 4].includes(dir) || !allImages.length) return;
+  // Use the live marker, not the last Search click — searchResults / distCenter
+  // stay frozen when Auto-search on move is off (infinite-scroll default).
+  const [qx, qy] = wgs84ToMgi.forward([searchLon, searchLat]);
+  const best = nearestImageForDirection(dir, qx, qy);
   if (!best) return;
+  if (currentImage && best.name === currentImage.name) {
+    updateOrbitDirectionHighlight();
+    return;
+  }
   applySort();
   const list = document.getElementById('resultsList');
   const items = list._items || [];
-  let idx = items.findIndex(i => i.name === best.name);
-  if (idx < 0) {
-    imageSwitchGen++;
-    const gen = imageSwitchGen;
-    if (currentImage && currentImage.name !== best.name) {
-      captureDisplayJacobianForTransition();
-    }
-    noteOutgoingMainBeforeSwitch(best);
-    currentImage = best;
-    const z = getTileZoomIndex(best);
-    if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-      waitForMainAndNeighborTiles(best, z).then(() => {
-        if (gen !== imageSwitchGen) return;
-        openViewer(best, z);
-      });
-    } else {
-      openViewer(best, z);
-    }
+  const idx = items.findIndex(i => i.name === best.name);
+  if (idx >= 0) {
+    const el = list.querySelectorAll('.result-item')[idx] || document.createElement('div');
+    selectImage(idx, el);
     return;
   }
-  selectImage(idx, document.createElement('div'));
+  switchToImageBg(best, qx, qy);
 }
 
 /** Show/hide header, search list, and viewer toolbar. Preference in localStorage. */
