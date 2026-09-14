@@ -100,7 +100,27 @@
     .height-ctrl input[type=range] { width: 80px; accent-color: var(--accent); }
     .height-ctrl input[type=number] { width: 58px; padding: 2px 6px; font-size: .75rem; }
 
-    .viewer-area { flex: 1; overflow: auto; background: #080a0e; cursor: grab; position: relative; }
+    .viewer-stage { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; isolation: isolate; }
+    /* Isolate overlay layer z-index (1…n) so they cannot paint over sibling UI */
+    .viewer-area { flex: 1; overflow: auto; background: #080a0e; cursor: grab; position: relative; z-index: 0; isolation: isolate; }
+    .tile-load-indicator {
+      position: absolute;
+      top: max(10px, env(safe-area-inset-top));
+      left: max(10px, env(safe-area-inset-left));
+      z-index: 2147483645;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+      width: 28px;
+      height: 28px;
+      background: rgba(22, 27, 34, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      box-shadow: 0 3px 14px rgba(0,0,0,.4);
+    }
+    .tile-load-indicator.is-on { display: flex; }
+    .tile-load-indicator .spinner { width: 14px; height: 14px; }
     /* Dim main oblique only when ortho is the only thing behind it — if reprojected neighbors sit under #rotPadDiv, dimming looks like a double image */
     /*.viewer-area.has-ortho-dim-main #rotPadDiv .tile-canvas-wrap { opacity: 0.78; } */
     /* Shift+O: hide nadir ortho; restore full opacity on main oblique while hidden */
@@ -692,8 +712,13 @@
       <span style="font-size:.68rem;color:var(--text-dim);white-space:nowrap"
             title="Arrow keys: move along view (↑↓←→, Shift=×10). + / # visual zoom (DE layout). , / . list.">⌨ ↑↓←→ +# · , .</span>
     </div>
-    <div class="viewer-area" id="viewerArea">
-      <div class="empty-viewer" id="viewerLoadingMsg">Loading...</div>
+    <div class="viewer-stage" id="viewerStage">
+      <div class="viewer-area" id="viewerArea">
+        <div class="empty-viewer" id="viewerLoadingMsg">Loading...</div>
+      </div>
+      <div class="tile-load-indicator" id="tileLoadIndicator" role="status" aria-label="Loading" aria-live="polite" aria-hidden="true">
+        <div class="spinner" aria-hidden="true"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -2723,7 +2748,7 @@ function selectImage(idx, el) {
   const img = currentImage;
   const z = getTileZoomIndex(img);
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForMainAndNeighborTiles(img, z).then(() => {
+    waitForVisibleTiles(img, z).then(() => {
       if (gen !== imageSwitchGen) return;
       openViewer(img, z);
     });
@@ -2883,6 +2908,82 @@ function whenImagesReady(imgs) {
       im.addEventListener('error', done, { once: true });
     });
   }));
+}
+
+let tileLoadBusyCount = 0;
+let tileLoadShowTimer = null;
+let tileLoadHideTimer = null;
+const TILE_LOAD_INDICATOR_DELAY_MS = 80;
+const TILE_LOAD_INDICATOR_HOLD_MS = 60;
+
+function tileLoadIndicatorSuppressed() {
+  return typeof autoTourActive !== 'undefined' && autoTourActive;
+}
+
+function showTileLoadIndicatorEl() {
+  if (tileLoadIndicatorSuppressed()) return;
+  const el = document.getElementById('tileLoadIndicator');
+  if (!el) return;
+  el.classList.add('is-on');
+  el.setAttribute('aria-hidden', 'false');
+}
+
+function hideTileLoadIndicatorEl() {
+  const el = document.getElementById('tileLoadIndicator');
+  if (!el) return;
+  el.classList.remove('is-on');
+  el.setAttribute('aria-hidden', 'true');
+}
+
+function beginTileLoadIndicator() {
+  tileLoadBusyCount++;
+  if (tileLoadHideTimer) {
+    clearTimeout(tileLoadHideTimer);
+    tileLoadHideTimer = null;
+  }
+  const el = document.getElementById('tileLoadIndicator');
+  if (!el) return;
+  if (el.classList.contains('is-on')) return;
+  if (tileLoadShowTimer) return;
+  tileLoadShowTimer = setTimeout(() => {
+    tileLoadShowTimer = null;
+    if (tileLoadBusyCount > 0) showTileLoadIndicatorEl();
+  }, TILE_LOAD_INDICATOR_DELAY_MS);
+}
+
+function suppressTileLoadIndicatorForTour() {
+  if (tileLoadShowTimer) {
+    clearTimeout(tileLoadShowTimer);
+    tileLoadShowTimer = null;
+  }
+  if (tileLoadHideTimer) {
+    clearTimeout(tileLoadHideTimer);
+    tileLoadHideTimer = null;
+  }
+  hideTileLoadIndicatorEl();
+}
+
+function endTileLoadIndicator() {
+  if (tileLoadBusyCount > 0) tileLoadBusyCount--;
+  if (tileLoadBusyCount > 0) return;
+  if (tileLoadShowTimer) {
+    clearTimeout(tileLoadShowTimer);
+    tileLoadShowTimer = null;
+  }
+  const el = document.getElementById('tileLoadIndicator');
+  if (!el || !el.classList.contains('is-on')) return;
+  if (tileLoadHideTimer) clearTimeout(tileLoadHideTimer);
+  tileLoadHideTimer = setTimeout(() => {
+    tileLoadHideTimer = null;
+    if (tileLoadBusyCount > 0) return;
+    hideTileLoadIndicatorEl();
+  }, TILE_LOAD_INDICATOR_HOLD_MS);
+}
+
+/** Prefetch that should show the top-left spinner (visible wait, not background warm). */
+function waitForVisibleTiles(mainImg, zoom) {
+  beginTileLoadIndicator();
+  return waitForMainAndNeighborTiles(mainImg, zoom).finally(endTileLoadIndicator);
 }
 
 /** Bumps to cancel stale crossfades when another image mounts. */
@@ -4002,6 +4103,14 @@ function wrapInnerHtmlWithOrthoIfNeeded(innerHtml, img, rotDeg, contentW, conten
 }
 
 function renderTiles(img, zoom) {
+  beginTileLoadIndicator();
+  let loadEnded = false;
+  const finishTileLoad = () => {
+    if (loadEnded) return;
+    loadEnded = true;
+    endTileLoadIndicator();
+  };
+
   orthoContentOffsetX = orthoContentOffsetY = 0;
   const area = document.getElementById('viewerArea');
   const {cols, rows} = tileDims(img.width, img.height, zoom, img.tileResolution);
@@ -4163,6 +4272,7 @@ function renderTiles(img, zoom) {
   const reveal = () => {
     if (revealed || revealGen !== imageRevealGen) return;
     revealed = true;
+    finishTileLoad();
     const finishTransition = () => {
       if (revealGen !== imageRevealGen) return;
       // Crossfade done — drop outgoing freeze and settle everyone on the new main.
@@ -4265,7 +4375,10 @@ function renderTiles(img, zoom) {
   const mainReady = whenImagesReady(layer.querySelectorAll('.tile-canvas-wrap img'));
   // Only reveal once main tiles AND new reprojected layers are loaded (or timeout).
   Promise.all([mainReady, neighborPrepPromise]).then(([, prep]) => {
-    if (revealGen !== imageRevealGen) return;
+    if (revealGen !== imageRevealGen) {
+      finishTileLoad();
+      return;
+    }
     neighborPrep = prep;
     if (revealed) {
       // Timeout already showed the main — still apply neighbor prep when it arrives.
@@ -4276,7 +4389,10 @@ function renderTiles(img, zoom) {
     reveal();
   });
   setTimeout(() => {
-    if (revealed || revealGen !== imageRevealGen) return;
+    if (revealed || revealGen !== imageRevealGen) {
+      finishTileLoad();
+      return;
+    }
     // Budget exceeded: show main now; neighbor prep may still be running.
     reveal();
     neighborPrepPromise.then(prep => {
@@ -5591,7 +5707,7 @@ function switchToImageBg(img, qx, qy) {
   // Always warm main + reprojected-neighbor tiles before mounting so the joint
   // crossfade in renderTiles can start as soon as DOM imgs are ready.
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForMainAndNeighborTiles(img, z).then(commit);
+    waitForVisibleTiles(img, z).then(commit);
     return;
   }
 
@@ -5702,6 +5818,7 @@ function stopAutoTour() {
   }
   autoTourLastTs = null;
   syncAutoTourButtons();
+  if (tileLoadBusyCount > 0) showTileLoadIndicatorEl();
 }
 
 /** Absolute marker position in MGI ground metres. */
@@ -5884,7 +6001,11 @@ function autoTourLoop(ts) {
 function startAutoTour() {
   if (!allImages || !allImages.length) return;
   stopListPlay();
-  stopAutoTour();
+  if (autoTourRaf != null) {
+    cancelAnimationFrame(autoTourRaf);
+    autoTourRaf = null;
+  }
+  autoTourLastTs = null;
 
   if (!zoomToMarker) toggleZoomToMarker();
 
@@ -5899,6 +6020,7 @@ function startAutoTour() {
   );
   autoTourActive = true;
   autoTourLastTs = null;
+  suppressTileLoadIndicatorForTour();
   syncAutoTourButtons();
   autoTourRaf = requestAnimationFrame(autoTourLoop);
 }
@@ -6537,7 +6659,7 @@ function initInfiniteScrollMode() {
   };
 
   if (document.getElementById('waitFullTilesSwitchCb')?.checked) {
-    waitForMainAndNeighborTiles(img, z).then(() => {
+    waitForVisibleTiles(img, z).then(() => {
       if (gen !== imageSwitchGen) return;
       openViewer(img, z);
       finishOverlayInit();
